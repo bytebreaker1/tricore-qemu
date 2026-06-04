@@ -25,9 +25,10 @@ enum { POCS_DEFAULT_CONFIG = 0x00, POCS_READY = 0x01, POCS_NORMAL_ACTIVE = 0x02,
 #define SUCC1_PBSY  (1u << 7)
 #define SUCC1_RESET 0x0C401080u
 
-void tc1797_eray_init(ErayCC *e)
+void tc1797_eray_init(ErayCC *e, uint32_t base)
 {
     memset(e, 0, sizeof(*e));
+    e->base = base;
     e->regs[ERAY_SUCC1 >> 2] = SUCC1_RESET;
     e->pocs = POCS_DEFAULT_CONFIG;
 }
@@ -91,7 +92,7 @@ static bool eray_apply_cmd(ErayCC *e, unsigned cmd)
 
 void tc1797_eray_write(ErayCC *e, uint32_t addr, uint32_t val)
 {
-    uint32_t off = (addr - TC1797_ERAY_BASE) & ~0x3u;
+    uint32_t off = (addr - e->base) & ~0x3u;
     if (off >= TC1797_ERAY_SIZE) {
         return;
     }
@@ -113,7 +114,7 @@ void tc1797_eray_write(ErayCC *e, uint32_t addr, uint32_t val)
 
 uint32_t tc1797_eray_read(ErayCC *e, uint32_t addr)
 {
-    uint32_t off = (addr - TC1797_ERAY_BASE) & ~0x3u;
+    uint32_t off = (addr - e->base) & ~0x3u;
     if (off >= TC1797_ERAY_SIZE) {
         return 0;
     }
@@ -132,7 +133,7 @@ void tc1797_eray_selftest(void)
     unsigned pass = 0, fail = 0;
 #define CHK(c) do { if (c) pass++; else { fail++; \
         error_report("ERAY selftest FAIL @%d", __LINE__); } } while (0)
-    tc1797_eray_init(&e);
+    tc1797_eray_init(&e, TC1797_ERAY_BASE);
 
     /* reset: POCS = DEFAULT_CONFIG, SUCC1 = reset value */
     CHK((tc1797_eray_read(&e, TC1797_ERAY_BASE + ERAY_CCSV) & 0x3F) == POCS_DEFAULT_CONFIG);

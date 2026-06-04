@@ -103,9 +103,10 @@ static void *dma_thread_fn(void *arg)
     return NULL;
 }
 
-void tc1797_dma_init(Tc1797Dma *d, DmaIrqFn irq_fn, void *opaque)
+void tc1797_dma_init(Tc1797Dma *d, uint32_t base, DmaIrqFn irq_fn, void *opaque)
 {
     memset(d, 0, sizeof(*d));
+    d->base = base;
     d->irq_fn = irq_fn;
     d->irq_opaque = opaque;
     qemu_mutex_init(&d->mutex);
@@ -125,6 +126,7 @@ void tc1797_dma_start(Tc1797Dma *d)
 
 uint32_t tc1797_dma_read(Tc1797Dma *d, uint32_t addr)
 {
+    addr = TC1797_DMA_BASE + (addr - d->base);   /* relocate to IP-relative space */
     unsigned off;
     int n = dma_decode(addr, &off);
     if (n < 0) {
@@ -141,6 +143,7 @@ uint32_t tc1797_dma_read(Tc1797Dma *d, uint32_t addr)
 
 void tc1797_dma_write(Tc1797Dma *d, uint32_t addr, uint32_t val)
 {
+    addr = TC1797_DMA_BASE + (addr - d->base);
     unsigned off;
     int n = dma_decode(addr, &off);
     if (n < 0) {
@@ -177,7 +180,7 @@ void tc1797_dma_write(Tc1797Dma *d, uint32_t addr, uint32_t val)
 void tc1797_dma_selftest(void)
 {
     Tc1797Dma d;
-    tc1797_dma_init(&d, NULL, NULL);           /* not started -> inline transfer */
+    tc1797_dma_init(&d, TC1797_DMA_BASE, NULL, NULL);   /* not started -> inline transfer */
     unsigned pass = 0, fail = 0;
 #define CHK(c) do { if (c) pass++; else { fail++; \
         error_report("DMA selftest FAIL @%d", __LINE__); } } while (0)

@@ -33,6 +33,7 @@ typedef struct Tc1797CanMO {
 } Tc1797CanMO;
 
 typedef struct Tc1797Can {
+    uint32_t base;                     /* kernel base (message objects at base + 0x1000) */
     uint32_t regs[TC1797_CAN_NREGS];   /* register shadow (config read-back) */
     Tc1797CanMO mo[TC1797_CAN_NMO];
     uint8_t mo_list[TC1797_CAN_NMO];   /* PANCTR list membership (0=unalloc) */
@@ -41,7 +42,7 @@ typedef struct Tc1797Can {
     uint64_t tx_count, rx_count;
 } Tc1797Can;
 
-void tc1797_can_init(Tc1797Can *c, CanTxFn tx_cb, void *opaque);
+void tc1797_can_init(Tc1797Can *c, uint32_t base, CanTxFn tx_cb, void *opaque);
 uint32_t tc1797_can_read(Tc1797Can *c, uint32_t addr);
 void tc1797_can_write(Tc1797Can *c, uint32_t addr, uint32_t val);
 /* Deliver an inbound frame into a matching receive MO. Returns true if a

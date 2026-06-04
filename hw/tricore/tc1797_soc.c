@@ -41,6 +41,7 @@
 #include "tc1797_fadc.h"
 #include "tc1797_mli.h"
 #include "tc1797_jtag.h"
+#include "tricore_soc.h"
 #include "chardev/char.h"
 #include "system/system.h"
 #include "net/can_emu.h"
@@ -837,6 +838,99 @@ static void tc1797_ssc_write(TC1797SoCState *s, int unit, uint32_t off,
      * self-test cluster -- it is read downstream, so it does not gate 0x3027. */
 }
 
+/*
+ * ── Spec-driven peripheral dispatch ──────────────────────────────────────────
+ * The relocatable peripheral IP for this part, as a table of instances each
+ * naming an IP kind (the registry) + the base it sits at. The MMIO read/write
+ * routers iterate this table; a different part supplies a different table (and,
+ * across generations, different kinds). This is the TC1797 instance; bases are
+ * the part's own constants (see the #defines above) so a sibling part is just a
+ * different table. (Part-specific SCU/clock/DTS/flash register quirks are NOT
+ * here -- they stay in the per-part switch below.)
+ */
+static const TriCorePeriphCfg tc1797_periphs[] = {
+    { TC_IP_MULTICAN, TC1797_CAN_BASE,  TC1797_CAN_END  - TC1797_CAN_BASE, 0, 0 },
+    { TC_IP_ADC,      TC1797_ADC_LO,    TC1797_ADC_HI   - TC1797_ADC_LO,   0, 0 },
+    { TC_IP_FADC,     TC1797_FADC_BASE, TC1797_FADC_SIZE,                  0, 0 },
+    { TC_IP_GPTA,     TC1797_GPTA_LO,   TC1797_GPTA_HI  - TC1797_GPTA_LO,  0, 0 },
+    { TC_IP_DMA,      TC1797_DMA_BASE,  TC1797_DMA_END  - TC1797_DMA_BASE, 0, 0 },
+    { TC_IP_ERAY,     TC1797_ERAY_BASE, TC1797_ERAY_SIZE,                  0, 0 },
+    { TC_IP_ASC,      TC1797_ASC0_BASE, TC1797_ASC_SIZE,                   0, 0 },
+    { TC_IP_ASC,      TC1797_ASC1_BASE, TC1797_ASC_SIZE,                   1, 0 },
+    { TC_IP_MLI,      TC1797_MLI0_BASE, TC1797_MLI_SIZE,                   0, 0 },
+    { TC_IP_MLI,      TC1797_MLI1_BASE, TC1797_MLI_SIZE,                   1, 0 },
+};
+
+/* Per-peripheral dispatch gates kept from the original SoC (CAN/ADC/GPTA can be
+ * disabled for bring-up bisection/safety); other kinds are always on. */
+static bool tc1797_periph_enabled(TC1797SoCState *s, TriCoreIpKind kind)
+{
+    switch (kind) {
+    case TC_IP_MULTICAN: return s->en_can;
+    case TC_IP_ADC:      return s->en_adc;
+    case TC_IP_GPTA:     return s->en_gpta;
+    default:             return true;
+    }
+}
+
+/* Route an MMIO read to the modeled peripheral whose instance window contains
+ * `addr`, via the IP-kind registry. Returns false (fall through to the
+ * part-specific handler) if nothing matches or the matched kind is gated off. */
+static bool tc1797_periph_read(TC1797SoCState *s, uint32_t addr, uint32_t *out)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(tc1797_periphs); i++) {
+        const TriCorePeriphCfg *p = &tc1797_periphs[i];
+        if (addr < p->base || addr >= p->base + p->size) {
+            continue;
+        }
+        if (!tc1797_periph_enabled(s, p->kind)) {
+            return false;
+        }
+        switch (p->kind) {
+        case TC_IP_MULTICAN: *out = tc1797_can_read(&s->can, addr); return true;
+        case TC_IP_ADC:      *out = tc1797_adc_read(&s->adc, addr); return true;
+        case TC_IP_FADC:     *out = tc1797_fadc_read(&s->fadc, addr); return true;
+        case TC_IP_GPTA:     *out = tc1797_gpta_read(&s->gpta, addr,
+                                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)); return true;
+        case TC_IP_DMA:      *out = tc1797_dma_read(&s->dma, addr); return true;
+        case TC_IP_ERAY:     *out = tc1797_eray_read(&s->eray, addr); return true;
+        case TC_IP_ASC:      *out = tc1797_asc_read(p->unit ? &s->asc1 : &s->asc0, addr);
+                             return true;
+        case TC_IP_MLI:      *out = tc1797_mli_read(p->unit ? &s->mli1 : &s->mli0, addr);
+                             return true;
+        default:             return false;
+        }
+    }
+    return false;
+}
+
+static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(tc1797_periphs); i++) {
+        const TriCorePeriphCfg *p = &tc1797_periphs[i];
+        if (addr < p->base || addr >= p->base + p->size) {
+            continue;
+        }
+        if (!tc1797_periph_enabled(s, p->kind)) {
+            return false;
+        }
+        switch (p->kind) {
+        case TC_IP_MULTICAN: tc1797_can_write(&s->can, addr, val); return true;
+        case TC_IP_ADC:      tc1797_adc_write(&s->adc, addr, val); return true;
+        case TC_IP_FADC:     tc1797_fadc_write(&s->fadc, addr, val); return true;
+        case TC_IP_GPTA:     tc1797_gpta_write(&s->gpta, addr, val); return true;
+        case TC_IP_DMA:      tc1797_dma_write(&s->dma, addr, val); return true;
+        case TC_IP_ERAY:     tc1797_eray_write(&s->eray, addr, val); return true;
+        case TC_IP_ASC:      tc1797_asc_write(p->unit ? &s->asc1 : &s->asc0, addr, val);
+                             return true;
+        case TC_IP_MLI:      tc1797_mli_write(p->unit ? &s->mli1 : &s->mli0, addr, val);
+                             return true;
+        default:             return false;
+        }
+    }
+    return false;
+}
+
 static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
 {
     TC1797SoCState *s = opaque;
@@ -872,57 +966,19 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
         /* other port registers fall through (read 0, logged) */
     }
 
-    /* MultiCAN controller (kernel regs + 128 message objects). */
-    if (s->en_can && addr >= TC1797_CAN_BASE && addr < TC1797_CAN_END) {
-        return tc1797_can_read(&s->can, addr);
-    }
-
-    /* ADC0/1/2 kernels: status + RESRn/RESRDn result registers. */
-    if (s->en_adc && addr >= TC1797_ADC_LO && addr < TC1797_ADC_HI) {
-        return tc1797_adc_read(&s->adc, addr);
-    }
-
-    /* Fast ADC (FADC): CLC/ID + RESRx result registers (knock/fast inputs). */
-    if (addr >= TC1797_FADC_BASE && addr < TC1797_FADC_BASE + TC1797_FADC_SIZE) {
-        return tc1797_fadc_read(&s->fadc, addr);
-    }
-
-    /* MLI0/MLI1 (Micro Link Interface): CLC/ID + config read-back. */
-    if (addr >= TC1797_MLI0_BASE && addr < TC1797_MLI0_BASE + TC1797_MLI_SIZE) {
-        return tc1797_mli_read(&s->mli0, addr);
-    }
-    if (addr >= TC1797_MLI1_BASE && addr < TC1797_MLI1_BASE + TC1797_MLI_SIZE) {
-        return tc1797_mli_read(&s->mli1, addr);
-    }
-
-    /* GPTA0/GPTA1/LTCA2 timer arrays: config read-back + free-running timers. */
-    if (s->en_gpta && addr >= TC1797_GPTA_LO && addr < TC1797_GPTA_HI) {
-        return tc1797_gpta_read(&s->gpta, addr,
-                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-    }
-
     /* PCP control registers (0xF0043F00..0xF0043FFF): module ID; the rest read
      * 0 (firmware tolerates) -- PCP_CS config is captured on write. */
     if (addr >= 0xF0043F00u && addr <= 0xF0043FFFu) {
         return (addr == 0xF0043F08u) ? 0x0000C001u : 0;   /* PCP_ID */
     }
 
-    /* E-Ray (FlexRay CC) kernel register block. */
-    if (addr >= TC1797_ERAY_BASE && addr < TC1797_ERAY_BASE + TC1797_ERAY_SIZE) {
-        return tc1797_eray_read(&s->eray, addr);
-    }
-
-    /* ASC0/ASC1 UARTs. */
-    if (addr >= TC1797_ASC0_BASE && addr < TC1797_ASC0_BASE + TC1797_ASC_SIZE) {
-        return tc1797_asc_read(&s->asc0, addr);
-    }
-    if (addr >= TC1797_ASC1_BASE && addr < TC1797_ASC1_BASE + TC1797_ASC_SIZE) {
-        return tc1797_asc_read(&s->asc1, addr);
-    }
-
-    /* DMA controller (block-move engine). */
-    if (addr >= TC1797_DMA_BASE && addr < TC1797_DMA_END) {
-        return tc1797_dma_read(&s->dma, addr);
+    /* Relocatable peripheral IP (MultiCAN/ADC/FADC/GPTA/DMA/E-Ray/ASC/MLI),
+     * routed by the per-part instance table via the IP-kind registry. */
+    {
+        uint32_t v;
+        if (tc1797_periph_read(s, addr, &v)) {
+            return v;
+        }
     }
 
     switch (addr) {
@@ -1049,30 +1105,6 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
         tc1797_ssc_write(s, ssc_u, ssc_off, (uint32_t)val);
         return;
     }
-    if (s->en_can && addr >= TC1797_CAN_BASE && addr < TC1797_CAN_END) {
-        tc1797_can_write(&s->can, addr, (uint32_t)val);
-        return;
-    }
-    if (s->en_adc && addr >= TC1797_ADC_LO && addr < TC1797_ADC_HI) {
-        tc1797_adc_write(&s->adc, addr, (uint32_t)val);
-        return;
-    }
-    if (addr >= TC1797_FADC_BASE && addr < TC1797_FADC_BASE + TC1797_FADC_SIZE) {
-        tc1797_fadc_write(&s->fadc, addr, (uint32_t)val);
-        return;
-    }
-    if (addr >= TC1797_MLI0_BASE && addr < TC1797_MLI0_BASE + TC1797_MLI_SIZE) {
-        tc1797_mli_write(&s->mli0, addr, (uint32_t)val);
-        return;
-    }
-    if (addr >= TC1797_MLI1_BASE && addr < TC1797_MLI1_BASE + TC1797_MLI_SIZE) {
-        tc1797_mli_write(&s->mli1, addr, (uint32_t)val);
-        return;
-    }
-    if (s->en_gpta && addr >= TC1797_GPTA_LO && addr < TC1797_GPTA_HI) {
-        tc1797_gpta_write(&s->gpta, addr, (uint32_t)val);
-        return;
-    }
     /* PCP control registers: capture PCP_CS (0xF0043F10) so firmware config
      * drives the engine (RCB bit4 -> entry-table vectoring; CS[7:6] context
      * model). Other PCP regs accept writes (no read-back, stays inert). */
@@ -1083,20 +1115,10 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
         }
         return;
     }
-    if (addr >= TC1797_ERAY_BASE && addr < TC1797_ERAY_BASE + TC1797_ERAY_SIZE) {
-        tc1797_eray_write(&s->eray, addr, (uint32_t)val);
-        return;
-    }
-    if (addr >= TC1797_ASC0_BASE && addr < TC1797_ASC0_BASE + TC1797_ASC_SIZE) {
-        tc1797_asc_write(&s->asc0, addr, (uint32_t)val);
-        return;
-    }
-    if (addr >= TC1797_ASC1_BASE && addr < TC1797_ASC1_BASE + TC1797_ASC_SIZE) {
-        tc1797_asc_write(&s->asc1, addr, (uint32_t)val);
-        return;
-    }
-    if (addr >= TC1797_DMA_BASE && addr < TC1797_DMA_END) {
-        tc1797_dma_write(&s->dma, addr, (uint32_t)val);
+
+    /* Relocatable peripheral IP, routed by the per-part instance table via the
+     * IP-kind registry (same table as the read path). */
+    if (tc1797_periph_write(s, addr, (uint32_t)val)) {
         return;
     }
     /* GPIO ports P0..P11: latch Pn_OUT (+0x00) and apply Pn_OMR (+0x04, PS[15:0]
@@ -1517,7 +1539,7 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     s->en_can  = (getenv("TC1797_NO_CAN")  == NULL);
     s->en_adc  = (getenv("TC1797_NO_ADC")  == NULL);
     s->en_gpta = (getenv("TC1797_NO_GPTA") == NULL);
-    tc1797_can_init(&s->can, tc1797_can_tx, s);
+    tc1797_can_init(&s->can, TC1797_CAN_BASE, tc1797_can_tx, s);
     /* Attach to a QEMU CAN bus if one exists (-object can-bus,id=...): the
      * firmware's CAN frames then leave the model and external frames are
      * delivered into the matching receive MOs. */
@@ -1542,7 +1564,7 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
      * set TC1797_ADC_DEFAULT=<0..4095> to give every channel a plausible
      * "sensor present" idle count so the firmware's scale path sees valid
      * inputs once it runs conversions (the faithful alt to DSPR injection). */
-    tc1797_adc_init(&s->adc);
+    tc1797_adc_init(&s->adc, TC1797_ADC0_BASE);
     {
         const char *d = getenv("TC1797_ADC_DEFAULT");
         if (d) {
@@ -1558,7 +1580,7 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
      * channel a plausible idle count (e.g. quiescent knock level). The firmware
      * uses the FADC for knock sensing -- a set count flows through its own
      * read+scale path, the faithful alternative to DSPR-level injection. */
-    tc1797_fadc_init(&s->fadc);
+    tc1797_fadc_init(&s->fadc, TC1797_FADC_BASE);
     {
         const char *d = getenv("TC1797_FADC_DEFAULT");
         if (d) {
@@ -1619,7 +1641,7 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
 
     /* GPTA0/GPTA1/LTCA2 timer arrays. tc1797_pcp_irq is a generic SRN-raise
      * (opaque + srpn -> tc1797_raise_srpn), reused here for capture-cell IRQs. */
-    tc1797_gpta_init(&s->gpta, tc1797_pcp_irq, s);
+    tc1797_gpta_init(&s->gpta, TC1797_GPTA_LO, tc1797_pcp_irq, s);
     s->gpta.t0_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->gpta.freerun = (getenv("TC1797_GPTA_FREERUN") != NULL);
     if (getenv("TC1797_GPTATEST")) {
@@ -1627,7 +1649,7 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     }
 
     /* E-Ray (FlexRay CC) POC state machine (driven by the firmware at phase 4). */
-    tc1797_eray_init(&s->eray);
+    tc1797_eray_init(&s->eray, TC1797_ERAY_BASE);
     if (getenv("TC1797_ERAYTEST")) {
         tc1797_eray_selftest();
     }
@@ -1635,7 +1657,7 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     /* DMA controller (block-move engine on its own thread; transfers run async
      * to the CPU and raise a completion service request via tc1797_pcp_irq, the
      * generic SRN-raise). Inert until the firmware enables+triggers a channel. */
-    tc1797_dma_init(&s->dma, tc1797_pcp_irq, s);
+    tc1797_dma_init(&s->dma, TC1797_DMA_BASE, tc1797_pcp_irq, s);
     if (getenv("TC1797_DMATEST")) {
         tc1797_dma_selftest();
     }

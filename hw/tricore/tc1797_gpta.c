@@ -5,9 +5,10 @@
 #include "qemu/error-report.h"
 #include "tc1797_gpta.h"
 
-void tc1797_gpta_init(Tc1797Gpta *g, GptaIrqFn irq_fn, void *opaque)
+void tc1797_gpta_init(Tc1797Gpta *g, uint32_t base, GptaIrqFn irq_fn, void *opaque)
 {
     memset(g, 0, sizeof(*g));
+    g->base = base;
     g->irq_fn = irq_fn;
     g->irq_opaque = opaque;
 }
@@ -19,6 +20,7 @@ static inline uint32_t gpta_idx(uint32_t addr)
 
 uint32_t tc1797_gpta_read(Tc1797Gpta *g, uint32_t addr, uint64_t now_ns)
 {
+    addr = TC1797_GPTA_LO + (addr - g->base);   /* relocate to IP-relative space */
     uint32_t idx = gpta_idx(addr);
     if (idx >= TC1797_GPTA_NREG) {
         return 0;
@@ -42,6 +44,7 @@ uint32_t tc1797_gpta_read(Tc1797Gpta *g, uint32_t addr, uint64_t now_ns)
 
 void tc1797_gpta_write(Tc1797Gpta *g, uint32_t addr, uint32_t val)
 {
+    addr = TC1797_GPTA_LO + (addr - g->base);
     uint32_t idx = gpta_idx(addr);
     if (idx < TC1797_GPTA_NREG) {
         g->shadow[idx] = val;
@@ -73,7 +76,7 @@ void tc1797_gpta_selftest(GptaIrqFn irq_fn, void *opaque)
 #define CHK(c) do { if (c) pass++; else { fail++; \
         error_report("GPTA selftest FAIL @%d", __LINE__); } } while (0)
 
-    tc1797_gpta_init(&g, gpta_test_irq, NULL);
+    tc1797_gpta_init(&g, TC1797_GPTA_LO, gpta_test_irq, NULL);
     g.freerun = true;
 
     /* free-running timer advances with virtual time */

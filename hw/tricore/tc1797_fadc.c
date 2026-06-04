@@ -12,9 +12,10 @@
 #define FADC_RESMASK 0xFFFu              /* 12-bit result (matches firmware scaling) */
 #define FADC_MODID   0x00B1C001u         /* module-ID shape (UM value best-effort) */
 
-void tc1797_fadc_init(Tc1797Fadc *f)
+void tc1797_fadc_init(Tc1797Fadc *f, uint32_t base)
 {
     memset(f, 0, sizeof(*f));
+    f->base = base;
     f->default_count = -1;
     for (int i = 0; i < TC1797_FADC_NCH; i++) {
         f->input[i] = -1;
@@ -32,7 +33,7 @@ static uint32_t fadc_res_word(Tc1797Fadc *f, int ch)
 
 uint32_t tc1797_fadc_read(Tc1797Fadc *f, uint32_t addr)
 {
-    uint32_t off = (addr - TC1797_FADC_BASE) & ~0x3u;
+    uint32_t off = (addr - f->base) & ~0x3u;
     if (off >= FADC_RES && off < FADC_RES + TC1797_FADC_NCH * 4) {
         return fadc_res_word(f, (off - FADC_RES) >> 2);
     }
@@ -47,7 +48,7 @@ uint32_t tc1797_fadc_read(Tc1797Fadc *f, uint32_t addr)
 
 void tc1797_fadc_write(Tc1797Fadc *f, uint32_t addr, uint32_t val)
 {
-    uint32_t off = (addr - TC1797_FADC_BASE) & ~0x3u;
+    uint32_t off = (addr - f->base) & ~0x3u;
     if (off >= TC1797_FADC_SIZE) {
         return;
     }
@@ -78,7 +79,7 @@ void tc1797_fadc_set_default(Tc1797Fadc *f, int count)
 void tc1797_fadc_selftest(void)
 {
     Tc1797Fadc f;
-    tc1797_fadc_init(&f);
+    tc1797_fadc_init(&f, TC1797_FADC_BASE);
     unsigned pass = 0, fail = 0;
 #define CHK(c) do { if (c) pass++; else { fail++; \
         error_report("FADC selftest FAIL @%d", __LINE__); } } while (0)

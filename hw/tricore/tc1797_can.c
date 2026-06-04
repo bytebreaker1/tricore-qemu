@@ -26,9 +26,10 @@ static inline uint32_t mo_word(unsigned n, unsigned moff)
     return (0x1000u + n * 0x20u + moff) >> 2;
 }
 
-void tc1797_can_init(Tc1797Can *c, CanTxFn tx_cb, void *opaque)
+void tc1797_can_init(Tc1797Can *c, uint32_t base, CanTxFn tx_cb, void *opaque)
 {
     memset(c, 0, sizeof(*c));
+    c->base = base;
     c->tx_cb = tx_cb;
     c->tx_opaque = opaque;
 }
@@ -88,6 +89,7 @@ static void can_panel_command(Tc1797Can *c, uint32_t panctr)
 
 uint32_t tc1797_can_read(Tc1797Can *c, uint32_t addr)
 {
+    addr = TC1797_CAN_BASE + (addr - c->base);   /* relocate to IP-relative space */
     uint32_t idx = can_idx(addr);
     if (addr >= TC1797_CAN_MO_BASE
         && addr < TC1797_CAN_MO_BASE + TC1797_CAN_NMO * 0x20) {
@@ -124,6 +126,7 @@ uint32_t tc1797_can_read(Tc1797Can *c, uint32_t addr)
 
 void tc1797_can_write(Tc1797Can *c, uint32_t addr, uint32_t val)
 {
+    addr = TC1797_CAN_BASE + (addr - c->base);
     uint32_t idx = can_idx(addr);
 
     if (addr == TC1797_CAN_PANCTR) {
@@ -204,7 +207,7 @@ bool tc1797_can_rx_inject(Tc1797Can *c, uint32_t can_id,
 void tc1797_can_selftest(CanTxFn tx_cb, void *opaque)
 {
     Tc1797Can c;
-    tc1797_can_init(&c, tx_cb, opaque);
+    tc1797_can_init(&c, TC1797_CAN_BASE, tx_cb, opaque);
     unsigned pass = 0, fail = 0;
 #define CHK(cond) do { if (cond) pass++; else { fail++; \
         error_report("CAN selftest FAIL @%d", __LINE__); } } while (0)

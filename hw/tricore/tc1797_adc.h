@@ -31,9 +31,10 @@ typedef struct AdcKernel {
 
 typedef struct Tc1797Adc {
     AdcKernel k[TC1797_ADC_NKERN];
+    uint32_t  base0;                     /* ADC0 base (kernel i at base0 + i*KSIZE) */
 } Tc1797Adc;
 
-void tc1797_adc_init(Tc1797Adc *a);
+void tc1797_adc_init(Tc1797Adc *a, uint32_t base0);
 bool tc1797_adc_is_addr(uint32_t addr);
 uint32_t tc1797_adc_read(Tc1797Adc *a, uint32_t addr);
 void tc1797_adc_write(Tc1797Adc *a, uint32_t addr, uint32_t val);

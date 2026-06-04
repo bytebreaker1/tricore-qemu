@@ -23,9 +23,10 @@ typedef struct Tc1797Fadc {
     int32_t  input[TC1797_FADC_NCH];     /* persistent channel count, -1 = none */
     int32_t  default_count;              /* idle baseline, -1 = silicon reset (read 0) */
     uint32_t regs[TC1797_FADC_NREG];     /* CLC + config read-back */
+    uint32_t base;                       /* module base (relocatable per part) */
 } Tc1797Fadc;
 
-void tc1797_fadc_init(Tc1797Fadc *f);
+void tc1797_fadc_init(Tc1797Fadc *f, uint32_t base);
 uint32_t tc1797_fadc_read(Tc1797Fadc *f, uint32_t addr);
 void tc1797_fadc_write(Tc1797Fadc *f, uint32_t addr, uint32_t val);
 /* Persistent per-channel conversion count (e.g. live knock amplitude). */

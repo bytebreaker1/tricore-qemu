@@ -28,9 +28,10 @@ typedef struct Tc1797Gpta {
     bool     freerun;                    /* expose free-running cell timers   */
     GptaIrqFn irq_fn;
     void *irq_opaque;
+    uint32_t base;                       /* block base (relocatable per part) */
 } Tc1797Gpta;
 
-void tc1797_gpta_init(Tc1797Gpta *g, GptaIrqFn irq_fn, void *opaque);
+void tc1797_gpta_init(Tc1797Gpta *g, uint32_t base, GptaIrqFn irq_fn, void *opaque);
 uint32_t tc1797_gpta_read(Tc1797Gpta *g, uint32_t addr, uint64_t now_ns);
 void tc1797_gpta_write(Tc1797Gpta *g, uint32_t addr, uint32_t val);
 /* Latch `value` into the capture register at `cell_off` (offset within the

@@ -12,9 +12,10 @@
 #define RESULT_MASK  0x3FFFu
 #define STATUS_READY 0x00000300u         /* kernel running, no pending conv */
 
-void tc1797_adc_init(Tc1797Adc *a)
+void tc1797_adc_init(Tc1797Adc *a, uint32_t base0)
 {
     memset(a, 0, sizeof(*a));
+    a->base0 = base0;
     for (int ki = 0; ki < TC1797_ADC_NKERN; ki++) {
         a->k[ki].default_count = -1;
         for (int n = 0; n < TC1797_ADC_NRES; n++) {
@@ -57,6 +58,7 @@ static uint32_t resr_word(AdcKernel *k, int n)
 
 uint32_t tc1797_adc_read(Tc1797Adc *a, uint32_t addr)
 {
+    addr = TC1797_ADC0_BASE + (addr - a->base0);   /* relocate to IP-relative space */
     uint32_t off;
     int ki = adc_decode(addr, &off);
     if (ki < 0) {
@@ -84,6 +86,7 @@ uint32_t tc1797_adc_read(Tc1797Adc *a, uint32_t addr)
 
 void tc1797_adc_write(Tc1797Adc *a, uint32_t addr, uint32_t val)
 {
+    addr = TC1797_ADC0_BASE + (addr - a->base0);
     uint32_t off;
     int ki = adc_decode(addr, &off);
     if (ki >= 0) {
@@ -114,7 +117,7 @@ void tc1797_adc_set_default(Tc1797Adc *a, int count)
 void tc1797_adc_selftest(void)
 {
     Tc1797Adc a;
-    tc1797_adc_init(&a);
+    tc1797_adc_init(&a, TC1797_ADC0_BASE);
     unsigned pass = 0, fail = 0;
 #define CHK(c) do { if (c) pass++; else { fail++; \
         error_report("ADC selftest FAIL @%d", __LINE__); } } while (0)

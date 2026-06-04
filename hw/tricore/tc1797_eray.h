@@ -19,9 +19,10 @@ typedef struct ErayCC {
     uint8_t  pocs;                     /* POC status (CCSV.POCS[5:0]) */
     uint8_t  last_cmd;
     uint32_t cmd_count;
+    uint32_t base;                     /* module base address (relocatable per part) */
 } ErayCC;
 
-void tc1797_eray_init(ErayCC *e);
+void tc1797_eray_init(ErayCC *e, uint32_t base);
 uint32_t tc1797_eray_read(ErayCC *e, uint32_t addr);
 void tc1797_eray_write(ErayCC *e, uint32_t addr, uint32_t val);
 void tc1797_eray_selftest(void);

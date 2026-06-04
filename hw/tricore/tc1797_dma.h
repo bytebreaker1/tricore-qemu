@@ -32,6 +32,7 @@ typedef struct Tc1797DmaCh {
 
 typedef struct Tc1797Dma {
     Tc1797DmaCh ch[TC1797_DMA_NCH];
+    uint32_t base;                  /* module base (relocatable per part) */
     uint64_t transfers;             /* completed block moves (telemetry) */
 
     /* worker thread */
@@ -45,7 +46,7 @@ typedef struct Tc1797Dma {
     void      *irq_opaque;
 } Tc1797Dma;
 
-void tc1797_dma_init(Tc1797Dma *d, DmaIrqFn irq_fn, void *opaque);
+void tc1797_dma_init(Tc1797Dma *d, uint32_t base, DmaIrqFn irq_fn, void *opaque);
 void tc1797_dma_start(Tc1797Dma *d);   /* spawn the worker thread */
 uint32_t tc1797_dma_read(Tc1797Dma *d, uint32_t addr);
 void tc1797_dma_write(Tc1797Dma *d, uint32_t addr, uint32_t val);
