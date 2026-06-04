@@ -28,9 +28,21 @@ for source, dest in json.loads(out).items():
     try:
         os.symlink(source, bundle_dest)
     except BaseException as e:
-        if not isinstance(e, OSError) or e.errno != errno.EEXIST:
-            if os.name == 'nt':
-                print('Please enable Developer Mode to support soft link '
-                      'without Administrator permission')
+        if isinstance(e, OSError) and e.errno == errno.EEXIST:
+            pass
+        elif os.name == 'nt':
+            # Windows non-admin can't create symlinks without Developer Mode.
+            # Best-effort COPY into the bundle, and NEVER fail the postconf: the
+            # qemu-bundle is a run-from-build convenience, and a headless TriCore
+            # board needs no bundled data files. (Re-runs hit existing entries.)
+            try:
+                import shutil
+                if os.path.isdir(source):
+                    shutil.copytree(source, bundle_dest, dirs_exist_ok=True)
+                elif not os.path.exists(bundle_dest):
+                    shutil.copy2(source, bundle_dest)
+            except BaseException as e2:
+                print(f'warning: skip bundle entry {dest}: {e2}', file=sys.stderr)
+        else:
             print(f'error making symbolic link {dest}', file=sys.stderr)
             raise e

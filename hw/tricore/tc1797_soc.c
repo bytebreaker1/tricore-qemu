@@ -97,8 +97,9 @@ struct TC1797SoCState {
     uint32_t stm_icr;            /* ICR: CMP0EN[0],CMP0IR[1],CMP0OS[2],CMP1EN[4],... */
     uint32_t stm_isrr;           /* compare-match service-request pending bits */
     uint32_t stm_src0, stm_src1; /* STM SRC0/SRC1 nodes @0xF00002F8/FC (SRPN/SRE) */
-    QEMUTimer *stm_timer;        /* drives the CMP0 systick interrupt */
+    QEMUTimer *stm_timer;        /* drives the CMP0/CMP1 systick interrupts */
     int64_t stm_period_ns;       /* derived OSEK tick period */
+    unsigned stm_rr;             /* round-robin across the enabled STM compares */
     uint32_t ssc_tb[2];          /* SSC0/SSC1 transmit-buffer shadow (loopback) */
     uint32_t ssc_src[2][2];      /* SSC0/1 service-request nodes [unit][0]=+0xF8 (xfer), [1]=+0xFC (queue) */
     bool sw_reset_pending;       /* set when 0xF0000560=2 requested a SW reset */
@@ -137,7 +138,7 @@ struct TC1797SoCState {
     Tc1797Jtag jtag;             /* JTAG TAP + Cerberus/OCDS debug interface */
     Tc1797Gpta gpta;             /* GPTA0/1 + LTCA2 timer arrays (capture/compare) */
     bool en_can, en_adc, en_gpta; /* per-peripheral dispatch gates (bisect/safety) */
-    uint32_t port_out[12];       /* GPIO P0..P11 output latch (observable) */
+    uint32_t port_out[20];       /* GPIO output latch: P0-P11 (idx 0-11) + Port10/11 block @0xF0300000 (idx 12-19) */
     ErayCC eray;                 /* E-Ray (FlexRay CC) POC state machine */
     Tc1797Dma dma;               /* DMA controller (block-move engine) */
     QEMUTimer *bootstrap_timer;  /* coding-marker bootstrap (env TC1797_BOOTSTRAP) */
@@ -192,15 +193,21 @@ static uint64_t tc1797_stm_count56(void)
  * the CPU takes it if ICR.IE && SRPN > CCPN and vectors to BIV + SRPN*32. The
  * firmware's tick ISR advances the OSEK time base/counter and re-arms CMP0.
  */
+/* A compare channel's tick is live when: compares configured (CMCON), the
+ * channel match is enabled (ICR.CMP0EN bit0 / CMP1EN bit4), and its SRC node is
+ * CPU-routed (TOS bit10 == 0) + enabled (SRE bit12). ch=0 -> CMP0/SRC0,
+ * ch=1 -> CMP1/SRC1. */
+static bool tc1797_stm_cmp_enabled(TC1797SoCState *s, int ch)
+{
+    uint32_t en  = ch ? (s->stm_icr & 0x10u) : (s->stm_icr & 1u);
+    uint32_t src = ch ? s->stm_src1 : s->stm_src0;
+    return (s->stm_cmcon != 0) && en
+        && ((src >> 12) & 1u) && !((src >> 10) & 1u);
+}
+
 static bool tc1797_stm_enabled(TC1797SoCState *s)
 {
-    /* CMP0 tick live when: compares configured (CMCON), CMP0 match enabled
-     * (ICR.CMP0EN bit0), and the SRC0 node is CPU-routed + enabled (SRE bit12,
-     * TOS bit10 == 0). */
-    return (s->stm_cmcon != 0)
-        && (s->stm_icr & 1u)
-        && ((s->stm_src0 >> 12) & 1u)
-        && !((s->stm_src0 >> 10) & 1u);
+    return tc1797_stm_cmp_enabled(s, 0);   /* CMP0 drives the timer arm/period */
 }
 
 static void tc1797_stm_arm(TC1797SoCState *s)
@@ -235,19 +242,46 @@ static void tc1797_stm_tick(void *opaque)
 {
     TC1797SoCState *s = opaque;
     CPUTriCoreState *env = &s->cpu.env;
-    uint32_t srpn0;
+    /*
+     * The MEVD17 OSEK time base runs on three firmware-armed service-request
+     * sources: STM CMP0 (SRC0 -> SRPN 8) and STM CMP1 (SRC1 -> SRPN 7) for the
+     * OS counters, plus the CPU service node (0xF7E0FFFC -> SRPN 1) the
+     * scheduler sets (SRR) to request a task dispatch. The phase 3 -> phase 4
+     * promotion needs all three to advance; the simplified ICU presents one
+     * pending priority at a time, and the higher STM ticks (7/8) would
+     * permanently starve the lower SRPN-1 dispatch -- so round-robin whichever
+     * are currently armed/pending, one per tick. (This is the faithful,
+     * firmware-driven analogue of the opt-in forced systick: it fires only the
+     * sources the firmware itself enabled, at the firmware's STM cadence.)
+     */
+    bool act[3];
+    uint32_t srpn[3];
+    act[0] = tc1797_stm_cmp_enabled(s, 0);  srpn[0] = s->stm_src0 & 0xFFu;  /* CMP0 */
+    act[1] = tc1797_stm_cmp_enabled(s, 1);  srpn[1] = s->stm_src1 & 0xFFu;  /* CMP1 */
+    act[2] = ((s->cpu_src >> 13) & 1u)      /* SRR pending */
+          && ((s->cpu_src >> 12) & 1u)      /* SRE enabled */
+          && !((s->cpu_src >> 10) & 1u);    /* TOS=0 (CPU) */
+    srpn[2] = s->cpu_src & 0xFFu;                                            /* cpu_src */
 
-    if (!tc1797_stm_enabled(s)) {
-        return;
+    int pick = -1;
+    for (int i = 0; i < 3; i++) {
+        int idx = (s->stm_rr + i) % 3;
+        if (act[idx]) { pick = idx; break; }
     }
-    s->stm_isrr |= 1;                              /* CMP0 request pending */
-    s->stm_icr |= 2;                               /* CMP0IR match flag (ICR bit1) */
-    srpn0 = s->stm_src0 & 0xFFu;                   /* SRPN from the SRC0 node (=1) */
-    if (srpn0 >= FIELD_EX32(env->ICR, ICR, PIPN)) {
-        env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, srpn0);
+    if (pick < 0) {
+        return;                                    /* nothing armed/pending */
+    }
+    s->stm_rr = (pick + 1) % 3;
+    if (pick == 0) {
+        s->stm_isrr |= 1; s->stm_icr |= 2;         /* CMP0 request + CMP0IR */
+    } else if (pick == 1) {
+        s->stm_isrr |= 2; s->stm_icr |= 0x20u;     /* CMP1 request + CMP1IR */
+    }
+    if (srpn[pick] >= FIELD_EX32(env->ICR, ICR, PIPN)) {
+        env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, srpn[pick]);
     }
     cpu_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
-    /* Keep ticking even if the ISR doesn't re-arm CMP0 itself. */
+    /* Keep ticking even if the ISR doesn't re-arm the compare itself. */
     timer_mod(s->stm_timer,
               qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->stm_period_ns);
 }
@@ -342,8 +376,13 @@ static void tc1797_stm_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
  * The MEVD17 ERCOSEK kernel advances its time base and expires its alarms from
  * periodic timer interrupts; the phase 3 -> phase 4 promotion (master-task
  * activation + periodic-task arming) only happens once those ticks arrive.
- * Pre-promotion the firmware never arms the STM CMP0 compare itself, so on bare
- * QEMU the RTOS sits in phase 3 forever (the STM engine above stays dormant).
+ * The firmware DOES arm its tick sources -- STM CMP0 (SRC0 -> SRPN 8), STM CMP1
+ * (SRC1 -> SRPN 7), and the cpu_src dispatch node (0xF7E0FFFC -> SRPN 1) -- and
+ * the STM engine above now round-robins all three, which drives the phase
+ * 3 -> phase 4 promotion ORGANICALLY by default (verified: phase byte
+ * 0xD0003643 reaches 4 with the full DME periodic CAN-TX set). This forced
+ * systick is therefore now a LEGACY opt-in fallback (TC1797_SYSTICK, OFF by
+ * default), kept only for bring-up experiments; the STM path supersedes it.
  *
  * The bridge drives it by injecting interrupts at SRPN 1, 7, 8 round-robin at
  * ~1 ms (three independent OSEK counters; one fire == one counter advance). We
@@ -966,6 +1005,13 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
         /* other port registers fall through (read 0, logged) */
     }
 
+    /* Second port block @0xF0300000 (Port 10/11 controller): reads fall through
+     * (return 0, as silicon-reset). Pn_IN is NOT forced high here -- unlike the
+     * P0..P11 block (where Pn_IN=0xFFFFFFFF models KL15/strap pins the firmware
+     * needs high), these inputs feed boot-config branches and forcing them high
+     * diverts the boot. The output latch is still tracked on WRITE (see below)
+     * for observability. */
+
     /* PCP control registers (0xF0043F00..0xF0043FFF): module ID; the rest read
      * 0 (firmware tolerates) -- PCP_CS config is captured on write. */
     if (addr >= 0xF0043F00u && addr <= 0xF0043FFFu) {
@@ -1083,6 +1129,19 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
         if (addr >= 0xF0000000u && addr < 0xF0200000u) {
             return s->sfr_shadow[(addr - 0xF0000000u) >> 2];
         }
+        /* PMI register block (0xF87Fxxxx): instruction-memory-interface control.
+         * Read 0 (NOT read-back): these include self-clearing command/status bits
+         * (e.g. cache invalidate) the firmware polls during early boot -- reading
+         * back the written value hangs that poll. QEMU fetches directly, so 0 is
+         * correct. Quiet (the firmware writes these on every init). */
+        if (addr >= 0xF87F0000u && addr < 0xF8800000u) {
+            return 0;
+        }
+        /* Top-of-SFR (0xFFFF0000+): the firmware issues a per-tick write-0 burst
+         * to 0xFFFFC000 with no read-back dependency -- return 0 quietly. */
+        if (addr >= 0xFFFF0000u) {
+            return 0;
+        }
         qemu_log_mask(LOG_UNIMP,
                       "tc1797.sfr: read  0x%08x (size %u) -> 0\n", addr, size);
         return 0;
@@ -1132,6 +1191,20 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
         } else if (pn < 12 && po == 0x04u) {
             uint32_t v = (uint32_t)val;
             s->port_out[pn] = (s->port_out[pn] | (v & 0xFFFFu)) & ~((v >> 16) & 0xFFFFu);
+        }
+        return;
+    }
+    /* Second port block @0xF0300000 (Port 10/11): latch Pn_OUT (+0x00) / Pn_OMR
+     * (+0x04) at port_out[12 + n], mirroring the P0..P11 block above. */
+    if (addr >= 0xF0300000u && addr < 0xF0300800u) {
+        unsigned pn = (addr - 0xF0300000u) >> 8;
+        unsigned po = addr & 0xFFu;
+        if (po == 0x00u) {
+            s->port_out[12 + pn] = (uint32_t)val;
+        } else if (po == 0x04u) {
+            uint32_t v = (uint32_t)val;
+            s->port_out[12 + pn] =
+                (s->port_out[12 + pn] | (v & 0xFFFFu)) & ~((v >> 16) & 0xFFFFu);
         }
         return;
     }
@@ -1274,6 +1347,16 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
          * here, so this only backs the otherwise-unmodeled config registers. */
         if (addr >= 0xF0000000u && addr < 0xF0200000u) {
             s->sfr_shadow[(addr - 0xF0000000u) >> 2] = (uint32_t)val;
+            break;
+        }
+        /* PMI register block (0xF87Fxxxx): instruction-memory-interface control
+         * (cache/scratchpad config). No functional effect under QEMU's direct
+         * fetch; ignore quietly (reads return 0, see the matching read default). */
+        if (addr >= 0xF87F0000u && addr < 0xF8800000u) {
+            break;
+        }
+        /* Top-of-SFR (0xFFFF0000+): benign per-tick write-0 burst -- ignore quietly. */
+        if (addr >= 0xFFFF0000u) {
             break;
         }
         qemu_log_mask(LOG_UNIMP,
