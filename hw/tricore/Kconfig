@@ -11,3 +11,10 @@ config TRIBOARD
 
 config TC27X_SOC
     bool
+
+config TC1797_SOC
+    bool
+    default y
+    depends on TRICORE
+    select UNIMP
+    select CAN_BUS

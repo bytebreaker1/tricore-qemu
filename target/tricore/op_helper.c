@@ -110,6 +110,15 @@ static void raise_exception_sync_helper(CPUTriCoreState *env, uint32_t class,
     raise_exception_sync_internal(env, class, tin, pc, 0);
 }
 
+/* Range-based memory-protection trap (TRAPC_PROT, class 1). Called from the
+ * softmmu fault path (tricore_cpu_tlb_fill) with the host return address so
+ * cpu_restore_state recovers the guest PC of the faulting access. */
+G_NORETURN void tricore_raise_protection_trap(CPUTriCoreState *env,
+                                              uint32_t tin, uintptr_t pc)
+{
+    raise_exception_sync_internal(env, TRAPC_PROT, tin, pc, 0);
+}
+
 /* Addressing mode helper */
 
 static uint16_t reverse16(uint16_t val)
@@ -2529,6 +2538,66 @@ static void restore_context_lower(CPUTriCoreState *env, uint32_t ea,
     env->gpr_d[5] = cpu_ldl_le_data(env, ea + 52);
     env->gpr_d[6] = cpu_ldl_le_data(env, ea + 56);
     env->gpr_d[7] = cpu_ldl_le_data(env, ea + 60);
+}
+
+/*
+ * TC1797 hardware-interrupt entry (ported from the e:fs QEMU TriCore fork,
+ * adapted to mainline). Mainline stubs interrupts out; this implements the
+ * canonical interrupt-entry sequence (Architecture Vol.1 §5): save upper
+ * context to the CSA at FCX, build PCXI (UL=1, PIE=old IE, PCPN=old CCPN),
+ * disable IE, switch to the interrupt stack, set supervisor mode, ICR.CCPN =
+ * ICR.PIPN, A[11] = return PC, then vector to BIV + PIPN*(VSS?8:32). The board
+ * raises an interrupt by setting ICR.PIPN + cpu_interrupt(CPU_INTERRUPT_HARD);
+ * tricore_cpu_exec_interrupt gates on IE && PIPN>CCPN and calls this.
+ */
+void tricore_cpu_do_interrupt(CPUState *cs)
+{
+    TriCoreCPU *cpu = TRICORE_CPU(cs);
+    CPUTriCoreState *env = &cpu->env;
+    target_ulong ea, new_FCX, psw;
+    uint32_t pipn;
+
+    psw = psw_read(env);
+    cs->exception_index = -1;
+
+    if (env->PSW & MASK_PSW_CDE) {
+        cdc_increment(&psw);            /* CDO trap path omitted (per e:fs) */
+    }
+    psw = (env->PSW & ~MASK_PSW_CDE) | (1u << 7);
+
+    /* Save upper context of the interrupted task into the CSA at FCX. */
+    ea = ((env->FCX & MASK_FCX_FCXS) << 12) + ((env->FCX & MASK_FCX_FCXO) << 6);
+    new_FCX = cpu_ldl_le_data(env, ea);
+    helper_stucx(env, ea);
+
+    env->PSW = psw;
+    pcxi_set_ul(env, 1);
+    pcxi_set_pie(env, icr_get_ie(env)); /* PCXI.PIE = old ICR.IE */
+    icr_set_ie(env, 0);                 /* globally disable interrupts */
+    pcxi_set_pcpn(env, icr_get_ccpn(env)); /* PCXI.PCPN = old ICR.CCPN */
+
+    /* Switch to the interrupt stack if not already on it (PSW.IS). */
+    if (((env->PSW & MASK_PSW_IS) >> 9) == 0) {
+        env->gpr_a[10] = env->ISP;
+        env->PSW = (env->PSW & ~MASK_PSW_IS) | (1u << 9);
+    }
+    env->PSW = (env->PSW & ~MASK_PSW_IO) | (0b10u << 10);  /* supervisor */
+    env->PSW = (env->PSW & ~MASK_PSW_PRS);                 /* PRS = 0 */
+    env->PSW = (env->PSW & ~MASK_PSW_CDC);                 /* CDC = 0 */
+    env->PSW = (env->PSW & ~MASK_PSW_CDE) | (1u << 7);     /* CDE = 1 */
+    env->PSW = (env->PSW & ~MASK_PSW_GW);                  /* GW = 0 */
+
+    /* ICR.CCPN = ICR.PIPN (the interrupt now becomes the current priority). */
+    pipn = FIELD_EX32(env->ICR, ICR, PIPN);
+    env->ICR = FIELD_DP32(env->ICR, ICR, CCPN, pipn);
+
+    env->gpr_a[11] = env->PC;           /* return address */
+    /* New PC = BIV + PIPN * (BIV.VSS ? 8 : 32). */
+    env->PC = (env->BIV & 0xFFFFFFFEu) | (pipn << ((env->BIV & 0x1u) ? 3 : 5));
+
+    /* Advance the CSA free-list: PCXI[19:0] = FCX[19:0]; FCX = new_FCX. */
+    env->PCXI = (env->PCXI & 0xfff00000u) | (env->FCX & 0xfffffu);
+    env->FCX = (env->FCX & 0xfff00000u) | (new_FCX & 0xfffffu);
 }
 
 void helper_call(CPUTriCoreState *env, uint32_t next_pc)

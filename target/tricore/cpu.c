@@ -21,6 +21,7 @@
 #include "qapi/error.h"
 #include "cpu.h"
 #include "exec/translation-block.h"
+#include "exec/cpu-interrupt.h"
 #include "qemu/error-report.h"
 #include "tcg/debug-assert.h"
 #include "accel/tcg/cpu-ops.h"
@@ -168,7 +169,33 @@ static void tc37x_initfn(Object *obj)
 
 static bool tricore_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 {
-    /* Interrupts are not implemented */
+    TriCoreCPU *cpu = TRICORE_CPU(cs);
+    CPUTriCoreState *env = &cpu->env;
+
+    /* Take a pending hardware interrupt when globally enabled (ICR.IE, TC1.3
+     * bit 8) and its priority (ICR.PIPN) is higher than the current CPU
+     * priority (ICR.CCPN). The board's interrupt controller sets PIPN and
+     * raises CPU_INTERRUPT_HARD; tricore_cpu_do_interrupt does the entry. */
+    if ((interrupt_request & CPU_INTERRUPT_HARD)
+            && FIELD_EX32(env->ICR, ICR, IE_13)
+            && FIELD_EX32(env->ICR, ICR, PIPN) > FIELD_EX32(env->ICR, ICR, CCPN)) {
+        tricore_cpu_do_interrupt(cs);
+        /*
+         * Service-entry acknowledge. On TC1.3.1 the interrupt control unit
+         * clears the winning Service Request Node's request when the CPU enters
+         * the handler, then re-arbitrates PIPN from whatever sources are still
+         * asserting. The board models a single active source at a time (the STM
+         * systick / CPU-SRN dispatch the firmware uses), so deassert PIPN and the
+         * latched CPU_INTERRUPT_HARD here: that makes an edge-triggered (injected)
+         * request a true one-shot, so it is NOT re-taken when the handler's rfe
+         * restores ICR.CCPN below PIPN. A level source (e.g. an un-acked STM
+         * compare match) simply re-raises HARD from its own device model on the
+         * next tick, so this does not lose a still-pending request.
+         */
+        env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, 0);
+        cpu_reset_interrupt(cs, CPU_INTERRUPT_HARD);
+        return true;
+    }
     return false;
 }
 

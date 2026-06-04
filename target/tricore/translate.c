@@ -385,6 +385,24 @@ static void gen_mtcr(DisasContext *ctx, TCGv_i32 r1, int32_t offset)
         if (offset == 0xfe04) {
             gen_helper_psw_write(tcg_env, r1);
             ctx->base.is_jmp = DISAS_EXIT_UPDATE;
+        } else if (offset == 0xfe2c) {
+            /*
+             * ICR: the Pending Interrupt Priority Number (PIPN, bits[23:16]) is
+             * driven by the interrupt control unit and is READ-ONLY to the CPU --
+             * `mtcr ICR` writes CCPN/IE but must not overwrite PIPN. The default
+             * codegen below stores the whole operand, which would wipe a pending
+             * request the board raised (via cpu_interrupt + ICR.PIPN) every time
+             * the firmware adjusts CCPN/IE for an OSEK priority level, so the
+             * injected interrupt is never taken. Merge: keep the current PIPN,
+             * take all other bits from the operand.
+             */
+            TCGv_i32 merged = tcg_temp_new_i32();
+            TCGv_i32 keep = tcg_temp_new_i32();
+            tcg_gen_ld_i32(keep, tcg_env, offsetof(CPUTriCoreState, ICR));
+            tcg_gen_andi_i32(keep, keep, R_ICR_PIPN_MASK);
+            tcg_gen_andi_i32(merged, r1, ~R_ICR_PIPN_MASK);
+            tcg_gen_or_i32(merged, merged, keep);
+            tcg_gen_st_i32(merged, tcg_env, offsetof(CPUTriCoreState, ICR));
         } else {
             switch (offset) {
 #include "csfr.h.inc"

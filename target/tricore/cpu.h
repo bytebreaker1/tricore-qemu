@@ -81,6 +81,13 @@ struct TriCoreCPUClass {
 
 hwaddr tricore_cpu_get_phys_addr_debug(CPUState *cpu, vaddr addr);
 void tricore_cpu_dump_state(CPUState *cpu, FILE *f, int flags);
+void tricore_cpu_do_interrupt(CPUState *cs);
+/* Deliver a TC1.3.1 range-based memory-protection trap (class 1: MPR/MPW/MPX)
+ * from the softmmu tlb_fill path. NORETURN: vectors to BTV and longjmps out. */
+G_NORETURN void tricore_raise_protection_trap(CPUTriCoreState *env,
+                                              uint32_t tin, uintptr_t pc);
+/* Opt-in self-test of the range-based protection logic (TC1797_MPUTEST=1). */
+void tricore_mpu_selftest(void);
 
 FIELD(PCXI, PCPN_13, 24, 8)
 FIELD(PCXI, PCPN_161, 22, 8)
