@@ -22,6 +22,11 @@
 typedef void (*CanTxFn)(void *opaque, uint32_t can_id,
                         const uint8_t *data, unsigned len);
 
+/* A frame was accepted into receive MO `mo_index`. The SoC routes it
+ * (MOIPR.RXINP -> CAN interrupt SRC node -> SRPN) into the CPU interrupt path.
+ * Without this the firmware's interrupt-driven CAN RX never wakes. */
+typedef void (*CanRxIrqFn)(void *opaque, int mo_index);
+
 typedef struct Tc1797CanMO {
     uint32_t id;            /* arbitration ID (11-bit standard) */
     uint32_t mask;          /* acceptance mask                  */
@@ -39,6 +44,8 @@ typedef struct Tc1797Can {
     uint8_t mo_list[TC1797_CAN_NMO];   /* PANCTR list membership (0=unalloc) */
     CanTxFn tx_cb;
     void *tx_opaque;
+    CanRxIrqFn rx_irq_cb;       /* raise the MO's RX service request (optional) */
+    void *rx_irq_opaque;
     uint64_t tx_count, rx_count;
 } Tc1797Can;
 

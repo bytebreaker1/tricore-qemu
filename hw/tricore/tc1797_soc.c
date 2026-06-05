@@ -43,6 +43,7 @@
 #include "tc1797_jtag.h"
 #include "tricore_soc.h"
 #include "chardev/char.h"
+#include "chardev/char-fe.h"
 #include "system/system.h"
 #include "net/can_emu.h"
 #include "qom/object_interfaces.h"
@@ -135,6 +136,15 @@ struct TC1797SoCState {
     Tc1797Can can;               /* MultiCAN controller (TX/RX + message objects) */
     CanBusState *canbus;         /* optional QEMU CAN bus backend (-object can-bus) */
     CanBusClientState can_client;/* this SoC's client on the CAN bus */
+    CharFrontend can_tun;        /* optional CAN tunnel to host (-chardev ...,id=can0) */
+    char can_tun_rx[160];        /* line-accumulation buffer for inbound tunnel frames */
+    unsigned can_tun_rxlen;
+    CharFrontend eray_tun;       /* optional E-Ray/CP tunnel to host (-chardev ...,id=fray0) */
+    char eray_tun_rx[320];       /* line-accumulation buffer for inbound CP frames */
+    unsigned eray_tun_rxlen;
+    CharFrontend mem_tun;        /* optional memory peek/poke tunnel (-chardev ...,id=mem0) */
+    char mem_tun_rx[1088];       /* line-accumulation buffer (W cmd: addr + up to 512B hex) */
+    unsigned mem_tun_rxlen;
     Tc1797Asc asc0, asc1;        /* ASC0/ASC1 UARTs (chardev-backed) */
     uint32_t scu_nmisr;          /* SCU NMI status (ESR1/NMI request) */
     uint32_t dts_stat;           /* DTS status (RDY + RESULT = die temperature) */
@@ -250,6 +260,33 @@ static void tc1797_stm_ack(TC1797SoCState *s)
     cpu_reset_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
 }
 
+/*
+ * Highest-priority CPU-routed CAN RX service request currently pending, or 0.
+ * Re-derived from the MOs' rx_pending flags (the source of truth) each tick:
+ * a receive MO with a frame waiting routes via MOIPR.RXINP to a CAN interrupt
+ * SRC node (0xF00040C0+node*4); if that node targets the CPU (TOS==0, SRE) its
+ * SRPN is a pending request. This makes CAN RX a *level* source (it persists
+ * until the firmware reads the MO and rx_pending clears) so the single-slot ICU
+ * can't drop it under a busier higher-priority source. Cheap: the common
+ * no-pending case is a 128-bool scan; SRC lookups happen only for live frames.
+ */
+static uint8_t tc1797_can_pending_rx_srpn(TC1797SoCState *s)
+{
+    Tc1797Can *c = &s->can;
+    uint8_t best = 0;
+    for (int n = 0; n < TC1797_CAN_NMO; n++) {
+        if (!c->mo[n].rx_pending || c->mo[n].dir != 0) {
+            continue;
+        }
+        uint32_t moipr = tc1797_can_read(c, TC1797_CAN_MO_BASE + n * 0x20 + 0x08);
+        uint8_t srpn = (moipr >> 8) & 0x1Fu;   /* MO RX SRN priority */
+        if (srpn > best) {
+            best = srpn;
+        }
+    }
+    return best;
+}
+
 static void tc1797_stm_tick(void *opaque)
 {
     TC1797SoCState *s = opaque;
@@ -266,24 +303,28 @@ static void tc1797_stm_tick(void *opaque)
      * firmware-driven analogue of the opt-in forced systick: it fires only the
      * sources the firmware itself enabled, at the firmware's STM cadence.)
      */
-    bool act[3];
-    uint32_t srpn[3];
+    bool act[4];
+    uint32_t srpn[4];
     act[0] = tc1797_stm_cmp_enabled(s, 0);  srpn[0] = s->stm_src0 & 0xFFu;  /* CMP0 */
     act[1] = tc1797_stm_cmp_enabled(s, 1);  srpn[1] = s->stm_src1 & 0xFFu;  /* CMP1 */
     act[2] = ((s->cpu_src >> 13) & 1u)      /* SRR pending */
           && ((s->cpu_src >> 12) & 1u)      /* SRE enabled */
           && !((s->cpu_src >> 10) & 1u);    /* TOS=0 (CPU) */
     srpn[2] = s->cpu_src & 0xFFu;                                            /* cpu_src */
+    srpn[3] = tc1797_can_pending_rx_srpn(s);  act[3] = (srpn[3] != 0); /* CAN RX */
 
+    /* Round-robin all four armed/pending sources (3 OSEK + CAN RX), one per tick,
+     * so no source starves another. CAN RX persists (re-derived from MO
+     * rx_pending) until the firmware's CAN ISR reads the MO. */
     int pick = -1;
-    for (int i = 0; i < 3; i++) {
-        int idx = (s->stm_rr + i) % 3;
+    for (int i = 0; i < 4; i++) {
+        int idx = (s->stm_rr + i) % 4;
         if (act[idx]) { pick = idx; break; }
     }
     if (pick < 0) {
         return;                                    /* nothing armed/pending */
     }
-    s->stm_rr = (pick + 1) % 3;
+    s->stm_rr = (pick + 1) % 4;
     if (pick == 0) {
         s->stm_isrr |= 1; s->stm_icr |= 2;         /* CMP0 request + CMP0IR */
     } else if (pick == 1) {
@@ -475,6 +516,27 @@ static void tc1797_pcp_irq(void *opaque, uint8_t srpn)
 }
 
 /*
+ * MultiCAN RX -> CPU service request. A frame was accepted into receive MO
+ * `mo`; the faithful TC1797 MultiCAN pulses that MO's interrupt output. Route
+ * MOIPR.RXINP (bits[11:8]) to one of the 16 CAN interrupt SRC nodes at
+ * 0xF00040C0 + node*4; if that node is enabled (SRE) and targets the CPU
+ * (TOS==0), raise its SRPN. Without this the firmware's interrupt-driven CAN
+ * RX never wakes -- NEWDAT just piles up unread, so it never consumes RX
+ * frames nor answers UDS/diagnostic requests. (PCP-routed nodes (TOS==1) are
+ * left for the PCP path; the diag + FEM RX objects here target the CPU.)
+ */
+static void tc1797_can_rx_irq(void *opaque, int mo)
+{
+    TC1797SoCState *s = opaque;
+    uint32_t moipr = tc1797_can_read(&s->can,
+                                     TC1797_CAN_MO_BASE + mo * 0x20 + 0x08);
+    uint8_t srpn = (moipr >> 8) & 0x1Fu;               /* MO RX SRN priority */
+    if (srpn) {
+        tc1797_raise_srpn(s, srpn);                    /* prompt best-effort raise */
+    }
+}
+
+/*
  * MultiCAN TX: the firmware committed a frame (MOCTR SET-TXRQ). Surface it
  * (rate-limited). A QEMU CAN-bus backend can be attached here later so the
  * frame leaves the model; for now it is logged + counted in s->can.
@@ -497,6 +559,18 @@ static void tc1797_can_tx(void *opaque, uint32_t can_id,
         f.can_dlc = len > 8 ? 8 : len;
         memcpy(f.data, data, f.can_dlc);
         can_bus_client_send(&s->can_client, &f, 1);
+    }
+    /* Stream out the host CAN tunnel (-chardev ...,id=can0) as one ASCII line
+     * "<id_hex>#<data_hex>\n", so a front-end can observe DME TX directly. */
+    {
+        char line[64];
+        unsigned n = len > 8 ? 8 : len;
+        int o = snprintf(line, sizeof(line), "%x#", can_id);
+        for (unsigned i = 0; i < n && o < (int)sizeof(line) - 3; i++) {
+            o += snprintf(line + o, sizeof(line) - o, "%02x", data[i]);
+        }
+        line[o++] = '\n';
+        qemu_chr_fe_write_all(&s->can_tun, (const uint8_t *)line, o);
     }
 }
 
@@ -525,6 +599,247 @@ static CanBusClientInfo tc1797_can_bus_info = {
     .can_receive = tc1797_can_bus_can_receive,
     .receive = tc1797_can_bus_receive,
 };
+
+/* ── Host CAN tunnel (chardev id=can0): inject inbound frames into the DME ──
+ * Line protocol: "<id_hex>#<data_hex>\n", e.g. "135#0102030405060708". Each
+ * complete line is parsed and pushed through the normal MultiCAN RX acceptance
+ * path (tc1797_can_rx_inject), exactly as an on-bus frame would be. */
+static void tc1797_can_tun_parse(TC1797SoCState *s, const char *line)
+{
+    char *p = NULL;
+    unsigned long id = strtoul(line, &p, 16);
+    uint8_t data[8] = { 0 };
+    unsigned dlc = 0;
+    if (p && *p == '#') {
+        p++;
+        while (dlc < 8 && p[0] && p[1]) {
+            char b[3] = { p[0], p[1], 0 };
+            data[dlc++] = (uint8_t)strtoul(b, NULL, 16);
+            p += 2;
+        }
+    }
+    {
+        static unsigned rn;
+        if (rn < 8) {
+            rn++;
+            info_report("tc1797: CAN tunnel RX inject id=0x%x dlc=%u",
+                        (uint32_t)id, dlc);
+        }
+    }
+    tc1797_can_rx_inject(&s->can, (uint32_t)id, data, dlc);
+}
+
+static int tc1797_can_tun_can_receive(void *opaque)
+{
+    return 64;                       /* accept up to this many bytes per call */
+}
+
+static void tc1797_can_tun_receive(void *opaque, const uint8_t *buf, int size)
+{
+    TC1797SoCState *s = opaque;
+    for (int i = 0; i < size; i++) {
+        char c = (char)buf[i];
+        if (c == '\n' || c == '\r') {
+            if (s->can_tun_rxlen) {
+                s->can_tun_rx[s->can_tun_rxlen] = 0;
+                tc1797_can_tun_parse(s, s->can_tun_rx);
+                s->can_tun_rxlen = 0;
+            }
+        } else if (s->can_tun_rxlen < sizeof(s->can_tun_rx) - 1) {
+            s->can_tun_rx[s->can_tun_rxlen++] = c;
+        } else {
+            s->can_tun_rxlen = 0;    /* overrun: drop the malformed line */
+        }
+    }
+}
+
+/* ── Host E-Ray/CP tunnel (chardev id=fray0): the CAS/immobilizer challenge-
+ * response runs over the E-Ray transport, which this firmware drives through a
+ * DSPR CP message struct + a PRAM command buffer + a doorbell SFR (not the
+ * E-Ray register block). The tunnel:
+ *   - TX (DME->host): on the doorbell write (0xF00027B1 bit7) snapshot the CP
+ *     command/type words, mark the controller "done" so the firmware's post-TX
+ *     poll proceeds, and emit "ERAYTX <be0> <be8>\n". The front-end then reads
+ *     the full outbound CP buffer over gdb and computes the response.
+ *   - RX (host->DME): a line "<cmd>:<type>:<payloadhex>" is written into the CP
+ *     RX struct at DSPR 0xD0012FAE; the firmware's CP sequencer consumes it on
+ *     its next task dispatch (the path is task-scheduled, not IRQ-driven). */
+#define TC1797_CP_RX_CMD     0xD0012FAEu   /* cmd byte                        */
+#define TC1797_CP_RX_PAYLOAD 0xD0012FAFu   /* payload[0..128]                 */
+#define TC1797_CP_RX_LEN     0xD0013030u   /* length byte                     */
+#define TC1797_CP_RX_TYPE    0xD0013031u   /* message type byte               */
+#define TC1797_ERAY_TX_CMD   0xF0050BE0u   /* outbound CP command word        */
+#define TC1797_ERAY_TX_TYPE  0xF0050BE8u   /* outbound CP type word           */
+#define TC1797_ERAY_TX_REQ   0xF0050BECu   /* request/status (bit0 ready/1 busy) */
+#define TC1797_ERAY_RDY      0xF0050A98u   /* ready flag (bit0)               */
+#define TC1797_ERAY_DOORBELL 0xF00027B1u   /* TX doorbell SFR (bit7)          */
+
+static void tc1797_eray_doorbell(TC1797SoCState *s)
+{
+    uint32_t be0 = 0, be8 = 0, w = 0;
+    cpu_physical_memory_read(TC1797_ERAY_TX_CMD, &be0, 4);
+    cpu_physical_memory_read(TC1797_ERAY_TX_TYPE, &be8, 4);
+    /* Mark the (unmodelled) controller "done, not busy" so the firmware's
+     * post-dispatch poll of the request/ready words completes instead of
+     * spinning forever waiting for hardware that isn't there. */
+    cpu_physical_memory_read(TC1797_ERAY_TX_REQ, &w, 4);
+    w = (w | 1u) & ~2u;
+    cpu_physical_memory_write(TC1797_ERAY_TX_REQ, &w, 4);
+    cpu_physical_memory_read(TC1797_ERAY_RDY, &w, 4);
+    w |= 1u;
+    cpu_physical_memory_write(TC1797_ERAY_RDY, &w, 4);
+    if (qemu_chr_fe_backend_connected(&s->eray_tun)) {
+        char line[64];
+        int o = snprintf(line, sizeof(line), "ERAYTX %08x %08x\n", be0, be8);
+        qemu_chr_fe_write_all(&s->eray_tun, (const uint8_t *)line, o);
+    }
+    {
+        static unsigned dn;
+        if (dn < 8) {
+            dn++;
+            info_report("tc1797: E-Ray CP doorbell cmd=0x%08x type=0x%08x", be0, be8);
+        }
+    }
+}
+
+static void tc1797_eray_tun_parse(TC1797SoCState *s, const char *line)
+{
+    /* format: <cmd_hex>:<type_hex>:<payload_hex>  e.g. 84:02:aabbcc... */
+    char *p = NULL;
+    unsigned long cmd = strtoul(line, &p, 16);
+    unsigned long type = 0;
+    uint8_t payload[129] = { 0 };
+    unsigned plen = 0;
+    if (p && *p == ':') {
+        p++;
+        type = strtoul(p, &p, 16);
+        if (p && *p == ':') {
+            p++;
+            while (plen < sizeof(payload) && p[0] && p[1]) {
+                char b[3] = { p[0], p[1], 0 };
+                payload[plen++] = (uint8_t)strtoul(b, NULL, 16);
+                p += 2;
+            }
+        }
+    }
+    uint8_t cb = (uint8_t)cmd, tb = (uint8_t)type, lb = (uint8_t)plen;
+    cpu_physical_memory_write(TC1797_CP_RX_CMD, &cb, 1);
+    cpu_physical_memory_write(TC1797_CP_RX_PAYLOAD, payload, plen);
+    cpu_physical_memory_write(TC1797_CP_RX_LEN, &lb, 1);
+    cpu_physical_memory_write(TC1797_CP_RX_TYPE, &tb, 1);
+    {
+        static unsigned rn;
+        if (rn < 8) {
+            rn++;
+            info_report("tc1797: E-Ray CP RX inject cmd=0x%x type=0x%x len=%u",
+                        (unsigned)cmd, (unsigned)type, plen);
+        }
+    }
+}
+
+static int tc1797_eray_tun_can_receive(void *opaque)
+{
+    return 128;
+}
+
+static void tc1797_eray_tun_receive(void *opaque, const uint8_t *buf, int size)
+{
+    TC1797SoCState *s = opaque;
+    for (int i = 0; i < size; i++) {
+        char c = (char)buf[i];
+        if (c == '\n' || c == '\r') {
+            if (s->eray_tun_rxlen) {
+                s->eray_tun_rx[s->eray_tun_rxlen] = 0;
+                tc1797_eray_tun_parse(s, s->eray_tun_rx);
+                s->eray_tun_rxlen = 0;
+            }
+        } else if (s->eray_tun_rxlen < sizeof(s->eray_tun_rx) - 1) {
+            s->eray_tun_rx[s->eray_tun_rxlen++] = c;
+        } else {
+            s->eray_tun_rxlen = 0;
+        }
+    }
+}
+
+/*
+ * Host memory peek/poke tunnel (-chardev socket,id=mem0,...). This is the
+ * clean, zero-perturbation replacement for the gdb stub's run-control dance:
+ * memory is served from the SoC side via cpu_physical_memory_read/write (in the
+ * iothread under the BQL), so the vCPU keeps running at full real-time speed.
+ *
+ * ASCII line protocol (the front-end's QemuLink mem channel speaks it):
+ *   "R <addr_hex> <len_dec>\n"      -> "<hex>\n"   (len bytes, max 512)
+ *   "W <addr_hex> <payload_hex>\n"  -> "OK\n"
+ * malformed / out-of-range -> "E\n".
+ */
+#define TC1797_MEM_TUN_MAX 512
+static void tc1797_mem_tun_parse(TC1797SoCState *s, const char *line)
+{
+    char op = line[0];
+    char *p = NULL;
+
+    if (op == 'R' || op == 'r') {
+        unsigned long addr = strtoul(line + 1, &p, 16);
+        unsigned long len = (p && *p) ? strtoul(p, NULL, 0) : 0;
+        if (len == 0 || len > TC1797_MEM_TUN_MAX) {
+            qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"E\n", 2);
+            return;
+        }
+        uint8_t buf[TC1797_MEM_TUN_MAX];
+        cpu_physical_memory_read(addr, buf, len);
+        char out[TC1797_MEM_TUN_MAX * 2 + 2];
+        int o = 0;
+        for (unsigned i = 0; i < len; i++) {
+            o += snprintf(out + o, sizeof(out) - o, "%02x", buf[i]);
+        }
+        out[o++] = '\n';
+        qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)out, o);
+    } else if (op == 'W' || op == 'w') {
+        unsigned long addr = strtoul(line + 1, &p, 16);
+        uint8_t buf[TC1797_MEM_TUN_MAX];
+        unsigned n = 0;
+        if (p) {
+            while (*p == ' ') {
+                p++;
+            }
+            while (n < sizeof(buf) && p[0] && p[1] && p[0] != ' ') {
+                char b[3] = { p[0], p[1], 0 };
+                buf[n++] = (uint8_t)strtoul(b, NULL, 16);
+                p += 2;
+            }
+        }
+        if (n) {
+            cpu_physical_memory_write(addr, buf, n);
+        }
+        qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"OK\n", 3);
+    } else {
+        qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"E\n", 2);
+    }
+}
+
+static int tc1797_mem_tun_can_receive(void *opaque)
+{
+    return 512;
+}
+
+static void tc1797_mem_tun_receive(void *opaque, const uint8_t *buf, int size)
+{
+    TC1797SoCState *s = opaque;
+    for (int i = 0; i < size; i++) {
+        char c = (char)buf[i];
+        if (c == '\n' || c == '\r') {
+            if (s->mem_tun_rxlen) {
+                s->mem_tun_rx[s->mem_tun_rxlen] = 0;
+                tc1797_mem_tun_parse(s, s->mem_tun_rx);
+                s->mem_tun_rxlen = 0;
+            }
+        } else if (s->mem_tun_rxlen < sizeof(s->mem_tun_rx) - 1) {
+            s->mem_tun_rx[s->mem_tun_rxlen++] = c;
+        } else {
+            s->mem_tun_rxlen = 0;
+        }
+    }
+}
 
 /*
  * Watchdog timeout. Armed only when modelled (env TC1797_WDT); the firmware
@@ -1168,6 +1483,14 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
     int ssc_u;
     uint32_t ssc_off;
 
+    /* E-Ray/CP TX doorbell (bit7): snapshot the outbound CP frame to the host
+     * tunnel and mark the (unmodelled) controller done; clear bit7 so the
+     * firmware's post-dispatch poll proceeds instead of spinning. */
+    if (addr == TC1797_ERAY_DOORBELL && (val & 0x80u)) {
+        tc1797_eray_doorbell(s);
+        val &= ~0x80u;
+    }
+
     if (addr >= 0xF0000200u && addr <= 0xF00002FFu) {
         tc1797_stm_write(s, addr, (uint32_t)val);
         return;
@@ -1674,6 +1997,8 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     s->en_adc  = (getenv("TC1797_NO_ADC")  == NULL);
     s->en_gpta = (getenv("TC1797_NO_GPTA") == NULL);
     tc1797_can_init(&s->can, TC1797_CAN_BASE, tc1797_can_tx, s);
+    s->can.rx_irq_cb = tc1797_can_rx_irq;      /* RX frames pulse the MO's SRN */
+    s->can.rx_irq_opaque = s;
     /* Attach to a QEMU CAN bus if one exists (-object can-bus,id=...): the
      * firmware's CAN frames then leave the model and external frames are
      * delivered into the matching receive MOs. */
@@ -1688,6 +2013,45 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
             } else {
                 info_report("tc1797: MultiCAN attached to QEMU CAN bus");
             }
+        }
+    }
+    /* Host CAN tunnel: -chardev socket,id=can0,host=...,port=...,server=on,wait=off.
+     * The front-end connects to that socket; DME TX frames stream out as
+     * "<id>#<hex>\n" and lines written back are injected as RX. No bus needed. */
+    {
+        Chardev *cc = qemu_chr_find("can0");
+        if (cc) {
+            qemu_chr_fe_init(&s->can_tun, cc, &error_abort);
+            qemu_chr_fe_set_handlers(&s->can_tun, tc1797_can_tun_can_receive,
+                                     tc1797_can_tun_receive, NULL, NULL,
+                                     s, NULL, true);
+            info_report("tc1797: CAN tunnel attached (chardev id=can0)");
+        }
+    }
+    /* Host E-Ray/CP tunnel: -chardev socket,id=fray0,...  Carries the CAS/
+     * immobilizer challenge-response. DME CP TX is announced as "ERAYTX ..";
+     * a line "<cmd>:<type>:<hex>" injects a CP frame into the DSPR RX struct. */
+    {
+        Chardev *fc = qemu_chr_find("fray0");
+        if (fc) {
+            qemu_chr_fe_init(&s->eray_tun, fc, &error_abort);
+            qemu_chr_fe_set_handlers(&s->eray_tun, tc1797_eray_tun_can_receive,
+                                     tc1797_eray_tun_receive, NULL, NULL,
+                                     s, NULL, true);
+            info_report("tc1797: E-Ray/CP tunnel attached (chardev id=fray0)");
+        }
+    }
+    /* Host memory peek/poke tunnel: -chardev socket,id=mem0,...  Zero-perturbation
+     * live guest memory R/W from the front-end (phase/os_running reads, register
+     * pokes). Replaces the gdb stub for orchestration; the vCPU never stops. */
+    {
+        Chardev *mc = qemu_chr_find("mem0");
+        if (mc) {
+            qemu_chr_fe_init(&s->mem_tun, mc, &error_abort);
+            qemu_chr_fe_set_handlers(&s->mem_tun, tc1797_mem_tun_can_receive,
+                                     tc1797_mem_tun_receive, NULL, NULL,
+                                     s, NULL, true);
+            info_report("tc1797: memory tunnel attached (chardev id=mem0)");
         }
     }
     if (getenv("TC1797_CANTEST")) {

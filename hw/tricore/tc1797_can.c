@@ -197,6 +197,9 @@ bool tc1797_can_rx_inject(Tc1797Can *c, uint32_t can_id,
             memset(m->rx_data, 0, 8);
             memcpy(m->rx_data, data, len);
             c->rx_count++;
+            if (c->rx_irq_cb) {
+                c->rx_irq_cb(c->rx_irq_opaque, n);   /* pulse MO RX interrupt */
+            }
             return true;
         }
     }
