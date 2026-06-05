@@ -53,6 +53,10 @@ typedef struct PcpEngine {
     bool      rcb;          /* PCP_CS.RCB: 1 => entry table (PC=2*SRPN)     */
     int       context_model;/* PCP_CS.CS: 0=Full 1=Small 2=Minimum         */
     uint32_t  max_insns;    /* runaway guard per channel                    */
+    uint64_t  f_pcp_hz;     /* PCP own clock (fPCP); set from the SoC clock tree.
+                             * Carried here so the channel engine can pace its
+                             * execution to PCP-cycles under a deterministic clock
+                             * (currently informational; pacing is the icount step). */
     PcpIrqFn  irq_fn;
     void     *irq_opaque;
 

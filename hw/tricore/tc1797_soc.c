@@ -100,6 +100,16 @@ struct TC1797SoCState {
     QEMUTimer *stm_timer;        /* drives the CMP0/CMP1 systick interrupts */
     int64_t stm_period_ns;       /* derived OSEK tick period */
     unsigned stm_rr;             /* round-robin across the enabled STM compares */
+    /* Clock tree (Hz) -- the SoC timing substrate. Every peripheral timer
+     * derives its period from one of these rather than a hardcoded constant.
+     * Defaults reproduce the previously-hardcoded rates exactly (behaviour-
+     * neutral); override via TC1797_F{SYS,CPU,PCP,STM}_MHZ. f_pcp models the
+     * PCP co-processor's own clock (TC1797 UM fPCP, derived from fSYS). */
+    uint64_t f_sys;              /* PLL system clock */
+    uint64_t f_cpu;              /* TriCore CPU clock (180 MHz on -512F180E) */
+    uint64_t f_pcp;             /* PCP co-processor clock */
+    uint64_t f_stm;              /* System Timer Module clock */
+    uint32_t stm_ns_per_tick;    /* cached 1e9 / f_stm (= 10 at the 100 MHz default) */
     uint32_t ssc_tb[2];          /* SSC0/SSC1 transmit-buffer shadow (loopback) */
     uint32_t ssc_src[2][2];      /* SSC0/1 service-request nodes [unit][0]=+0xF8 (xfer), [1]=+0xFC (queue) */
     bool sw_reset_pending;       /* set when 0xF0000560=2 requested a SW reset */
@@ -171,10 +181,12 @@ struct TC1797SoCState {
  * bridge_server.py's STM model. The CMP0/CMP1 compare-match interrupt is not
  * wired yet (returns no-pending); that lands with the STM->IR->CPU path.
  */
-static uint64_t tc1797_stm_count56(void)
+static uint64_t tc1797_stm_count56(uint32_t ns_per_tick)
 {
     uint64_t ns = (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    return (ns / 10u) & 0x00FFFFFFFFFFFFFFULL;   /* 56-bit @ 100 MHz */
+    /* 56-bit free-running counter at f_stm (ns_per_tick = 1e9 / f_stm;
+     * = 10 at the 100 MHz default, reproducing the former hardcoded /10). */
+    return (ns / ns_per_tick) & 0x00FFFFFFFFFFFFFFULL;
 }
 
 /*
@@ -216,9 +228,9 @@ static void tc1797_stm_arm(TC1797SoCState *s)
         timer_del(s->stm_timer);
         return;
     }
-    uint32_t tim_now = (uint32_t)tc1797_stm_count56();
+    uint32_t tim_now = (uint32_t)tc1797_stm_count56(s->stm_ns_per_tick);
     uint32_t delta = s->stm_cmp0 - tim_now;       /* ticks to match (wraps OK) */
-    int64_t period_ns = (int64_t)delta * 10;       /* 10 ns/tick @ 100 MHz */
+    int64_t period_ns = (int64_t)delta * s->stm_ns_per_tick;   /* ticks -> ns @ f_stm */
     if (period_ns < 50000) {
         period_ns = 50000;                         /* floor 50us */
     }
@@ -291,7 +303,7 @@ static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
     if (addr >= 0xF0000210 && addr <= 0xF000022C) {
         /* TC1797 UM 11.x: TIMk = bits[k*4+31 : k*4] (k=0..6); +0x2C = CAP =
          * bits[63:32] of the 56-bit counter. */
-        uint64_t v56 = tc1797_stm_count56();
+        uint64_t v56 = tc1797_stm_count56(s->stm_ns_per_tick);
         unsigned idx = (addr - 0xF0000210u) >> 2;
         if (idx <= 6) {
             return (uint32_t)(v56 >> (idx * 4));
@@ -314,7 +326,7 @@ static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
         return (s->stm_src0 & ~0x2000u) | ((s->stm_isrr & 1u) << 13);
     case 0xF00002FC:                             /* SRC1 node */
         return (s->stm_src1 & ~0x2000u) | (((s->stm_isrr >> 1) & 1u) << 13);
-    default:         return (uint32_t)tc1797_stm_count56();
+    default:         return (uint32_t)tc1797_stm_count56(s->stm_ns_per_tick);
     }
 }
 
@@ -1519,6 +1531,45 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
         s->hwcfg_ststat = hw ? (uint32_t)strtoul(hw, NULL, 0) : 0x00000080u;
         s->scu_stcon = sc ? (uint32_t)strtoul(sc, NULL, 0) : 0x00000000u;
     }
+    /* ── Clock tree ──────────────────────────────────────────────────────────
+     * The SoC timing substrate: every peripheral timer derives its period from
+     * one of these rates. Defaults are the SAK-TC1797-512F180E clocks per the
+     * TC1797 User's Manual (v1.1) "180 MHz derivative":
+     *   fCPU max 180 MHz, fPCP max 180 MHz, fSYS (= FPI/SPB bus) max 90 MHz.
+     *   2:1 mode (required for CPU/PCP > 90 MHz): fFPI = fCPU/2 -> fSYS = 90 MHz.
+     *   STM: "driven by max 90 MHz (= fSYS); default after reset = fSYS/2" (45).
+     * We model the post-clock-init running rates (STM = fSYS = 90 MHz), verified
+     * to preserve the phase-4 boot. Override any rate in MHz via
+     * TC1797_F{SYS,CPU,PCP,STM}_MHZ. (Pacing execution to f_cpu/f_pcp --
+     * determinism via icount -- layers on top of this tree later.) */
+    s->f_sys = 90000000ULL;        /* fSYS = fFPI/SPB = fCPU/2 (UM: sys clk max 90 MHz) */
+    s->f_cpu = 180000000ULL;       /* fCPU max 180 MHz on -512F180E (2:1 mode)  */
+    s->f_pcp = 180000000ULL;       /* fPCP max 180 MHz (2:1 mode), PCP own clock */
+    s->f_stm = 90000000ULL;        /* fSTM = fSYS = 90 MHz (UM; reset default 45) */
+    {
+        const struct { const char *env; uint64_t *f; } clk[] = {
+            { "TC1797_FSYS_MHZ", &s->f_sys }, { "TC1797_FCPU_MHZ", &s->f_cpu },
+            { "TC1797_FPCP_MHZ", &s->f_pcp }, { "TC1797_FSTM_MHZ", &s->f_stm },
+        };
+        for (unsigned i = 0; i < ARRAY_SIZE(clk); i++) {
+            const char *e = getenv(clk[i].env);
+            if (e && *e) {
+                uint64_t mhz = strtoull(e, NULL, 0);
+                if (mhz >= 1 && mhz <= 1000) {
+                    *clk[i].f = mhz * 1000000ULL;
+                }
+            }
+        }
+    }
+    s->stm_ns_per_tick = (uint32_t)(1000000000ULL / s->f_stm);
+    if (s->stm_ns_per_tick == 0) {
+        s->stm_ns_per_tick = 1;
+    }
+    info_report("tc1797: clock tree -- fSYS=%" PRIu64 " fCPU=%" PRIu64
+                " fPCP=%" PRIu64 " fSTM=%" PRIu64 " MHz (STM %u ns/tick)",
+                s->f_sys / 1000000, s->f_cpu / 1000000, s->f_pcp / 1000000,
+                s->f_stm / 1000000, s->stm_ns_per_tick);
+
     s->stm_cmp0 = 0xFFFFFFFF;      /* STM compare regs default all-ones (bridge) */
     s->stm_cmp1 = 0xFFFFFFFF;
     s->stm_cmcon = 0;
@@ -1783,6 +1834,7 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     s->pcp_enabled = (getenv("TC1797_PCP") != NULL);
     pcp_engine_init(&s->pcp, PCP_PRAM_BASE, /*context_model=*/0, /*rcb=*/true,
                     tc1797_pcp_irq, s);
+    s->pcp.f_pcp_hz = s->f_pcp;   /* PCP runs on its own clock from the SoC tree */
     if (getenv("TC1797_PCPTEST")) {
         pcp_selftest();
     }
