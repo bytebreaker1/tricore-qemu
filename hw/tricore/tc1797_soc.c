@@ -101,6 +101,7 @@ struct TC1797SoCState {
     QEMUTimer *stm_timer;        /* drives the CMP0/CMP1 systick interrupts */
     int64_t stm_period_ns;       /* derived OSEK tick period */
     unsigned stm_rr;             /* round-robin across the enabled STM compares */
+    int64_t stm_cmp_deadline[2]; /* edge-on-match: abs virtual-ns when CMP0/CMP1 next fire */
     /* Clock tree (Hz) -- the SoC timing substrate. Every peripheral timer
      * derives its period from one of these rather than a hardcoded constant.
      * Defaults reproduce the previously-hardcoded rates exactly (behaviour-
@@ -113,6 +114,9 @@ struct TC1797SoCState {
     uint32_t stm_ns_per_tick;    /* cached 1e9 / f_stm (= 10 at the 100 MHz default) */
     uint32_t ssc_tb[2];          /* SSC0/SSC1 transmit-buffer shadow (loopback) */
     uint32_t ssc_src[2][2];      /* SSC0/1 service-request nodes [unit][0]=+0xF8 (xfer), [1]=+0xFC (queue) */
+    uint32_t adc_src[TC1797_ADC_NKERN][16]; /* ADC0/1/2 kernel SRNs (top of each 0x400 kernel, off>=0x3C0): firmware pulses SETR to trigger PCP/CPU completion (e.g. ADC0 SRC@0x3F0 -> PCP ch 0x1d -> sets 0xD000416F, DTC 0x3006 gate) */
+    QEMUTimer *ssc_done_timer[2];/* SPI transfer-latency: defer completion SRN raise */
+    int64_t ssc_xfer_ns;         /* modelled per-transfer time (env TC1797_SSC_XFER_NS) */
     bool sw_reset_pending;       /* set when 0xF0000560=2 requested a SW reset */
     /* Forced OSEK systick. The ERCOSEK kernel promotes itself from phase 3 to
      * phase 4 only after it starts receiving periodic system ticks, but it never
@@ -131,6 +135,11 @@ struct TC1797SoCState {
     uint32_t cpu_src;            /* CPU service-request node 0xF7E0FFFC (OSEK dispatch) */
     QEMUBH *irq_bh;              /* defers MMIO-context IRQ raises out of TB context */
     uint8_t irq_pending_srpn;    /* highest SRPN awaiting the bottom-half raise */
+    /* Faithful ICU: the set of pending CPU-routed service requests (one bit per
+     * SRPN). The arbiter presents the highest as ICR.PIPN; on service-entry the
+     * taken SRPN is cleared and it re-arbitrates to the next-highest -- so a
+     * busy high source no longer clobbers/starves the lower OSEK ticks + CAN. */
+    uint32_t icu_pending[8];
     PcpEngine pcp;               /* PCP2 co-processor, runs on its own thread */
     bool pcp_enabled;            /* env TC1797_PCP: route TOS=1 SRNs to the PCP */
     Tc1797Can can;               /* MultiCAN controller (TX/RX + message objects) */
@@ -156,6 +165,11 @@ struct TC1797SoCState {
     Tc1797Fadc fadc;             /* Fast ADC (FADC) — knock/fast-conversion results */
     Tc1797Mli mli0, mli1;        /* Micro Link Interface (inter-chip serial link) */
     Tc1797Jtag jtag;             /* JTAG TAP + Cerberus/OCDS debug interface */
+    uint32_t ocds_ostate;        /* OSCU OSTATE (0xF0000480): bit0=OCDS counter running.
+                                  * The ERCOSEK software-counter handler fn_800bfaac writes
+                                  * OCNTRL(0xF0000478)=0x5e to start the OCDS run-time counter,
+                                  * then polls OSTATE.bit0; until set it early-returns and
+                                  * disables the OS counter (-> periodic diag task never armed). */
     Tc1797Gpta gpta;             /* GPTA0/1 + LTCA2 timer arrays (capture/compare) */
     bool en_can, en_adc, en_gpta; /* per-peripheral dispatch gates (bisect/safety) */
     uint32_t port_out[20];       /* GPIO output latch: P0-P11 (idx 0-11) + Port10/11 block @0xF0300000 (idx 12-19) */
@@ -227,29 +241,61 @@ static bool tc1797_stm_cmp_enabled(TC1797SoCState *s, int ch)
         && ((src >> 12) & 1u) && !((src >> 10) & 1u);
 }
 
-static bool tc1797_stm_enabled(TC1797SoCState *s)
+static void tc1797_icu_set(TC1797SoCState *s, uint8_t srpn);
+static void tc1797_icu_arbitrate(TC1797SoCState *s);
+
+/*
+ * Windowed compare-match helper (TC1797 UM 11.3): ticks from `tim_now` to the
+ * next rising edge where the (MSIZE+1)-bit field of the 56-bit counter starting
+ * at bit MSTART equals CMP[ch] (CMCON.MSIZE0/MSTART0 for ch0, MSIZE1/MSTART1 for
+ * ch1). Used to time the faithful CMP0/CMP1 service requests. 0 -> a full
+ * period (so we don't busy-refire the match we are already sitting on).
+ */
+static uint64_t tc1797_stm_match_ticks(TC1797SoCState *s, int ch, uint64_t tim_now)
 {
-    return tc1797_stm_cmp_enabled(s, 0);   /* CMP0 drives the timer arm/period */
+    uint32_t cmcon  = s->stm_cmcon;
+    uint32_t msize  = ch ? ((cmcon >> 16) & 0x1Fu) : (cmcon & 0x1Fu);
+    uint32_t mstart = ch ? ((cmcon >> 24) & 0x1Fu) : ((cmcon >> 8) & 0x1Fu);
+    uint32_t cmp    = ch ? s->stm_cmp1 : s->stm_cmp0;
+    unsigned nbits  = msize + 1;                          /* 1..32 compared bits */
+    uint64_t cmask  = (nbits >= 32) ? 0xFFFFFFFFull : ((1ull << nbits) - 1u);
+    uint64_t period = (cmask + 1u) << mstart;             /* TIM period of the field */
+    uint64_t start  = ((uint64_t)cmp & cmask) << mstart;  /* TIM value at the edge */
+    uint64_t pos    = tim_now & (period - 1u);
+    uint64_t delta  = (start - pos) & (period - 1u);
+    return delta ? delta : period;
 }
 
+/*
+ * Faithful edge-on-match arm (TC1797 UM 11.3): program the QEMUTimer for the
+ * earliest enabled CMP0/CMP1 windowed match. If no compare is enabled the STM
+ * raises nothing (the firmware has not started a compare). Re-invoked from the
+ * CMP/CMCON/ICR/SRC writes so the cadence tracks the firmware's programmed
+ * compare values exactly, as on silicon.
+ */
 static void tc1797_stm_arm(TC1797SoCState *s)
 {
-    if (!tc1797_stm_enabled(s)) {
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t tim_now = tc1797_stm_count56(s->stm_ns_per_tick);
+    int64_t best = INT64_MAX;
+    for (int ch = 0; ch < 2; ch++) {
+        if (!tc1797_stm_cmp_enabled(s, ch)) {
+            s->stm_cmp_deadline[ch] = INT64_MAX;
+            continue;
+        }
+        int64_t when = now + (int64_t)(tc1797_stm_match_ticks(s, ch, tim_now)
+                                       * s->stm_ns_per_tick);
+        s->stm_cmp_deadline[ch] = when;
+        if (when < best) {
+            best = when;
+        }
+    }
+    s->stm_period_ns = (best == INT64_MAX) ? 0 : (best - now);
+    if (best == INT64_MAX) {
         timer_del(s->stm_timer);
-        return;
+    } else {
+        timer_mod(s->stm_timer, best);
     }
-    uint32_t tim_now = (uint32_t)tc1797_stm_count56(s->stm_ns_per_tick);
-    uint32_t delta = s->stm_cmp0 - tim_now;       /* ticks to match (wraps OK) */
-    int64_t period_ns = (int64_t)delta * s->stm_ns_per_tick;   /* ticks -> ns @ f_stm */
-    if (period_ns < 50000) {
-        period_ns = 50000;                         /* floor 50us */
-    }
-    if (period_ns > 100000000) {
-        period_ns = 1000000;                       /* cap runaway -> 1ms */
-    }
-    s->stm_period_ns = period_ns;
-    timer_mod(s->stm_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + period_ns);
 }
 
 static void tc1797_stm_ack(TC1797SoCState *s)
@@ -270,73 +316,87 @@ static void tc1797_stm_ack(TC1797SoCState *s)
  * can't drop it under a busier higher-priority source. Cheap: the common
  * no-pending case is a 128-bool scan; SRC lookups happen only for live frames.
  */
-static uint8_t tc1797_can_pending_rx_srpn(TC1797SoCState *s)
+/*
+ * Resolve a receive MO's CPU service-request priority from its MOIPR. RXINP[12:8]
+ * is NOT the SRPN -- it selects one of the 16 MultiCAN interrupt nodes, whose
+ * SRC register (0xF00040C0 + node*4) carries the real SRPN[7:0] + routing
+ * (TOS[10]: 0=CPU/1=PCP, SRE[12]=enable). Return that SRPN iff the node is
+ * CPU-routed and enabled; 0 otherwise (PCP-routed/disabled -> no CPU raise).
+ * The old code used the node index as the SRPN, so e.g. the FEM RX MOs (node 0
+ * -> SRPN 29, the firmware's unified CAN-RX ISR) raised SRPN 0 = nothing, and
+ * the firmware never drained any RX frame nor answered diagnostics.
+ */
+static uint8_t tc1797_can_rx_srpn_of(Tc1797Can *c, uint32_t moipr)
 {
-    Tc1797Can *c = &s->can;
-    uint8_t best = 0;
-    for (int n = 0; n < TC1797_CAN_NMO; n++) {
-        if (!c->mo[n].rx_pending || c->mo[n].dir != 0) {
-            continue;
-        }
-        uint32_t moipr = tc1797_can_read(c, TC1797_CAN_MO_BASE + n * 0x20 + 0x08);
-        uint8_t srpn = (moipr >> 8) & 0x1Fu;   /* MO RX SRN priority */
-        if (srpn > best) {
-            best = srpn;
-        }
+    uint8_t node = (moipr >> 8) & 0x1Fu;          /* MOIPR.RXINP */
+    uint32_t src = tc1797_can_read(c, TC1797_CAN_BASE + 0xC0u + (node & 0xFu) * 4u);
+    if (((src >> 12) & 1u) && !((src >> 10) & 1u)) {   /* SRE && TOS==CPU */
+        return src & 0xFFu;
     }
-    return best;
+    return 0;
 }
 
+/*
+ * Faithful STM compare-match service (TC1797 UM 11.3, edge-on-match). The
+ * 56-bit counter (tc1797_stm_count56), the TIM0..TIM6/CAP reads and the windowed
+ * CMP0/CMP1 compare (CMCON.MSIZE/MSTART) are all faithful. Fire CMP0/CMP1 only
+ * when their windowed compare actually reaches the programmed value -- a rising
+ * edge, once per match -- raising SRC0/SRC1 at the configured SRPN. The firmware's
+ * ISR re-arms CMP[x] (the CMP write recomputes the next match via
+ * tc1797_stm_arm). No fire-all, no round-robin, no floor/cap, no forced poll: the
+ * cadence is exactly the firmware's programmed compare values, as on silicon.
+ * The OSEK dispatch SRN (0xF7E0FFFC) and CAN-RX SRNs raise themselves from their
+ * own write/receive paths.
+ *
+ * NOTE: with this faithful STM the firmware does NOT currently reach phase 4 --
+ * it never configures the STM CMP0 OSEK system tick in the cold-init path we can
+ * reach, stalling at phase 3 behind the same unresolved gate that leaves the
+ * software-counter object pointer DAT_d00009a4 unwritten (task #124). That
+ * cold-init gate -- not the STM model -- is the real blocker.
+ */
 static void tc1797_stm_tick(void *opaque)
 {
     TC1797SoCState *s = opaque;
-    CPUTriCoreState *env = &s->cpu.env;
-    /*
-     * The MEVD17 OSEK time base runs on three firmware-armed service-request
-     * sources: STM CMP0 (SRC0 -> SRPN 8) and STM CMP1 (SRC1 -> SRPN 7) for the
-     * OS counters, plus the CPU service node (0xF7E0FFFC -> SRPN 1) the
-     * scheduler sets (SRR) to request a task dispatch. The phase 3 -> phase 4
-     * promotion needs all three to advance; the simplified ICU presents one
-     * pending priority at a time, and the higher STM ticks (7/8) would
-     * permanently starve the lower SRPN-1 dispatch -- so round-robin whichever
-     * are currently armed/pending, one per tick. (This is the faithful,
-     * firmware-driven analogue of the opt-in forced systick: it fires only the
-     * sources the firmware itself enabled, at the firmware's STM cadence.)
-     */
-    bool act[4];
-    uint32_t srpn[4];
-    act[0] = tc1797_stm_cmp_enabled(s, 0);  srpn[0] = s->stm_src0 & 0xFFu;  /* CMP0 */
-    act[1] = tc1797_stm_cmp_enabled(s, 1);  srpn[1] = s->stm_src1 & 0xFFu;  /* CMP1 */
-    act[2] = ((s->cpu_src >> 13) & 1u)      /* SRR pending */
-          && ((s->cpu_src >> 12) & 1u)      /* SRE enabled */
-          && !((s->cpu_src >> 10) & 1u);    /* TOS=0 (CPU) */
-    srpn[2] = s->cpu_src & 0xFFu;                                            /* cpu_src */
-    srpn[3] = tc1797_can_pending_rx_srpn(s);  act[3] = (srpn[3] != 0); /* CAN RX */
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    bool raised = false;
 
-    /* Round-robin all four armed/pending sources (3 OSEK + CAN RX), one per tick,
-     * so no source starves another. CAN RX persists (re-derived from MO
-     * rx_pending) until the firmware's CAN ISR reads the MO. */
-    int pick = -1;
-    for (int i = 0; i < 4; i++) {
-        int idx = (s->stm_rr + i) % 4;
-        if (act[idx]) { pick = idx; break; }
+    for (int ch = 0; ch < 2; ch++) {
+        if (!tc1797_stm_cmp_enabled(s, ch)) {
+            s->stm_cmp_deadline[ch] = INT64_MAX;
+            continue;
+        }
+        if (now < s->stm_cmp_deadline[ch]) {
+            continue;                       /* this channel's match is still future */
+        }
+        if (ch == 0) {
+            s->stm_isrr |= 1u; s->stm_icr |= 2u;          /* CMP0 request + CMP0IR */
+        } else {
+            s->stm_isrr |= 2u; s->stm_icr |= 0x20u;       /* CMP1 request + CMP1IR */
+        }
+        uint8_t srpn = (ch ? s->stm_src1 : s->stm_src0) & 0xFFu;
+        if (srpn) {
+            tc1797_icu_set(s, srpn);
+            raised = true;
+        }
+        /* Advance one full window-period; the ISR's CMP write re-arms sooner. */
+        uint64_t tim_now = tc1797_stm_count56(s->stm_ns_per_tick);
+        s->stm_cmp_deadline[ch] = now +
+            (int64_t)(tc1797_stm_match_ticks(s, ch, tim_now) * s->stm_ns_per_tick);
     }
-    if (pick < 0) {
-        return;                                    /* nothing armed/pending */
+
+    if (raised) {
+        tc1797_icu_arbitrate(s);
     }
-    s->stm_rr = (pick + 1) % 4;
-    if (pick == 0) {
-        s->stm_isrr |= 1; s->stm_icr |= 2;         /* CMP0 request + CMP0IR */
-    } else if (pick == 1) {
-        s->stm_isrr |= 2; s->stm_icr |= 0x20u;     /* CMP1 request + CMP1IR */
+
+    int64_t best = INT64_MAX;
+    for (int ch = 0; ch < 2; ch++) {
+        if (tc1797_stm_cmp_enabled(s, ch) && s->stm_cmp_deadline[ch] < best) {
+            best = s->stm_cmp_deadline[ch];
+        }
     }
-    if (srpn[pick] >= FIELD_EX32(env->ICR, ICR, PIPN)) {
-        env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, srpn[pick]);
+    if (best != INT64_MAX) {
+        timer_mod(s->stm_timer, best);
     }
-    cpu_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
-    /* Keep ticking even if the ISR doesn't re-arm the compare itself. */
-    timer_mod(s->stm_timer,
-              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->stm_period_ns);
 }
 
 static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
@@ -362,7 +422,7 @@ static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
         return (s->stm_icr & ~0x22u)
              | ((s->stm_isrr & 1u) << 1)
              | (((s->stm_isrr >> 1) & 1u) << 5);
-    case 0xF0000240: return s->stm_isrr;         /* ISRR: pending bits */
+    case 0xF0000240: return s->stm_isrr;         /* ISRR: pending bits (tuned baseline) */
     case 0xF00002F8:                             /* SRC0 node (SRPN/SRE/TOS + SRR) */
         return (s->stm_src0 & ~0x2000u) | ((s->stm_isrr & 1u) << 13);
     case 0xF00002FC:                             /* SRC1 node */
@@ -374,11 +434,14 @@ static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
 static void tc1797_stm_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
 {
     switch (addr) {
-    case 0xF0000230:                            /* CMP0: also the per-tick re-arm */
+    case 0xF0000230:                            /* CMP0 */
         s->stm_cmp0 = val;
         tc1797_stm_arm(s);
         break;
-    case 0xF0000234: s->stm_cmp1  = val; break;
+    case 0xF0000234:                            /* CMP1 */
+        s->stm_cmp1 = val;
+        tc1797_stm_arm(s);
+        break;
     case 0xF0000238:                            /* CMCON: compare window/enable */
         s->stm_cmcon = val;
         tc1797_stm_arm(s);
@@ -411,12 +474,16 @@ static void tc1797_stm_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
         s->stm_src0 = val & 0x00001FFFu;        /* keep SRPN/TOS/SRE config bits */
         tc1797_stm_arm(s);                      /* enabling SRE arms the tick */
         break;
-    case 0xF00002FC:                            /* SRC1 node (CMP1) */
-        if (val & 0x4000u) {
+    case 0xF00002FC:                            /* SRC1 node */
+        if (val & 0x4000u) {                    /* CLRR: ack the CMP1 request */
             s->stm_isrr &= ~2u;
             s->stm_icr &= ~0x20u;
+            if (s->stm_isrr == 0) {
+                tc1797_stm_ack(s);
+            }
         }
-        s->stm_src1 = val & 0x00001FFFu;
+        s->stm_src1 = val & 0x00001FFFu;        /* keep SRPN/TOS/SRE config bits */
+        tc1797_stm_arm(s);                      /* enabling CMP1's SRE arms the tick */
         break;
     default: break;                             /* TIM/CAP read-only; rest ignored */
     }
@@ -466,38 +533,92 @@ static const uint8_t tc1797_osek_tick_prios[] = { 1, 7, 8 };
  * PIPN+HARD on service-entry (the ack in target/tricore/cpu.c), so the
  * software-triggered request is a clean one-shot.
  */
-static void tc1797_irq_bh(void *opaque)
+/*
+ * Faithful ICU arbiter. icu_pending is the set of CPU-routed service requests
+ * currently asserting (one bit per SRPN). Present the HIGHEST as ICR.PIPN and
+ * drive HARD; the CPU's exec_interrupt gate (IE && PIPN>CCPN) takes it, and the
+ * service-entry ack (tc1797_icu_service_ack) clears that SRPN so we re-arbitrate
+ * to the next-highest. This replaces the old single-PIPN slot, which a busy high
+ * source (e.g. SSC) clobbered -- starving the lower OSEK ticks (SRPN 7/8) and
+ * CAN RX so the OS time base froze and UDS never answered.
+ *
+ * MUST run between TBs (BH / timer / service-entry), never from MMIO/TB context:
+ * a PIPN write there is wiped by the TCG global write-back. MMIO-context raises
+ * set the bit and schedule the BH.
+ */
+static void tc1797_icu_arbitrate(TC1797SoCState *s)
+{
+    CPUTriCoreState *env = &s->cpu.env;
+    uint8_t best = 0;
+    for (int w = 7; w >= 0; w--) {
+        uint32_t v = s->icu_pending[w];
+        if (v) {
+            int b = 31;
+            while (!(v & (1u << b))) {
+                b--;
+            }
+            best = (uint8_t)(w * 32 + b);
+            break;
+        }
+    }
+    env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, best);
+    if (best) {
+        cpu_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
+    } else {
+        cpu_reset_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
+    }
+}
+
+static void tc1797_icu_set(TC1797SoCState *s, uint8_t srpn)
+{
+    if (srpn) {
+        s->icu_pending[srpn >> 5] |= 1u << (srpn & 31u);
+    }
+}
+
+static void tc1797_icu_clr(TC1797SoCState *s, uint8_t srpn)
+{
+    s->icu_pending[srpn >> 5] &= ~(1u << (srpn & 31u));
+}
+
+/*
+ * Service-entry acknowledge, called from target/tricore/cpu.c when the CPU takes
+ * the interrupt: clear the taken SRPN (one-shot, mirroring the SRN's SRR
+ * auto-clear on service entry) and present the next-highest pending. Runs at the
+ * TB boundary, so the PIPN write sticks. Level sources (STM compare match still
+ * pending, CAN MO still NEWDAT) re-assert from their own model on the next tick.
+ */
+static void tc1797_icu_service_ack(void *opaque, uint32_t taken)
 {
     TC1797SoCState *s = opaque;
-    CPUTriCoreState *env = &s->cpu.env;
-    uint8_t srpn = s->irq_pending_srpn;
+    tc1797_icu_clr(s, (uint8_t)taken);
+    /* SRR auto-clears on service entry for edge nodes the firmware SETRs (the
+     * CPU service-request/dispatch node). Without this its SRR stays set and the
+     * tick re-asserts it every interval (over-dispatch). Level sources (STM
+     * compare, CAN MO NEWDAT) intentionally re-assert from their own model. */
+    if ((uint8_t)taken && (s->cpu_src & 0xFFu) == (uint8_t)taken) {
+        s->cpu_src &= ~(1u << 13);          /* clear SRR */
+    }
+    tc1797_icu_arbitrate(s);
+}
 
-    s->irq_pending_srpn = 0;
-    if (srpn == 0) {
-        return;
-    }
-    if (srpn >= FIELD_EX32(env->ICR, ICR, PIPN)) {
-        env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, srpn);
-    }
-    cpu_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
+static void tc1797_irq_bh(void *opaque)
+{
+    tc1797_icu_arbitrate((TC1797SoCState *)opaque);
 }
 
 /*
  * Raise a CPU-bound service request at priority srpn. Callers run in MMIO/TB
- * context (a peripheral SRN SETR write), so the actual ICR.PIPN write + HARD
- * assertion is deferred to tc1797_irq_bh (see above). PIPN keeps the highest
- * pending priority -- a poor-man's ICU arbitration across the few sources this
- * board drives (the OSEK systick is raised directly from timer context, the
- * SSC/CPU service nodes through here).
+ * context (a peripheral SRN SETR write), so set the pending bit now and defer
+ * the ICR.PIPN write + HARD to tc1797_irq_bh (between TBs). The bit persists in
+ * icu_pending until the source is serviced -- real arbitration, not one slot.
  */
 static void tc1797_raise_srpn(TC1797SoCState *s, uint8_t srpn)
 {
     if (srpn == 0) {
         return;
     }
-    if (srpn > s->irq_pending_srpn) {
-        s->irq_pending_srpn = srpn;
-    }
+    tc1797_icu_set(s, srpn);
     qemu_bh_schedule(s->irq_bh);
     /* Kick the vCPU out of its current TB so the BH runs promptly; the HARD line
      * persists (it lives in CPUState, not the clobbered TCG global). */
@@ -528,9 +649,20 @@ static void tc1797_pcp_irq(void *opaque, uint8_t srpn)
 static void tc1797_can_rx_irq(void *opaque, int mo)
 {
     TC1797SoCState *s = opaque;
+    /* Diagnostic experiment (env TC1797_NORXINT): suppress the CPU RX interrupt
+     * so receive MOs are left for the firmware's *polled* consumers (the diag
+     * task polls MO84 via FUN_800dc44c). Tests whether the SRPN-29 unified RX ISR
+     * is draining the diag MO before the diag task can. */
+    static int norx = -1;
+    if (norx < 0) {
+        norx = getenv("TC1797_NORXINT") ? 1 : 0;
+    }
+    if (norx) {
+        return;
+    }
     uint32_t moipr = tc1797_can_read(&s->can,
                                      TC1797_CAN_MO_BASE + mo * 0x20 + 0x08);
-    uint8_t srpn = (moipr >> 8) & 0x1Fu;               /* MO RX SRN priority */
+    uint8_t srpn = tc1797_can_rx_srpn_of(&s->can, moipr);  /* node -> real SRPN */
     if (srpn) {
         tc1797_raise_srpn(s, srpn);                    /* prompt best-effort raise */
     }
@@ -923,6 +1055,15 @@ static void tc1797_src_node_write(TC1797SoCState *s, uint32_t *node,
         return;                           /* not a set, enabled request */
     }
     if ((*node >> 10) & 1u) {             /* TOS=1: peripheral control processor */
+        if (getenv("TC1797_PCPLOG")) {
+            static unsigned pc;
+            if (pc++ < 64) {
+                fprintf(stderr, "PCPLOG: TOS=1 SRN 0x%08x val=0x%08x SRPN=%u "
+                        "pcp_en=%d -> trigger ch %u\n", addr, *node,
+                        *node & 0xFFu, s->pcp_enabled, *node & 0xFFu);
+                fflush(stderr);
+            }
+        }
         if (s->pcp_enabled) {
             pcp_engine_trigger(&s->pcp, *node & 0xFFu);
         }
@@ -1148,6 +1289,20 @@ static uint64_t tc1797_ssc_read(TC1797SoCState *s, int unit, uint32_t off)
     }
 }
 
+/* SPI transfer-latency expiry: the modelled transfer finished, so raise the
+ * SSC completion (queue-node) service request now -- the deferred analogue of
+ * the PCP signalling transfer-done. (See tc1797_ssc_write +0xF8.) */
+static void tc1797_ssc0_done(void *opaque)
+{
+    TC1797SoCState *s = opaque;
+    tc1797_raise_srpn(s, s->ssc_src[0][1] & 0xFFu);
+}
+static void tc1797_ssc1_done(void *opaque)
+{
+    TC1797SoCState *s = opaque;
+    tc1797_raise_srpn(s, s->ssc_src[1][1] & 0xFFu);
+}
+
 static void tc1797_ssc_write(TC1797SoCState *s, int unit, uint32_t off,
                              uint32_t val)
 {
@@ -1187,7 +1342,16 @@ static void tc1797_ssc_write(TC1797SoCState *s, int unit, uint32_t off,
         }
         s->ssc_src[unit][0] = (val & 0x00001FFFu) | (srr << 13);
         if (srr) {
-            tc1797_raise_srpn(s, s->ssc_src[unit][1] & 0xFFu);  /* PCP "done" -> CPU */
+            /* Model the SPI transfer LATENCY. On silicon the PCP shifts the
+             * frame over the transfer time (tens of us at the SSC baud) and only
+             * THEN signals completion. Raising the completion SRN immediately
+             * makes the SSC ISR (fn_80083610) re-fire back-to-back at full CPU
+             * speed -- ~90% of all interrupts -- starving the lower-priority OSEK
+             * counter ticks (SRPN 7/8) so the OS time base freezes (no alarms ->
+             * no periodic tasks -> no os_running). Defer the completion raise by
+             * a transfer time so the OSEK ticks run in the gaps. */
+            timer_mod(s->ssc_done_timer[unit],
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->ssc_xfer_ns);
         }
         return;
     }
@@ -1281,8 +1445,46 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
             return false;
         }
         switch (p->kind) {
-        case TC_IP_MULTICAN: tc1797_can_write(&s->can, addr, val); return true;
-        case TC_IP_ADC:      tc1797_adc_write(&s->adc, addr, val); return true;
+        case TC_IP_MULTICAN:
+            {   /* DIAGNOSTIC (env TC1797_MOLOG): who resets MO84 NEWDAT (the diag
+                 * request MO, channel 110)? A MOCTR (0xF0005A9C) write with bit3
+                 * (RESET NEWDAT) is the only thing that can clear the request. */
+                static int mol = -1;
+                if (mol < 0) {
+                    mol = getenv("TC1797_MOLOG") ? 1 : 0;
+                }
+                if (mol && addr == 0xF0005A9Cu && (val & (1u << 3))) {
+                    static unsigned c;
+                    if (c++ < 50) {
+                        fprintf(stderr, "MO84 MOCTR-RESET NEWDAT pc=%08x val=%08x\n",
+                                (uint32_t)s->cpu.env.PC, val);
+                        fflush(stderr);
+                    }
+                }
+            }
+            tc1797_can_write(&s->can, addr, val); return true;
+        case TC_IP_ADC:
+            {   /* ADC kernel service-request nodes sit in the top of each 0x400
+                 * kernel (TC1797 UM ch.23/24). The firmware programs SRPN/SRE/TOS
+                 * then pulses SETR to fire the conversion-complete handshake:
+                 * ADC0 SRC@0x3F0 = 0x941d (SRPN 0x1d, SRE, TOS=1, SETR) triggers
+                 * PCP channel 0x1d which sets 0xD000416F (the GPTA/ADC init-done
+                 * flag the DTC-0x3006 gate FUN_800fbafe polls). Route SRE-shaped
+                 * writes in that region through the generic SRN handler so the
+                 * request actually fires (TOS=1 -> PCP, TOS=0 -> CPU); keep the
+                 * shadow for the firmware's read-modify-write of the SRC reg. */
+                uint32_t aoff = addr - TC1797_ADC0_BASE;
+                uint32_t koff = aoff & (TC1797_ADC_KSIZE - 1);
+                int ki = (int)(aoff / TC1797_ADC_KSIZE);
+                if (ki >= 0 && ki < TC1797_ADC_NKERN
+                    && koff >= 0x3C0u && (val & 0x1000u)) {
+                    tc1797_adc_write(&s->adc, addr, val);  /* shadow read-back */
+                    tc1797_src_node_write(s, &s->adc_src[ki][(koff - 0x3C0u) >> 2],
+                                          val, addr);
+                    return true;
+                }
+            }
+            tc1797_adc_write(&s->adc, addr, val); return true;
         case TC_IP_FADC:     tc1797_fadc_write(&s->fadc, addr, val); return true;
         case TC_IP_GPTA:     tc1797_gpta_write(&s->gpta, addr, val); return true;
         case TC_IP_DMA:      tc1797_dma_write(&s->dma, addr, val); return true;
@@ -1303,6 +1505,34 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
     uint32_t addr = 0xF0000000u + (uint32_t)offset;
     int ssc_u;
     uint32_t ssc_off;
+
+    /* DIAGNOSTIC (env TC1797_MOLOG): trace the firmware's reads of MO84 (the diag
+     * request MO, 0xF0005A80..0xF0005A9F) -- which register/offset it polls and
+     * what value it actually gets, vs the rx_pending state. Definitively shows
+     * whether the firmware's CPU read sees NEWDAT. */
+    {
+        static int mol = -1;
+        if (mol < 0) { mol = getenv("TC1797_MOLOG") ? 1 : 0; }
+        if (mol && addr >= 0xF0005A80u && addr < 0xF0005AA0u && s->en_can) {
+            static unsigned rc;
+            uint32_t v = tc1797_can_read(&s->can, addr & ~3u);
+            if (rc++ < 50000) {
+                fprintf(stderr, "MO84-READ off=%02x size=%u word=%08x pc=%08x\n",
+                        (addr & 0x1Fu), size, v, (uint32_t)s->cpu.env.PC);
+                fflush(stderr);
+            }
+        }
+    }
+
+    /* CAN MO data registers (MODR0/MODR1 at MO+0x10/0x14) are read byte-by-byte
+     * by the firmware's diag/ISO-TP drain (FUN_800dc44c reads bytes at
+     * 0xF0005010+). The MultiCAN model returns the word at the word-aligned
+     * index, so serve sub-word reads by extracting the requested byte(s). */
+    if (size < 4 && addr >= TC1797_CAN_MO_BASE && addr < TC1797_CAN_END
+        && s->en_can) {
+        uint32_t word = tc1797_can_read(&s->can, addr & ~3u);
+        return (word >> ((addr & 3u) * 8)) & (size == 1 ? 0xFFu : 0xFFFFu);
+    }
 
     /* STM occupies a small contiguous block; dispatch by range. */
     if (addr >= 0xF0000200u && addr <= 0xF00002FFu) {
@@ -1419,6 +1649,7 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
     /* ── Silicon identification chain (lets chip-ID checks pass) ── */
     case 0xF0000408: return 0x000DC001;   /* JDPID (Cerberus/JTAG) */
     case 0xF0000464: return 0x101701C7;   /* JTAGID (TC1797 IDCODE) */
+    case 0xF0000480: return s->ocds_ostate; /* OSCU OSTATE: bit0=OCDS counter running */
     case 0xF0000508: return 0x000DC001;   /* SCU_ID */
     /* ── Die Temperature Sensor (DTS, in the SCU; UM 3.7.1) ──
      * DTSSTAT (0xF00000E0): RESULT[9:0] (significant [9:2]) = die temperature,
@@ -1580,6 +1811,13 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
          * consistency check `d0 != d15` at 0x801490F6 -> DFLASH/coding gate).
          */
         if ((uint32_t)val == 2) {
+            if (getenv("TC1797_DTCLOG")) {
+                CPUTriCoreState *e = &s->cpu.env;
+                info_report("tc1797: SCU-reset@0x%08x dregs d4=%08x d5=%08x "
+                            "d6=%08x d15=%08x a11=%08x", (uint32_t)e->PC,
+                            e->gpr_d[4], e->gpr_d[5], e->gpr_d[6], e->gpr_d[15],
+                            e->gpr_a[11]);
+            }
             /*
              * Observe (do not act on) the firmware's self-reset request. The
              * fatal handler FUN_800bf97c writes 0xF0000560=2 to reset the SoC
@@ -1623,6 +1861,18 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
                     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
                 }
             }
+        }
+        break;
+    case 0xF0000478:                      /* OSCU OCNTRL (OCDS run-time counter ctrl) */
+        /* The ERCOSEK software-counter start (fn_800bfaac) writes 0x5e here to
+         * enable the OCDS run-time counter, then polls OSTATE.bit0 for "running".
+         * On silicon the OSCU asserts that status once enabled; model it so the
+         * handler doesn't take its disable-and-return path. */
+        s->sfr_shadow[(0xF0000478u - 0xF0000000u) >> 2] = (uint32_t)val;
+        if ((uint32_t)val != 0) {
+            s->ocds_ostate |= 1u;         /* counter now running */
+        } else {
+            s->ocds_ostate &= ~1u;
         }
         break;
     case 0xF00005F0:                      /* WDT_CON0: ENDINIT password servicing */
@@ -1901,7 +2151,23 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     s->stm_src0 = 0;
     s->stm_src1 = 0;
     s->stm_period_ns = 1000000;    /* 1 ms fallback until firmware arms CMP0 */
+    s->stm_cmp_deadline[0] = INT64_MAX;   /* edge-on-match: no compare armed yet */
+    s->stm_cmp_deadline[1] = INT64_MAX;
     s->stm_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_stm_tick, s);
+
+    /* SSC (SPI) per-transfer latency: model the PCP shift time so the SSC
+     * completion interrupt fires at a bounded rate (instead of storming back-to-
+     * back and starving the OSEK time-base ticks). ~25 us is realistic for a
+     * multi-byte frame at the SSC baud; env TC1797_SSC_XFER_NS overrides. */
+    s->ssc_done_timer[0] = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_ssc0_done, s);
+    s->ssc_done_timer[1] = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_ssc1_done, s);
+    {
+        const char *e = getenv("TC1797_SSC_XFER_NS");
+        s->ssc_xfer_ns = e ? (int64_t)strtoll(e, NULL, 0) : 25000;
+        if (s->ssc_xfer_ns < 1000) {
+            s->ssc_xfer_ns = 1000;       /* floor 1 us */
+        }
+    }
 
     /* Forced OSEK systick: ~1 ms per priority, divided across the round-robin
      * set so one fire == one OSEK-counter advance (see tc1797_osek_tick). Armed
@@ -1909,6 +2175,11 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
      * harmlessly masked through the early boot until the RTOS enables it. */
     s->irq_pending_srpn = 0;
     s->irq_bh = qemu_bh_new(tc1797_irq_bh, s);
+    /* Register the faithful ICU service-entry ack so the CPU re-arbitrates PIPN
+     * to the next-highest pending SRN on every interrupt taken (vs the legacy
+     * single-slot clear). */
+    tricore_icu_ack = tc1797_icu_service_ack;
+    tricore_icu_ack_ctx = s;
     s->cpu_src = 0;
     s->osek_rr = 0;
     s->osek_phase4 = false;
@@ -2278,17 +2549,23 @@ static void tc1797_cpu_reset(void *opaque)
         s->stm_isrr = 0;
         s->stm_src0 = 0;
         s->stm_src1 = 0;
+        s->stm_cmp_deadline[0] = INT64_MAX;   /* edge-on-match: clear armed compares */
+        s->stm_cmp_deadline[1] = INT64_MAX;
         s->ssc_tb[0] = 0;
         s->ssc_tb[1] = 0;
         s->ssc_src[0][0] = s->ssc_src[0][1] = 0;
         s->ssc_src[1][0] = s->ssc_src[1][1] = 0;
         if (s->stm_timer) {
-            timer_del(s->stm_timer);
+            /* Re-arm the edge-on-match poll floor (200us) so the CPU-SRC + CAN-RX
+             * polls keep running after the warm reset; no compare is armed yet. */
+            timer_mod(s->stm_timer,
+                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 200000);
         }
         /* Forced OSEK systick: re-init round-robin/phase state and re-arm. DSPR
          * persists across a warm reset, so reset the phase-4 detection origin
          * (the firmware re-runs cold-init from phase 0 on the reboot). */
         s->cpu_src = 0;
+        s->ocds_ostate = 0;          /* OCDS run-time counter off until re-enabled */
         s->osek_rr = 0;
         s->osek_phase4 = false;
         if (s->osek_timer && s->osek_enabled) {

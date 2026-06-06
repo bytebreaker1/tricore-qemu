@@ -82,6 +82,12 @@ struct TriCoreCPUClass {
 hwaddr tricore_cpu_get_phys_addr_debug(CPUState *cpu, vaddr addr);
 void tricore_cpu_dump_state(CPUState *cpu, FILE *f, int flags);
 void tricore_cpu_do_interrupt(CPUState *cs);
+/* Board interrupt-controller service-entry hook. When the CPU takes a hardware
+ * interrupt it calls this (if set) instead of blindly clearing ICR.PIPN, so the
+ * board ICU can clear the taken Service Request Node and re-arbitrate PIPN to the
+ * next-highest pending request (faithful TC1797 ICU). Set by the SoC at realize. */
+extern void (*tricore_icu_ack)(void *ctx, uint32_t taken_srpn);
+extern void *tricore_icu_ack_ctx;
 /* Deliver a TC1.3.1 range-based memory-protection trap (class 1: MPR/MPW/MPX)
  * from the softmmu tlb_fill path. NORETURN: vectors to BTV and longjmps out. */
 G_NORETURN void tricore_raise_protection_trap(CPUTriCoreState *env,

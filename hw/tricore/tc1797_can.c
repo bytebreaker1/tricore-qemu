@@ -99,23 +99,41 @@ uint32_t tc1797_can_read(Tc1797Can *c, uint32_t addr)
         switch (moff) {
         case 0x00:                                  /* MOFCR: NEWDAT(bit5) */
             return c->regs[idx] | (m->rx_pending ? (1u << 5) : 0);
-        case 0x10:                                  /* MODR0: data[0:3] */
-            if (m->rx_pending) {
-                return ldl_le_p(m->rx_data);
-            }
-            break;
-        case 0x14:                                  /* MODR1: data[4:7] (clears) */
-            if (m->rx_pending) {
-                uint32_t v = ldl_le_p(m->rx_data + 4);
-                m->rx_pending = false;
-                return v;
-            }
-            break;
+        /* MODR0/MODR1 (data words at +0x10/+0x14) are written into the MO data
+         * registers by tc1797_can_rx_inject and served by the default return
+         * below. A *read* must NOT clear NEWDAT -- on TC1797 only an explicit
+         * MOCTR NEWDAT-reset (the firmware's ack) clears it. The previous code
+         * cleared rx_pending on a MODR1 read AND gated the data on rx_pending;
+         * that (a) let an unrelated MO scan consume the diagnostic request before
+         * the diag task polled MO84, and (b) returned stale data to the diag
+         * drain FUN_800dc44c, which resets NEWDAT *before* reading MODR0/1. */
         case 0x18:                                  /* MOAR: ID in [28:18] */
             if (m->rx_pending) {
                 return (m->rx_id & 0x7FF) << 18;
             }
             break;
+        case 0x1C:                                  /* MOSTAT: NEWDAT(bit3)+RXPND(bit0) */
+            /* The firmware's RX path checks NEWDAT in MOSTAT (read of the MOCTR
+             * address), not MOFCR. Report a waiting frame here too, else a
+             * MOSTAT-polling consumer (the diag/ISO-TP handler) never sees it. */
+            {   /* DIAGNOSTIC (env TC1797_MOLOG): what does a MOSTAT read of MO84
+                 * (the diag request MO) return + the rx_pending state? */
+                static int mol = -1;
+                if (mol < 0) {
+                    mol = getenv("TC1797_MOLOG") ? 1 : 0;
+                }
+                if (mol && n == 84) {
+                    static unsigned nlog, n1;
+                    if (m->rx_pending && n1++ < 30) {
+                        fprintf(stderr, "CANRD MO84 MOSTAT rx_pending=1 (firmware SEES the request)\n");
+                        fflush(stderr);
+                    } else if (!m->rx_pending && nlog++ < 5) {
+                        fprintf(stderr, "CANRD MO84 MOSTAT rx_pending=0\n");
+                        fflush(stderr);
+                    }
+                }
+            }
+            return c->regs[idx] | (m->rx_pending ? ((1u << 3) | (1u << 0)) : 0);
         default:
             break;
         }
@@ -160,6 +178,9 @@ void tc1797_can_write(Tc1797Can *c, uint32_t addr, uint32_t val)
         } else if (val & (1u << 11)) {              /* RESET DIR -> receive */
             m->dir = 0;
         }
+        if (val & (1u << 3)) {                      /* RESET NEWDAT: frame consumed */
+            m->rx_pending = false;
+        }
         if (val & (1u << 24)) {                     /* SET TXRQ -> transmit */
             uint32_t d0 = c->regs[mo_word(n, 0x10)];
             uint32_t d1 = c->regs[mo_word(n, 0x14)];
@@ -185,17 +206,37 @@ bool tc1797_can_rx_inject(Tc1797Can *c, uint32_t can_id,
     if (len > 8) {
         len = 8;
     }
+    static int mol = -1;
+    if (mol < 0) {
+        mol = getenv("TC1797_MOLOG") ? 1 : 0;
+    }
     for (int n = 0; n < TC1797_CAN_NMO; n++) {
         Tc1797CanMO *m = &c->mo[n];
         if (!m->configured || m->dir != 0) {
+            if (mol && can_id == 0x7e2 && (n == 84 || m->id == 0x7e2)) {
+                static unsigned s84; if (s84++ < 10) {
+                    fprintf(stderr, "RXINJ 0x7e2 SKIP MO%d configured=%d dir=%d id=%03x\n",
+                            n, m->configured, m->dir, m->id); fflush(stderr); }
+            }
             continue;                               /* only receive objects */
         }
         uint32_t mask = m->mask ? m->mask : 0x7FF;
         if ((can_id & mask) == (m->id & mask)) {
+            if (mol && can_id == 0x7e2) {
+                static unsigned mt; if (mt++ < 10) {
+                    fprintf(stderr, "RXINJ 0x7e2 MATCH MO%d id=%03x mask=%03x dir=%d\n",
+                            n, m->id, mask, m->dir); fflush(stderr); }
+            }
             m->rx_pending = true;
             m->rx_id = can_id;
             memset(m->rx_data, 0, 8);
             memcpy(m->rx_data, data, len);
+            /* Persist the frame bytes in the MO data registers (MODR0/MODR1 at
+             * +0x10/+0x14) so a read returns them regardless of NEWDAT -- the
+             * diag drain FUN_800dc44c resets NEWDAT *before* reading the data,
+             * and on silicon the MO data registers retain the last frame. */
+            c->regs[mo_word(n, 0x10)] = ldl_le_p(m->rx_data);
+            c->regs[mo_word(n, 0x14)] = ldl_le_p(m->rx_data + 4);
             c->rx_count++;
             if (c->rx_irq_cb) {
                 c->rx_irq_cb(c->rx_irq_opaque, n);   /* pulse MO RX interrupt */

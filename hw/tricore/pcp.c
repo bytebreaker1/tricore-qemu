@@ -44,6 +44,14 @@ static void pcp_write(hwaddr addr, unsigned size, uint32_t val)
     for (unsigned i = 0; i < size; i++) {
         b[i] = (val >> (8 * i)) & 0xff;
     }
+    if (getenv("TC1797_PCPWLOG")) {
+        static unsigned wc;
+        if (wc++ < 400) {
+            fprintf(stderr, "PCPW: [0x%08x].%u = 0x%08x\n",
+                    (uint32_t)(addr & MASK32), size, val);
+            fflush(stderr);
+        }
+    }
     address_space_rw(&address_space_memory, addr & MASK32,
                      MEMTXATTRS_UNSPECIFIED, b, size, true);
 }
@@ -110,11 +118,16 @@ static bool eval_cond(int code, uint32_t flags)
     return false;
 }
 
-/* ── channel context save areas (UM 10.4.2.2): csa_base + SRPN*ctx_size ── */
+/* ── channel context save areas (UM 10.4.2.2): csa_base + SRPN*ctx_size ──
+ * The CSA stores the context registers HIGH-to-LOW: CR7 (PC[31:16] | R7low) is
+ * at the lowest word, then CR6 (CPPN | R6), then CR5..CR0. Confirmed against
+ * this firmware's pre-initialised contexts (e.g. srpn29 @0xF00503A0 word0 =
+ * 0x06370e40 -> CR7 -> PC=0x0637; word7=0). Small/Minimum keep the high regs
+ * (CR7,CR6,... ) that Full has at its lowest words. */
 static const struct { int nwords; uint8_t regs[8]; } CTX[3] = {
-    { 8, { 0, 1, 2, 3, 4, 5, 6, 7 } },   /* Full    */
-    { 4, { 4, 5, 6, 7 } },               /* Small   */
-    { 2, { 6, 7 } },                     /* Minimum */
+    { 8, { 7, 6, 5, 4, 3, 2, 1, 0 } },   /* Full    */
+    { 4, { 7, 6, 5, 4 } },               /* Small   */
+    { 2, { 7, 6 } },                     /* Minimum */
 };
 
 static void pcp_restore_context(PcpCore *c, uint8_t srpn, uint32_t csa_base,
@@ -126,6 +139,13 @@ static void pcp_restore_context(PcpCore *c, uint8_t srpn, uint32_t csa_base,
         c->R[CTX[model].regs[slot]] = pcp_read(base + slot * 4, 4);
     }
     c->pc = rcb ? ((2 * srpn) & 0xFFFF) : ((c->R[7] >> 16) & 0xFFFF);
+    if (getenv("TC1797_PCPLOG")) {
+        fprintf(stderr, "PCPCTX: srpn=%u rcb=%d model=%d base=0x%08x "
+                "words=[%08x %08x %08x %08x %08x %08x %08x %08x] pc=0x%x\n",
+                srpn, rcb, model, base, c->R[0], c->R[1], c->R[2], c->R[3],
+                c->R[4], c->R[5], c->R[6], c->R[7], c->pc);
+        fflush(stderr);
+    }
     c->R[7] &= 0xFFFF;                  /* live R7 upper 16 bits read 0 */
     c->cur_srpn = srpn;
 }
@@ -201,6 +221,16 @@ static void pcp_step(PcpCore *c)
 
     if (c->trace) {
         qemu_log("  PCP 0x%08x: am=%u hw=%04x\n", (uint32_t)pa, am, hw);
+    }
+    if (getenv("TC1797_PCPTRACE")) {
+        static unsigned tc;
+        if (tc++ < 300) {
+            fprintf(stderr, "PCPT pc=0x%04x pa=0x%08x hw=%04x hw2=%04x am=%u "
+                    "Rb=%u Ra=%u | R0=%08x R1=%08x R4=%08x R5=%08x R6=%08x R7=%08x\n",
+                    (uint32_t)(c->pc - len_hw), (uint32_t)pa, hw, hw2, am, Rb, Ra,
+                    R[0], R[1], R[4], R[5], R[6], R[7]);
+            fflush(stderr);
+        }
     }
 
     switch (am) {
@@ -477,6 +507,13 @@ static void *pcp_thread_fn(void *arg)
                                             &exit_int);
         if (exit_int && e->irq_fn) {
             e->irq_fn(e->irq_opaque, srpn);     /* PCP -> CPU service request */
+        }
+        if (getenv("TC1797_PCPLOG")) {
+            uint32_t flag = pcp_read(0xD000416F, 1) & 0xFF;
+            fprintf(stderr, "PCPLOG: ran ch %u: insns=%u exited=%d exit_int=%d "
+                    "ex_ep=0x%x  [0xD000416F now=0x%02x]\n", srpn, ran,
+                    e->core.exited, exit_int, e->core.ex_ep, flag);
+            fflush(stderr);
         }
         bql_unlock();
 

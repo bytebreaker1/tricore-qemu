@@ -261,6 +261,14 @@ uint32_t helper_fdiv(CPUTriCoreState *env, uint32_t r1, uint32_t r2)
     f_result = float32_div(arg1, arg2 , &env->fp_status);
 
     flags = f_get_excp_flags(env);
+    /*
+     * TriCore DIV.F sets FZ whenever the divisor is zero and the dividend is
+     * not Inf (manual p515) -- this includes the 0/0 case, which softfloat
+     * reports only as invalid (not divbyzero). Inject divbyzero so FZ is set.
+     */
+    if (float32_is_zero(arg2) && !float32_is_infinity(arg1)) {
+        flags |= float_flag_divbyzero;
+    }
     if (flags) {
         /* If the output is a NaN, but the inputs aren't,
            we return a unique value.  */
@@ -567,16 +575,124 @@ uint32_t helper_ftouz(CPUTriCoreState *env, uint32_t arg)
     return result;
 }
 
+/*
+ * FTOQ31 / FTOQ31Z  -- Float to Q31 fraction (manual p519 / p521).
+ *   arg_a = denorm_to_zero(f_real(D[a]));            (flush_inputs_to_zero is on)
+ *   if NaN -> 0; else precise = arg_a * 2^-D[b][8:0];
+ *   saturate to 7FFFFFFFH if > q_real(7FFFFFFFH), to 80000000H if < -1.0;
+ *   else result = round_to_q31(precise)   (RM rounding; FTOQ31Z forces round-to-0).
+ * Since q_real(x) = x / 2^31, round_to_q31(precise) == round(f_real(D[a]) *
+ * 2^(31 - D[b][8:0])) clamped to int32 range, which float32_to_int32 does
+ * directly (saturating to 0x7FFFFFFF / 0x80000000 and raising invalid).
+ *   FI on saturation/NaN, FX on inexact; FV/FZ/FU untouched.
+ */
+static uint32_t do_ftoq31(CPUTriCoreState *env, uint32_t arg, uint32_t arg_exp,
+                          bool round_to_zero)
+{
+    float32 f_arg = make_float32(arg);
+    int32_t exp = sextract32(arg_exp, 0, 9);   /* D[b][8:0], two's complement */
+    int32_t result;
+    uint32_t flags;
+
+    if (float32_is_any_nan(f_arg)) {
+        env->FPU_FI = 1 << 31;
+        env->FPU_FS = 1;
+        return 0;
+    }
+
+    f_arg = float32_scalbn(f_arg, 31 - exp, &env->fp_status);
+    if (round_to_zero) {
+        result = float32_to_int32_round_to_zero(f_arg, &env->fp_status);
+    } else {
+        result = float32_to_int32(f_arg, &env->fp_status);
+    }
+
+    /* Only FI (saturation) and FX (inexact) are defined for this op. */
+    flags = f_get_excp_flags(env) & (float_flag_invalid | float_flag_inexact);
+    if (flags & float_flag_invalid) {
+        flags &= ~float_flag_inexact;          /* saturation reports as FI, not FX */
+    }
+    if (flags) {
+        f_update_psw_flags(env, flags);
+    } else {
+        env->FPU_FS = 0;
+    }
+    return (uint32_t)result;
+}
+
+uint32_t helper_ftoq31(CPUTriCoreState *env, uint32_t arg, uint32_t arg_exp)
+{
+    return do_ftoq31(env, arg, arg_exp, false);
+}
+
+uint32_t helper_ftoq31z(CPUTriCoreState *env, uint32_t arg, uint32_t arg_exp)
+{
+    return do_ftoq31(env, arg, arg_exp, true);
+}
+
+/*
+ * Q31TOF -- Q31 fraction to Float (manual p532).
+ *   precise = q_real(D[a]) * 2^D[b][8:0];  result = ieee754_round(precise, RM).
+ * q_real(D[a]) = (int32)D[a] / 2^31, so precise = (int32)D[a] * 2^(D[b][8:0]-31).
+ *   FX on inexact, FS=FX; FI/FV/FZ/FU not set.
+ */
+uint32_t helper_q31tof(CPUTriCoreState *env, uint32_t arg, uint32_t arg_exp)
+{
+    int32_t exp = sextract32(arg_exp, 0, 9);   /* D[b][8:0], two's complement */
+    float32 f_result;
+    uint32_t flags;
+
+    f_result = int32_to_float32((int32_t)arg, &env->fp_status);
+    f_result = float32_scalbn(f_result, exp - 31, &env->fp_status);
+
+    flags = f_get_excp_flags(env) & float_flag_inexact;   /* only FX/FS defined */
+    if (flags) {
+        f_update_psw_flags(env, flags);
+    } else {
+        env->FPU_FS = 0;
+    }
+    return (uint32_t)f_result;
+}
+
 void helper_updfl(CPUTriCoreState *env, uint32_t arg)
 {
-    env->FPU_FS =  extract32(arg, 7, 1) & extract32(arg, 15, 1);
-    env->FPU_FI = (extract32(arg, 6, 1) & extract32(arg, 14, 1)) << 31;
-    env->FPU_FV = (extract32(arg, 5, 1) & extract32(arg, 13, 1)) << 31;
-    env->FPU_FZ = (extract32(arg, 4, 1) & extract32(arg, 12, 1)) << 31;
-    env->FPU_FU = (extract32(arg, 3, 1) & extract32(arg, 11, 1)) << 31;
-    /* clear FX and RM */
-    env->PSW &= ~(extract32(arg, 10, 1) << 26);
-    env->PSW |= (extract32(arg, 2, 1) & extract32(arg, 10, 1)) << 26;
+    /*
+     * UPDFL performs a *masked* update of PSW[31:24] (manual p537): for each
+     * flag the mask bit D[a][15:8] selects whether the value bit D[a][7:0]
+     * replaces the old flag (mask=1) or the old flag is preserved (mask=0):
+     *   set_Fx = (PSW.Fx & ~mask) | (val & mask).
+     * The previous implementation force-cleared FS/FI/FV/FZ/FU when their mask
+     * bit was 0 and never updated the rounding mode (RM, PSW[25:24]) at all.
+     */
+    /* FS: PSW bit 31, cache field stored as 0/1 */
+    if (extract32(arg, 15, 1)) {
+        env->FPU_FS = extract32(arg, 7, 1);
+    }
+    /* FI/FV/FZ/FU: cache fields stored in bit 31 */
+    if (extract32(arg, 14, 1)) {
+        env->FPU_FI = extract32(arg, 6, 1) << 31;
+    }
+    if (extract32(arg, 13, 1)) {
+        env->FPU_FV = extract32(arg, 5, 1) << 31;
+    }
+    if (extract32(arg, 12, 1)) {
+        env->FPU_FZ = extract32(arg, 4, 1) << 31;
+    }
+    if (extract32(arg, 11, 1)) {
+        env->FPU_FU = extract32(arg, 3, 1) << 31;
+    }
+    /* FX: PSW bit 26 */
+    if (extract32(arg, 10, 1)) {
+        env->PSW = deposit32(env->PSW, 26, 1, extract32(arg, 2, 1));
+    }
+    /* RM: PSW[25:24], masked 2-bit update (mask D[a][9:8], value D[a][1:0]) */
+    {
+        uint32_t rm_mask = extract32(arg, 8, 2);
+        uint32_t rm_val = extract32(arg, 0, 2);
+        uint32_t rm_old = extract32(env->PSW, 24, 2);
+        env->PSW = deposit32(env->PSW, 24, 2,
+                             (rm_old & ~rm_mask) | (rm_val & rm_mask));
+    }
 
     fpu_set_state(env);
 }

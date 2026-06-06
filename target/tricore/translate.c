@@ -41,6 +41,30 @@
 #define DISAS_EXIT_UPDATE DISAS_TARGET_1
 #define DISAS_JUMP        DISAS_TARGET_2
 
+/* TC1797 OSEK value-trace: gated by env TC1797_DBG; fires only at watched PCs. */
+static int tc_dbg_enabled(void)
+{
+    static int v = -1;
+    if (v < 0) {
+        v = (getenv("TC1797_DBG") || getenv("TC1797_DISP")
+             || getenv("TC1797_INJECT") || getenv("TC1797_HIJACK")) ? 1 : 0;
+    }
+    return v;
+}
+static inline bool tc_dbg_watch(uint32_t pc)
+{
+    return pc == 0x801256c8u   /* ERCOSEK scheduler `calli a15` (task-entry dispatch) */
+        || pc == 0x800bfaacu   /* counter tick handler fn_800bfaac (counter-object inject) */
+        || pc == 0x8012459au   /* OSEK dispatcher calli a4 (periodic-task hijack) */
+        || pc == 0x80121cf6u   /* diag task FUN_80121cf6 (hijacked) */
+        || pc == 0x800ff8ceu   /* UDS handler FUN_800ff8ce (per-connection) */
+        || pc == 0x800968f4u   /* sensor/diag poll ch0-4 FUN_800968f4 */
+        || pc == 0x80096968u   /* sensor/diag poll ch10 FUN_80096968 */
+        || pc == 0x8011caeeu   /* diag-drain caller FUN_8011caee */
+        || pc == 0x800dd0e8u   /* diag task FUN_800dd0e8 (session/channel log) */
+        || pc == 0x800dc44cu;  /* diag drain FUN_800dc44c */
+}
+
 /*
  * TCG registers
  */
@@ -108,6 +132,10 @@ void tricore_cpu_dump_state(CPUState *cs, FILE *f, int flags)
     qemu_fprintf(f, "\nPCXI: " TARGET_FMT_lx, env->PCXI);
     qemu_fprintf(f, " FCX: " TARGET_FMT_lx, env->FCX);
     qemu_fprintf(f, " LCX: " TARGET_FMT_lx, env->LCX);
+    qemu_fprintf(f, "\nBIV: " TARGET_FMT_lx, env->BIV);
+    qemu_fprintf(f, " BTV: " TARGET_FMT_lx, env->BTV);
+    qemu_fprintf(f, " ISP: " TARGET_FMT_lx, env->ISP);
+    qemu_fprintf(f, " SYSCON: " TARGET_FMT_lx, env->SYSCON);
 
     for (i = 0; i < 16; ++i) {
         if ((i & 3) == 0) {
@@ -1765,7 +1793,6 @@ static void gen_msub32_q(TCGv_i32 ret,
     TCGv_i64 t1 = tcg_temp_new_i64();
     TCGv_i64 t2 = tcg_temp_new_i64();
     TCGv_i64 t3 = tcg_temp_new_i64();
-    TCGv_i64 t4 = tcg_temp_new_i64();
 
     tcg_gen_ext_i32_i64(t2, arg2);
     tcg_gen_ext_i32_i64(t3, arg3);
@@ -1773,11 +1800,11 @@ static void gen_msub32_q(TCGv_i32 ret,
     tcg_gen_mul_i64(t2, t2, t3);
 
     tcg_gen_ext_i32_i64(t1, arg1);
-    /* if we shift part of the fraction out, we need to round up */
-    tcg_gen_andi_i64(t4, t2, (1ll << (up_shift - n)) - 1);
-    tcg_gen_setcondi_i64(TCG_COND_NE, t4, t4, 0);
+    /* MSUB.Q truncates the shifted product (no rounding), per the manual
+     * (p333): result = D[d] - (((D[a]*D[b]) << n) >> 32). The mirror MADD.Q
+     * also truncates; the previous round-up term here implemented MSUBR.Q
+     * (round) semantics, not MSUB.Q. */
     tcg_gen_sari_i64(t2, t2, up_shift - n);
-    tcg_gen_add_i64(t2, t2, t4);
 
     tcg_gen_sub_i64(t3, t1, t2);
     tcg_gen_extrl_i64_i32(temp3, t3);
@@ -1942,18 +1969,16 @@ static void gen_msubs32_q(TCGv_i32 ret,
     TCGv_i64 t1 = tcg_temp_new_i64();
     TCGv_i64 t2 = tcg_temp_new_i64();
     TCGv_i64 t3 = tcg_temp_new_i64();
-    TCGv_i64 t4 = tcg_temp_new_i64();
 
     tcg_gen_ext_i32_i64(t1, arg1);
     tcg_gen_ext_i32_i64(t2, arg2);
     tcg_gen_ext_i32_i64(t3, arg3);
 
     tcg_gen_mul_i64(t2, t2, t3);
-    /* if we shift part of the fraction out, we need to round up */
-    tcg_gen_andi_i64(t4, t2, (1ll << (up_shift - n)) - 1);
-    tcg_gen_setcondi_i64(TCG_COND_NE, t4, t4, 0);
+    /* MSUBS.Q truncates the shifted product (no rounding), per the manual
+     * (p333), mirroring gen_madds32_q. The previous round-up term matched
+     * MSUBR.Q, not MSUBS.Q. */
     tcg_gen_sari_i64(t3, t2, up_shift - n);
-    tcg_gen_add_i64(t3, t3, t4);
 
     gen_helper_msub32_q_sub_ssov(ret, tcg_env, t1, t3);
 }
@@ -3542,7 +3567,12 @@ static void decode_sr_system(DisasContext *ctx)
         ctx->base.is_jmp = DISAS_EXIT;
         break;
     case OPC2_16_SR_DEBUG:
-        /* raise EXCP_DEBUG */
+        /*
+         * DEBUG: if DBGSR.DE == 1 cause a Debug Event, else execute a NOP
+         * (manual p151). QEMU models DBGSR as a plain CSFR but implements no
+         * OCDS debug-event machinery, so the DE==1 path has no consumer; the
+         * architectural NOP (DE==0 path) is executed for both encodings.
+         */
         break;
     case OPC2_16_SR_FRET:
         gen_fret(ctx);
@@ -4417,6 +4447,48 @@ static void decode_bo_addrmode_post_pre_base(DisasContext *ctx)
     }
 }
 
+/*
+ * Circular-addressing helpers for the multi-halfword LD.D/ST.D and LD.W/ST.W
+ * forms. The manual (p230 / p243 / p461) defines these as a set of INDEPENDENT
+ * 16-bit accesses, each at EA = A[b] + (index + k) % length (k = 0,2,4,6) --
+ * i.e. every halfword wraps individually at the circular-buffer boundary. The
+ * previous code issued one/two contiguous 32-bit transfers, which is only
+ * correct when the buffer is element-aligned (length and index multiples of
+ * the element size); for other (architecturally legal) buffers it would read
+ * or write past the buffer end instead of wrapping. index = A[b+1][15:0],
+ * length = A[b+1][31:16]; for a valid buffer index < length, so the aligned
+ * case is byte-identical to the old contiguous behaviour.
+ */
+static void gen_ld_circ_hw(DisasContext *ctx, TCGv_i32 dst, int shift,
+                           TCGv_i32 base, TCGv_i32 index, TCGv_i32 length,
+                           int k)
+{
+    TCGv_i32 ea = tcg_temp_new_i32();
+    TCGv_i32 hw = tcg_temp_new_i32();
+    tcg_gen_addi_i32(ea, index, k);
+    tcg_gen_rem_i32(ea, ea, length);
+    tcg_gen_add_i32(ea, base, ea);
+    tcg_gen_qemu_ld_i32(hw, ea, ctx->mem_idx, MO_LEUW);
+    tcg_gen_deposit_i32(dst, dst, hw, shift, 16);
+}
+
+static void gen_st_circ_hw(DisasContext *ctx, TCGv_i32 src, int shift,
+                           TCGv_i32 base, TCGv_i32 index, TCGv_i32 length,
+                           int k)
+{
+    TCGv_i32 ea = tcg_temp_new_i32();
+    TCGv_i32 hw = tcg_temp_new_i32();
+    tcg_gen_addi_i32(ea, index, k);
+    tcg_gen_rem_i32(ea, ea, length);
+    tcg_gen_add_i32(ea, base, ea);
+    if (shift) {
+        tcg_gen_shri_i32(hw, src, shift);
+    } else {
+        tcg_gen_mov_i32(hw, src);
+    }
+    tcg_gen_qemu_st_i32(hw, ea, ctx->mem_idx, MO_LEUW);
+}
+
 static void decode_bo_addrmode_bitreverse_circular(DisasContext *ctx)
 {
     uint32_t op2;
@@ -4470,12 +4542,15 @@ static void decode_bo_addrmode_bitreverse_circular(DisasContext *ctx)
         break;
     case OPC2_32_BO_ST_D_CIRC:
         CHECK_REG_PAIR(r1);
-        tcg_gen_qemu_st_i32(cpu_gpr_d[r1], temp2, ctx->mem_idx, MO_LEUL);
-        tcg_gen_shri_i32(temp2, cpu_gpr_a[r2 + 1], 16);
-        tcg_gen_addi_i32(temp, temp, 4);
-        tcg_gen_rem_i32(temp, temp, temp2);
-        tcg_gen_add_i32(temp2, cpu_gpr_a[r2], temp);
-        tcg_gen_qemu_st_i32(cpu_gpr_d[r1 + 1], temp2, ctx->mem_idx, MO_LEUL);
+        {
+            TCGv_i32 length = tcg_temp_new_i32();
+            tcg_gen_shri_i32(length, cpu_gpr_a[r2 + 1], 16);   /* A[b+1][31:16] */
+            /* temp = index; four independent wrapped halfword stores */
+            gen_st_circ_hw(ctx, cpu_gpr_d[r1],     0,  cpu_gpr_a[r2], temp, length, 0);
+            gen_st_circ_hw(ctx, cpu_gpr_d[r1],     16, cpu_gpr_a[r2], temp, length, 2);
+            gen_st_circ_hw(ctx, cpu_gpr_d[r1 + 1], 0,  cpu_gpr_a[r2], temp, length, 4);
+            gen_st_circ_hw(ctx, cpu_gpr_d[r1 + 1], 16, cpu_gpr_a[r2], temp, length, 6);
+        }
         gen_helper_circ_update(cpu_gpr_a[r2 + 1], cpu_gpr_a[r2 + 1], t_off10);
         break;
     case OPC2_32_BO_ST_DA_BR:
@@ -4516,7 +4591,12 @@ static void decode_bo_addrmode_bitreverse_circular(DisasContext *ctx)
         gen_helper_br_update(cpu_gpr_a[r2 + 1], cpu_gpr_a[r2 + 1]);
         break;
     case OPC2_32_BO_ST_W_CIRC:
-        tcg_gen_qemu_st_i32(cpu_gpr_d[r1], temp2, ctx->mem_idx, MO_LEUL);
+        {
+            TCGv_i32 length = tcg_temp_new_i32();
+            tcg_gen_shri_i32(length, cpu_gpr_a[r2 + 1], 16);
+            gen_st_circ_hw(ctx, cpu_gpr_d[r1], 0,  cpu_gpr_a[r2], temp, length, 0);
+            gen_st_circ_hw(ctx, cpu_gpr_d[r1], 16, cpu_gpr_a[r2], temp, length, 2);
+        }
         gen_helper_circ_update(cpu_gpr_a[r2 + 1], cpu_gpr_a[r2 + 1], t_off10);
         break;
     default:
@@ -4710,12 +4790,15 @@ static void decode_bo_addrmode_ld_bitreverse_circular(DisasContext *ctx)
         break;
     case OPC2_32_BO_LD_D_CIRC:
         CHECK_REG_PAIR(r1);
-        tcg_gen_qemu_ld_i32(cpu_gpr_d[r1], temp2, ctx->mem_idx, MO_LEUL);
-        tcg_gen_shri_i32(temp2, cpu_gpr_a[r2 + 1], 16);
-        tcg_gen_addi_i32(temp, temp, 4);
-        tcg_gen_rem_i32(temp, temp, temp2);
-        tcg_gen_add_i32(temp2, cpu_gpr_a[r2], temp);
-        tcg_gen_qemu_ld_i32(cpu_gpr_d[r1 + 1], temp2, ctx->mem_idx, MO_LEUL);
+        {
+            TCGv_i32 length = tcg_temp_new_i32();
+            tcg_gen_shri_i32(length, cpu_gpr_a[r2 + 1], 16);   /* A[b+1][31:16] */
+            /* temp = index; four independent wrapped halfword loads */
+            gen_ld_circ_hw(ctx, cpu_gpr_d[r1],     0,  cpu_gpr_a[r2], temp, length, 0);
+            gen_ld_circ_hw(ctx, cpu_gpr_d[r1],     16, cpu_gpr_a[r2], temp, length, 2);
+            gen_ld_circ_hw(ctx, cpu_gpr_d[r1 + 1], 0,  cpu_gpr_a[r2], temp, length, 4);
+            gen_ld_circ_hw(ctx, cpu_gpr_d[r1 + 1], 16, cpu_gpr_a[r2], temp, length, 6);
+        }
         gen_helper_circ_update(cpu_gpr_a[r2 + 1], cpu_gpr_a[r2 + 1], t_off10);
         break;
     case OPC2_32_BO_LD_DA_BR:
@@ -4764,7 +4847,12 @@ static void decode_bo_addrmode_ld_bitreverse_circular(DisasContext *ctx)
         gen_helper_br_update(cpu_gpr_a[r2 + 1], cpu_gpr_a[r2 + 1]);
         break;
     case OPC2_32_BO_LD_W_CIRC:
-        tcg_gen_qemu_ld_i32(cpu_gpr_d[r1], temp2, ctx->mem_idx, MO_LEUL);
+        {
+            TCGv_i32 length = tcg_temp_new_i32();
+            tcg_gen_shri_i32(length, cpu_gpr_a[r2 + 1], 16);
+            gen_ld_circ_hw(ctx, cpu_gpr_d[r1], 0,  cpu_gpr_a[r2], temp, length, 0);
+            gen_ld_circ_hw(ctx, cpu_gpr_d[r1], 16, cpu_gpr_a[r2], temp, length, 2);
+        }
         gen_helper_circ_update(cpu_gpr_a[r2 + 1], cpu_gpr_a[r2 + 1], t_off10);
         break;
     default:
@@ -6358,6 +6446,20 @@ static void decode_rr_divide(DisasContext *ctx)
     case OPC2_32_RR_QSEED_F:
         gen_helper_qseed(cpu_gpr_d[r3], tcg_env, cpu_gpr_d[r1]);
         break;
+    case OPC2_32_RR_FTOQ31:
+        gen_helper_ftoq31(cpu_gpr_d[r3], tcg_env, cpu_gpr_d[r1], cpu_gpr_d[r2]);
+        break;
+    case OPC2_32_RR_Q31TOF:
+        gen_helper_q31tof(cpu_gpr_d[r3], tcg_env, cpu_gpr_d[r1], cpu_gpr_d[r2]);
+        break;
+    case OPC2_32_RR_FTOQ31Z:
+        if (has_feature(ctx, TRICORE_FEATURE_131)) {
+            gen_helper_ftoq31z(cpu_gpr_d[r3], tcg_env, cpu_gpr_d[r1],
+                               cpu_gpr_d[r2]);
+        } else {
+            generate_trap(ctx, TRAPC_INSN_ERR, TIN2_IOPC);
+        }
+        break;
     default:
         generate_trap(ctx, TRAPC_INSN_ERR, TIN2_IOPC);
     }
@@ -6600,9 +6702,12 @@ static void decode_rrpw_extract_insert(DisasContext *ctx)
     case OPC2_32_RRPW_EXTR_U:
         if (width == 0) {
             tcg_gen_movi_i32(cpu_gpr_d[r3], 0);
-        } else {
+        } else if (pos + width <= 32) {
             tcg_gen_extract_i32(cpu_gpr_d[r3], cpu_gpr_d[r1], pos, width);
         }
+        /* pos + width > 32 is architecturally "undefined"; leave D[c]
+         * unchanged (mirroring the signed EXTR case) rather than calling
+         * tcg_gen_extract_i32 with an out-of-range ofs+len (debug-build abort). */
         break;
     case OPC2_32_RRPW_IMASK:
         CHECK_REG_PAIR(r3);
@@ -7964,7 +8069,12 @@ static void decode_sys_interrupts(DisasContext *ctx)
 
     switch (op2) {
     case OPC2_32_SYS_DEBUG:
-        /* raise EXCP_DEBUG */
+        /*
+         * DEBUG: if DBGSR.DE == 1 cause a Debug Event, else execute a NOP
+         * (manual p151). QEMU models DBGSR as a plain CSFR but implements no
+         * OCDS debug-event machinery, so the DE==1 path has no consumer; the
+         * architectural NOP (DE==0 path) is executed for both encodings.
+         */
         break;
     case OPC2_32_SYS_DISABLE:
         if (ctx->priv == TRICORE_PRIV_SM || ctx->priv == TRICORE_PRIV_UM1) {
@@ -8453,6 +8563,10 @@ static void tricore_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
     CPUTriCoreState *env = cpu_env(cpu);
     uint16_t insn_lo;
     bool is_16bit;
+
+    if (tc_dbg_enabled() && tc_dbg_watch((uint32_t)ctx->base.pc_next)) {
+        gen_helper_tc_dbg(tcg_env, tcg_constant_i32((uint32_t)ctx->base.pc_next));
+    }
 
     insn_lo = translator_lduw_end(env, &ctx->base, ctx->base.pc_next, MO_LE);
     is_16bit = tricore_insn_is_16bit(insn_lo);

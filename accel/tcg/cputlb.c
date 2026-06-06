@@ -1279,7 +1279,17 @@ io_prepare(hwaddr *out_offset, CPUState *cpu, CPUTLBEntryFull *full,
     section = full->section;
     mr_offset = full->xlat_offset + addr;
     cpu->mem_io_pc = retaddr;
-    if (!cpu->neg.can_do_io) {
+    /*
+     * retaddr == 0 means this MMIO access did not originate from translated
+     * guest code -- e.g. a TCG helper doing cpu_ld*_data()/cpu_st*_data() with
+     * ra=0, or an architectural microcode access such as the TriCore CSA
+     * context save/restore (helper_stucx / interrupt entry) that reads a linked
+     * CSA whose (possibly corrupt) pointer lands in an MMIO region. There is no
+     * TB instruction to rewind, so cpu_io_recompile() would tcg_tb_lookup(0),
+     * find nothing, and cpu_abort("could not find TB for pc=0"). Such accesses
+     * don't need icount re-execution; let them proceed instead of aborting.
+     */
+    if (!cpu->neg.can_do_io && retaddr != 0) {
         cpu_io_recompile(cpu, retaddr);
     }
 

@@ -118,6 +118,9 @@ DEF_HELPER_2(utof, i32, env, i32)
 DEF_HELPER_2(ftoiz, i32, env, i32)
 DEF_HELPER_2(ftou, i32, env, i32)
 DEF_HELPER_2(ftouz, i32, env, i32)
+DEF_HELPER_3(ftoq31, i32, env, i32, i32)
+DEF_HELPER_3(ftoq31z, i32, env, i32, i32)
+DEF_HELPER_3(q31tof, i32, env, i32, i32)
 DEF_HELPER_2(updfl, void, env, i32)
 /* dvinit */
 DEF_HELPER_3(dvinit_b_13, i64, env, i32, i32)
@@ -160,3 +163,5 @@ DEF_HELPER_2(psw_write, void, env, i32)
 DEF_HELPER_1(psw_read, i32, env)
 /* Exceptions */
 DEF_HELPER_3(raise_exception_sync, noreturn, env, i32, i32)
+/* TC1797 OSEK value-trace (env-gated, watched PCs only) */
+DEF_HELPER_2(tc_dbg, void, env, i32)

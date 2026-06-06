@@ -23,6 +23,150 @@
 #include <zlib.h> /* for crc32 */
 
 
+/* TC1797 OSEK value-trace: logs regs + key OS-CB memory at watched PCs.
+ * Emitted only for watched PCs and only when TC1797_DBG is set (see translate.c). */
+void helper_tc_dbg(CPUTriCoreState *env, uint32_t pc)
+{
+    static int n;
+    /* Dispatch-crash diagnostic (env TC1797_DISP): the ERCOSEK scheduler enters
+     * the next task via `calli a15` at 0x801256c8, where
+     *   a15 = *( *(  (*0xD000998C) + nextid*0x10  + 4 ) ).
+     * If nextid is out of range (table has `limit` entries) or an entry is
+     * clobbered, a15 is garbage and the CPU runs away into unmapped space. Log
+     * every dispatch + ALWAYS flag the out-of-code-range case. */
+    if (pc == 0x801256c8u) {
+        static int disp = -1;
+        if (disp < 0) {
+            disp = getenv("TC1797_DISP") ? 1 : 0;
+        }
+        if (disp) {
+            uint32_t a15  = env->gpr_a[15];
+            uint32_t base = cpu_ldl_le_data(env, 0xD000998Cu);
+            uint32_t nid  = cpu_ldl_le_data(env, 0xD0000988u);
+            uint32_t cid  = cpu_ldl_le_data(env, 0xD0000064u);
+            uint32_t lim  = cpu_ldl_le_data(env, 0xD0000984u);
+            bool bad = (a15 < 0x80000000u || a15 >= 0x80400000u);
+            static unsigned dn;
+            if (bad || dn++ < 60) {
+                fprintf(stderr,
+                    "TCDBG DISP%s a15=%08x base=%08x nextid=%u curid=%u limit=%u pc_ra=%08x\n",
+                    bad ? "-BAD" : "", a15, base, nid, cid, lim, env->gpr_a[11]);
+                fflush(stderr);
+            }
+        }
+        return;
+    }
+    /* Experimental counter-object injection (TC1797_INJECT): the firmware's
+     * broken init never sets DAT_d00009a4, so its StartCounter bails. Provide
+     * the counter object at the firmware's own (unused) counter TCB slot and
+     * let the real StartCounter arm it. Tests how far the chain comes alive. */
+    static int inj = -1;
+    if (inj < 0) {
+        inj = getenv("TC1797_INJECT") ? 1 : 0;
+    }
+    if (inj && pc == 0x800bfaacu && cpu_ldl_le_data(env, 0xD00009A4) == 0) {
+        uint32_t obj = 0xD00099E0u;          /* firmware's own counter TCB slot */
+        cpu_stl_le_data(env, obj + 0, 0);              /* [0]  -> DAT_d00018c8 */
+        cpu_stl_le_data(env, obj + 4, 0xD0009BD0u);    /* [4]  -> 18cc (TCB)   */
+        cpu_stb_data(env,  obj + 8, 1);                /* [8]  autostart != 0  */
+        cpu_stb_data(env,  obj + 9, 0);                /* [9]  -> 400c         */
+        cpu_stb_data(env,  obj + 10, 0x20);            /* [10] mode (os-run)   */
+        cpu_stl_le_data(env, obj + 12, 0);             /* [12] -> 18e0         */
+        cpu_stl_le_data(env, obj + 16, 0);             /* [16] -> 18dc         */
+        cpu_stl_le_data(env, 0xD00009A4u, obj);        /* DAT_d00009a4 = obj   */
+        fprintf(stderr, "TCDBG INJECT: counter obj @%08x set into DAT_d00009a4\n", obj);
+        fflush(stderr);
+    }
+    /* Periodic-task dispatch hijack: the OSEK dispatcher FUN_80124512 calls the
+     * ready task's method via `calli a4` at 0x8012459a. The big periodic app
+     * task FUN_80081faa (which runs the diag poll + UDS handling) never gets
+     * activated because the counter/alarm init is gated. Every Nth dispatch,
+     * redirect a4 to FUN_80081faa so the firmware's own calli runs it with a
+     * correct context + return. */
+    {
+        static int hij = -1;
+        if (hij < 0) {
+            hij = getenv("TC1797_HIJACK") ? 1 : 0;   /* separate gate: dispatcher hijack */
+        }
+        if (!hij) {
+            goto skip_hijack;
+        }
+    }
+    if (pc == 0x8012459au) {
+        static unsigned dc;
+        uint8_t phase = cpu_ldub_data(env, 0xD0003643u);
+        if (phase >= 4 && (dc++ % 50u) == 0u) {
+            /* Run the diag dispatch task FUN_800dd0e8: drain diag MO + service
+             * dispatch (FUN_8011c1fe) + response build/TX (FUN_8011c2e8). */
+            env->gpr_a[4] = 0x80081faau;   /* real periodic task (proper calli/task
+                                            * context) that calls FUN_800dd0e8 -> diag;
+                                            * calli'ing the FUN_800dd0e8 subroutine
+                                            * directly faulted before the drain. */
+            cpu_stb_data(env, 0xD000400Fu, 1);   /* keep os_running asserted */
+            { static unsigned ff; if (ff++ < 20) {
+                fprintf(stderr, "TCDBG HIJACK#%u phase=%u\n", ff, phase); fflush(stderr); } }
+        }
+        return;
+    }
+ skip_hijack: ;
+    if (pc == 0x800dd0e8u) {
+        static unsigned dn, hits;
+        uint32_t sess = cpu_ldl_le_data(env, 0xD0019A44u);
+        uint32_t chan = (sess >= 0x80000000u && sess < 0x80400000u)
+                        ? cpu_lduw_le_data(env, sess + 0x1au) : 0xFFFFFFFFu;
+        uint32_t moidx = (chan < 256u) ? cpu_ldub_data(env, 0xD0014FE7u + chan) : 0xFFu;
+        uint32_t mostat = (moidx < 128u)
+            ? cpu_ldl_le_data(env, 0xF0005000u + moidx * 0x20u + 0x1Cu) : 0;
+        uint32_t a8e = cpu_lduw_le_data(env, 0xD0019A8Eu);
+        uint32_t a4c = cpu_ldl_le_data(env, 0xD0019A4Cu);
+        uint32_t nd = (mostat >> 3) & 1u;
+        if (nd) {
+            hits++;                       /* count diag-task runs that SAW NEWDAT */
+        }
+        if (dn++ < 100000) {
+            fprintf(stderr, "TCDBG DIAGTASK chan=%u mo=%u NEWDAT=%u a8e=%04x a4c=%08x newdat_hits=%u\n",
+                    chan, moidx, nd, a8e, a4c, hits);
+            fflush(stderr);
+        }
+        return;
+    }
+    if (pc == 0x800dc44cu && env->gpr_d[4] == 0x6eu) {   /* diag drain, channel 110 */
+        static unsigned dr, drnd;
+        uint32_t st = cpu_ldl_le_data(env, 0xF0005A9Cu);  /* MO84 MOSTAT (NEWDAT bit3) */
+        dr++;
+        if ((st >> 3) & 1u) {
+            drnd++;
+        }
+        if (dr <= 100000) {
+            fprintf(stderr, "TCDBG DRAIN110 #%u NEWDAT=%u saw_newdat_total=%u\n",
+                    dr, (st >> 3) & 1u, drnd);
+            fflush(stderr);
+        }
+        return;
+    }
+    {
+        static int verbose = -1;
+        if (verbose < 0) {
+            verbose = getenv("TC1797_DBG") ? 1 : 0;
+        }
+        if (!verbose) {
+            return;                      /* TC1797_DISP-only run: suppress tracer */
+        }
+    }
+    if (n++ > 4000) {
+        return;
+    }
+    uint32_t d9a4 = cpu_ldl_le_data(env, 0xD00009A4);
+    uint32_t err  = cpu_ldl_le_data(env, 0xD0016CB0);
+    uint32_t cnt0 = cpu_ldl_le_data(env, 0xD00099E0);
+    fprintf(stderr,
+        "TCDBG pc=%08x a2=%08x a4=%08x a5=%08x a11=%08x a15=%08x d4=%08x d15=%08x "
+        "| DAT_d00009a4=%08x d0016cb0=%08x TCB[d00099e0]=%08x\n",
+        pc, env->gpr_a[2], env->gpr_a[4], env->gpr_a[5], env->gpr_a[11],
+        env->gpr_a[15], env->gpr_d[4], env->gpr_d[15], d9a4, err, cnt0);
+    fflush(stderr);
+}
+
 /* Exception helpers */
 
 static G_NORETURN
@@ -2564,6 +2708,27 @@ void tricore_cpu_do_interrupt(CPUState *cs)
         cdc_increment(&psw);            /* CDO trap path omitted (per e:fs) */
     }
     psw = (env->PSW & ~MASK_PSW_CDE) | (1u << 7);
+
+    /* DIAGNOSTIC (env TC1797_DBG): interrupt entry saves the upper context into a
+     * CSA from the free list but never checks FCX==0 (FCU) or FCX==LCX (FCD).
+     * If the list is exhausted when an IRQ fires, ea becomes 0 and we corrupt
+     * memory at address 0 + the PCXI chain -> non-deterministic boot. Log if it
+     * ever happens during boot (capped). */
+    {
+        static int csa_dbg = -1;
+        if (csa_dbg < 0) {
+            csa_dbg = getenv("TC1797_DBG") ? 1 : 0;
+        }
+        if (csa_dbg && (env->FCX == 0
+                        || (env->FCX & 0xfffffu) == (env->LCX & 0xfffffu))) {
+            static unsigned fcu_n;
+            if (fcu_n++ < 60) {
+                fprintf(stderr, "TCDBG IRQ-CSA-EXHAUST FCX=%08x LCX=%08x PC=%08x pipn=%u\n",
+                        env->FCX, env->LCX, env->PC, FIELD_EX32(env->ICR, ICR, PIPN));
+                fflush(stderr);
+            }
+        }
+    }
 
     /* Save upper context of the interrupted task into the CSA at FCX. */
     ea = ((env->FCX & MASK_FCX_FCXS) << 12) + ((env->FCX & MASK_FCX_FCXO) << 6);
