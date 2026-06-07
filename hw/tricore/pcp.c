@@ -52,6 +52,10 @@ static void pcp_write(hwaddr addr, unsigned size, uint32_t val)
             fflush(stderr);
         }
     }
+    if ((addr & MASK32) == 0xD000416Fu && getenv("TC1797_PCPLOG")) {
+        fprintf(stderr, "PCPFLAG: 0xD000416F <- phase 0x%02x\n", val & 0xFF);
+        fflush(stderr);
+    }
     address_space_rw(&address_space_memory, addr & MASK32,
                      MEMTXATTRS_UNSPECIFIED, b, size, true);
 }
@@ -139,6 +143,18 @@ static void pcp_restore_context(PcpCore *c, uint8_t srpn, uint32_t csa_base,
         c->R[CTX[model].regs[slot]] = pcp_read(base + slot * 4, 4);
     }
     c->pc = rcb ? ((2 * srpn) & 0xFFFF) : ((c->R[7] >> 16) & 0xFFFF);
+    {   /* diagnostic: force a channel's cold entry PC each trigger (env
+         * TC1797_PCPCOLD=<srpn>:<pc>) so the cold path can be traced
+         * deterministically regardless of the resumable-context state. */
+        const char *cf = getenv("TC1797_PCPCOLD");
+        if (cf) {
+            unsigned csr = strtoul(cf, NULL, 0);
+            const char *colon = strchr(cf, ':');
+            if (colon && srpn == (uint8_t)csr) {
+                c->pc = (uint16_t)strtoul(colon + 1, NULL, 0);
+            }
+        }
+    }
     if (getenv("TC1797_PCPLOG")) {
         fprintf(stderr, "PCPCTX: srpn=%u rcb=%d model=%d base=0x%08x "
                 "words=[%08x %08x %08x %08x %08x %08x %08x %08x] pc=0x%x\n",
@@ -222,14 +238,18 @@ static void pcp_step(PcpCore *c)
     if (c->trace) {
         qemu_log("  PCP 0x%08x: am=%u hw=%04x\n", (uint32_t)pa, am, hw);
     }
-    if (getenv("TC1797_PCPTRACE")) {
-        static unsigned tc;
-        if (tc++ < 300) {
-            fprintf(stderr, "PCPT pc=0x%04x pa=0x%08x hw=%04x hw2=%04x am=%u "
-                    "Rb=%u Ra=%u | R0=%08x R1=%08x R4=%08x R5=%08x R6=%08x R7=%08x\n",
-                    (uint32_t)(c->pc - len_hw), (uint32_t)pa, hw, hw2, am, Rb, Ra,
-                    R[0], R[1], R[4], R[5], R[6], R[7]);
-            fflush(stderr);
+    {
+        const char *tcsr = getenv("TC1797_PCPTRACE");
+        if (tcsr && c->cur_srpn == (uint8_t)strtoul(tcsr, NULL, 0)) {
+            static unsigned tc;
+            if (tc++ < 400) {
+                fprintf(stderr, "PCPT[%02x] pc=0x%04x hw=%04x hw2=%04x am=%u Rb=%u "
+                        "Ra=%u | R0=%08x R1=%08x R2=%08x R3=%08x R4=%08x R5=%08x "
+                        "R6=%08x R7=%08x\n", c->cur_srpn, (uint32_t)(c->pc - len_hw),
+                        hw, hw2, am, Rb, Ra, R[0], R[1], R[2], R[3], R[4], R[5],
+                        R[6], R[7]);
+                fflush(stderr);
+            }
         }
     }
 

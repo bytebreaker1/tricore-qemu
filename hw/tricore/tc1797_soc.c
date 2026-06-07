@@ -360,6 +360,24 @@ static void tc1797_stm_tick(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     bool raised = false;
 
+    /* RESEARCH (TC1797_STM_GRACE_MS): defer the OSEK tick *interrupt* during early
+     * cold-init so the firmware's alarm-queue setup completes before the first tick
+     * ISR runs. Phase 3->4 is gated by a timing-sensitive ordering: the alarm
+     * processing (FUN_80124b16) underflows on an empty queue if the STM CMP tick
+     * (SRPN 8) fires before the alarm setup. The 56-bit counter keeps advancing
+     * (only the interrupt is held off), so firmware STM delay loops are unaffected. */
+    {
+        static int64_t grace_ns = -1;
+        if (grace_ns < 0) {
+            const char *e = getenv("TC1797_STM_GRACE_MS");
+            grace_ns = e ? (int64_t)atoi(e) * 1000000LL : 0;
+        }
+        if (grace_ns > 0 && now < grace_ns) {
+            timer_mod(s->stm_timer, grace_ns);   /* re-arm at end of the grace window */
+            return;
+        }
+    }
+
     for (int ch = 0; ch < 2; ch++) {
         if (!tc1797_stm_cmp_enabled(s, ch)) {
             s->stm_cmp_deadline[ch] = INT64_MAX;
@@ -412,6 +430,12 @@ static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
         return (uint32_t)(v56 >> 32);            /* CAP */
     }
     switch (addr) {
+    case 0xF0000208: return 0x0000C000;          /* STM_ID: MODTYPE 0xC0 (was leaking count56) */
+    /* STM_CLC (0xF0000200) is intentionally NOT intercepted: the firmware's early
+     * cold-init reads 0xF0000200 and depends on a TIME-VARYING value (the count56
+     * the default below leaks). Returning the faithful CLC reset (0x200) stalls the
+     * boot before DSPR block-init. Flagged for RE -- what the firmware wants at
+     * 0xF0000200 -- before STM_CLC can be modelled faithfully. */
     case 0xF0000230: return s->stm_cmp0;
     case 0xF0000234: return s->stm_cmp1;
     case 0xF0000238: return s->stm_cmcon;
@@ -1044,11 +1068,13 @@ static void tc1797_src_node_write(TC1797SoCState *s, uint32_t *node,
                                   uint32_t val, uint32_t addr)
 {
     uint32_t srr = (*node >> 13) & 1u;
-    if (val & 0x8000u) {
-        srr = 1;                          /* SETR */
-    }
-    if (val & 0x4000u) {
-        srr = 0;                          /* CLRR */
+    /* SETR[15]/CLRR[14] set/clear the request bit. Per the UM SRC-register note,
+     * when BOTH are written in the same access SRR is left UNCHANGED (neither wins)
+     * -- the old code applied CLRR after SETR, so CLRR incorrectly won a tie. */
+    if ((val & 0x8000u) && !(val & 0x4000u)) {
+        srr = 1;                          /* SETR only */
+    } else if ((val & 0x4000u) && !(val & 0x8000u)) {
+        srr = 0;                          /* CLRR only */
     }
     *node = (val & 0x00001FFFu) | (srr << 13);
     if (!(srr && ((*node >> 12) & 1u))) {
@@ -1850,13 +1876,22 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
              * stop after N so we don't peg the CPU -- and the count tells us. */
             {
                 static int rstn;
-                if (rstn < 8) {   /* bounded warm-reset during bring-up: boot#1 runs
-                                   * the RAM self-test then resets (intended 0x3026);
-                                   * boot#2+ skip it and proceed into OSEK cold-init.
-                                   * Capped so any residual reset loop can't peg. */
+                static int cap = -1;
+                if (cap < 0) {
+                    /* Real silicon has no reset cap; the firmware's reset-then-skip
+                     * init cascade (clock-config, RAM self-test 0x3026, and the
+                     * gate-3 0x3006 PCP-completion cascade) reboots as many times as
+                     * it needs, warm-resetting with SRAM/DFLASH/PCP-PRAM preserved
+                     * and RSTSTAT=SWRST so each reboot skips already-done steps.
+                     * We keep only a high safety bound so a genuine (non-skipping)
+                     * reset loop can't peg the CPU. Override via TC1797_RESET_CAP. */
+                    const char *e = getenv("TC1797_RESET_CAP");
+                    cap = e ? atoi(e) : 64;
+                }
+                if (rstn < cap) {
                     rstn++;
-                    info_report("tc1797: SCU sw-reset #%d PC=0x%08x",
-                                rstn, (uint32_t)s->cpu.env.PC);
+                    info_report("tc1797: SCU sw-reset #%d/%d PC=0x%08x",
+                                rstn, cap, (uint32_t)s->cpu.env.PC);
                     s->sw_reset_pending = true;
                     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
                 }

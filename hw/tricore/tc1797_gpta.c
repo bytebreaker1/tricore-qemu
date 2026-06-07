@@ -33,13 +33,22 @@ uint32_t tc1797_gpta_read(Tc1797Gpta *g, uint32_t addr, uint64_t now_ns)
      * EVERY unwritten register perturbs a firmware status branch and stalls the
      * boot, so it is gated rather than default.
      */
+    uint32_t rv;
     if (g->written[idx]) {
-        return g->shadow[idx];
+        rv = g->shadow[idx];
+    } else if (g->freerun) {
+        rv = (uint32_t)((now_ns - g->t0_ns) / 10u);   /* 10 ns == 100 MHz */
+    } else {
+        rv = 0;
     }
-    if (g->freerun) {
-        return (uint32_t)((now_ns - g->t0_ns) / 10u);   /* 10 ns == 100 MHz */
+    if (getenv("TC1797_GPTALOG")) {
+        static unsigned gc;
+        if (gc++ < 6000) {
+            fprintf(stderr, "GPTAR [0x%08x] = 0x%08x\n", (uint32_t)addr, rv);
+            fflush(stderr);
+        }
     }
-    return 0;
+    return rv;
 }
 
 void tc1797_gpta_write(Tc1797Gpta *g, uint32_t addr, uint32_t val)
