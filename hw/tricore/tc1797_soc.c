@@ -360,21 +360,28 @@ static void tc1797_stm_tick(void *opaque)
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     bool raised = false;
 
-    /* RESEARCH (TC1797_STM_GRACE_MS): defer the OSEK tick *interrupt* during early
-     * cold-init so the firmware's alarm-queue setup completes before the first tick
-     * ISR runs. Phase 3->4 is gated by a timing-sensitive ordering: the alarm
-     * processing (FUN_80124b16) underflows on an empty queue if the STM CMP tick
-     * (SRPN 8) fires before the alarm setup. The 56-bit counter keeps advancing
-     * (only the interrupt is held off), so firmware STM delay loops are unaffected. */
+    /* CONSENSUS FIX (3-agent tie-break, HIGH confidence): the OSEK schedule-tick ISR
+     * (FUN_80081870, raised by the SRPN-7 STM compare) dispatches *(*cursor) as a
+     * function pointer, where cursor = DAT_d0012498 (DSPR 0xD0012498). If the
+     * schedule table has not been started yet -- FUN_8012529c (OSEK StartScheduleTable)
+     * sets DAT_d0012498 = (*(DAT_d0000978+4))[1] and only then arms this tick -- the
+     * cursor is NULL, so the ISR does `calli 0` -> jumps to NULL -> the CPU marches
+     * NOPs through unmapped segment 0 forever (the phase 3->4 hang). Real silicon's OS
+     * tick does not dispatch before the schedule table exists. Faithful accommodation:
+     * defer the OS tick until the cursor is non-NULL. Env-gated (TC1797_TICK_GATE);
+     * default build unchanged. */
     {
-        static int64_t grace_ns = -1;
-        if (grace_ns < 0) {
-            const char *e = getenv("TC1797_STM_GRACE_MS");
-            grace_ns = e ? (int64_t)atoi(e) * 1000000LL : 0;
+        static int gate = -1;
+        if (gate < 0) {
+            gate = getenv("TC1797_TICK_GATE") ? 1 : 0;
         }
-        if (grace_ns > 0 && now < grace_ns) {
-            timer_mod(s->stm_timer, grace_ns);   /* re-arm at end of the grace window */
-            return;
+        if (gate) {
+            uint32_t cursor = 0;
+            cpu_physical_memory_read(0xD0012498u, &cursor, 4);
+            if (cursor == 0) {
+                timer_mod(s->stm_timer, now + 1000000);   /* recheck in 1 ms virtual */
+                return;
+            }
         }
     }
 
