@@ -2635,6 +2635,21 @@ static void tc1797_cpu_reset(void *opaque)
     cpu_set_pc(cs, ms->boot_entry);
 
     /*
+     * TC1797 (TC1.3.1) CPU-core reset vectors. QEMU's generic TriCore reset sets
+     * only PSW=0xB80 (correct) and leaves the rest zero; the DAVE device pack
+     * (TC1797.REGS) gives the chip's true reset state for the trap-vector base
+     * and interrupt stack pointer. The BROM/crt0 reprograms both via MTCR before
+     * any trap/interrupt fires, so this is a faithfulness fix (not a behavior
+     * change) -- it makes the pre-init core state match silicon for an early
+     * trap and for debugger/register inspection.
+     */
+    {
+        CPUTriCoreState *env = &ms->soc.cpu.env;
+        env->BTV = 0xA0000100;   /* Base Trap Vector Table Pointer (TC1797.REGS reset) */
+        env->ISP = 0x00000100;   /* Interrupt Stack Pointer (TC1797.REGS reset) */
+    }
+
+    /*
      * Re-initialise SoC peripheral register state on every (warm or cold) reset.
      * realize() runs only once, so without this a firmware-triggered warm reset
      * (0xF0000560=2) would leave stale peripheral state -- notably a stale FCE
