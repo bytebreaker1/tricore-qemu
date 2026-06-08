@@ -38,6 +38,8 @@
 #include "tc1797_eray.h"
 #include "tc1797_dma.h"
 #include "tc1797_asc.h"
+#include "tc1797_reset_seed.h"  /* faithful power-on SFR reset values (DAVE TC1797_v1_0.dip) */
+#include "tc1797_write_mask.h"  /* per-register write-protect masks (RO/hardware bits) */
 #include "tc1797_fadc.h"
 #include "tc1797_mli.h"
 #include "tc1797_jtag.h"
@@ -1632,9 +1634,11 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
          * writes 0xF0000560=2 (SCU reset) and halts. With this unmodelled (0),
          * the firmware re-configures the clock on every boot -> reset loop.
          * Report the configured state (bits[15:8]=0x91) so the clock-init is
-         * skipped and the boot proceeds without the reset cycle.
+         * skipped and the boot proceeds without the reset cycle. The faithful
+         * value is 0x9101 (bits[15:8]=0x91 + CHREV=0x01), confirmed by the DAVE
+         * device pack (TC1797.REGS: SCU_CHIPID reset = 0x00009101).
          */
-        return 0x00009100;
+        return 0x00009101;
     case 0xF0000648: return 0x00000001;
     case 0xF0000680: return 0x00000003;
     case 0xF00005C0: return s->hwcfg_ststat; /* STSTAT: HWCFG[7:0] boot-config (configurable) */
@@ -1681,9 +1685,9 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
     case 0xF010C210: return 0x00000000;   /* FCE input register */
     /* ── Silicon identification chain (lets chip-ID checks pass) ── */
     case 0xF0000408: return 0x000DC001;   /* JDPID (Cerberus/JTAG) */
-    case 0xF0000464: return 0x101701C7;   /* JTAGID (TC1797 IDCODE) */
+    case 0xF0000464: return 0x1015A083;   /* JTAGID = TC1797 device IDCODE (DAVE TC1797.REGS CBS_JTAGID; old 0x101701C7 had non-Infineon mfr bits) */
     case 0xF0000480: return s->ocds_ostate; /* OSCU OSTATE: bit0=OCDS counter running */
-    case 0xF0000508: return 0x000DC001;   /* SCU_ID */
+    case 0xF0000508: return 0x0052C001;   /* SCU_ID (DAVE TC1797.REGS: 0x0052C0xx; was wrongly the JDPID value 0x000DC001) */
     /* ── Die Temperature Sensor (DTS, in the SCU; UM 3.7.1) ──
      * DTSSTAT (0xF00000E0): RESULT[9:0] (significant [9:2]) = die temperature,
      * RDY=bit14, BUSY=bit15. We report a fixed, configurable die temperature
@@ -1694,9 +1698,9 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
     case 0xF00000E4: return s->dts_con & ~0x2u;
     case 0xF8000508: return 0x0050C001;   /* PMU0_ID */
     case 0xF8000608: return 0x0051C001;   /* PMU1_ID (TC1797 marker) */
-    case 0xF8002008: return 0x00C0C001;   /* FLASH0_ID */
-    case 0xF8004008: return 0x00C1C001;   /* FLASH1_ID */
-    case 0xF010C208: return 0x002CC001;   /* MCHK_ID */
+    case 0xF8002008: return 0x0053C001;   /* FLASH0_ID (DAVE TC1797.REGS: 0x0053C0xx) */
+    case 0xF8004008: return 0x0055C001;   /* FLASH1_ID (DAVE TC1797.REGS: 0x0055C0xx) */
+    case 0xF010C208: return 0x001BC001;   /* MCHK_ID  (DAVE TC1797.REGS: 0x001BC001) */
     /* ── CPU service-request node (OSEK task-dispatch trigger) ──
      * The ERCOSEK dispatcher polls SRR (bit13) on this node to find pending
      * task-switch work (FUN_801255da / FUN_80124512). Reflect the shadow so the
@@ -1736,6 +1740,28 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
         qemu_log_mask(LOG_UNIMP,
                       "tc1797.sfr: read  0x%08x (size %u) -> 0\n", addr, size);
         return 0;
+    }
+}
+
+/*
+ * Store into a config-read-back shadow cell, preserving the register's
+ * read-only / hardware-updated bits (TC1797.REGS write-protect mask): a real
+ * SFR write can't change 'r'/'rh' bits, so neither should the shadow -- otherwise
+ * a firmware full-word write would corrupt those bits on read-back. Writable
+ * (rw/rwh/w) and reserved bits track the write; protected bits keep their seeded
+ * reset value. TC1797_NO_WRITE_MASK=1 disables (A/B diagnostics).
+ */
+static inline void tc1797_shadow_store(uint32_t *cell, uint32_t val, uint32_t addr)
+{
+    static int gate = -1;
+    if (gate < 0) {
+        gate = getenv("TC1797_NO_WRITE_MASK") ? 0 : 1;
+    }
+    if (gate) {
+        uint32_t prot = tc1797_write_prot_mask(addr);
+        *cell = (*cell & prot) | (val & ~prot);
+    } else {
+        *cell = val;
     }
 }
 
@@ -1966,14 +1992,16 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
          * flash semantics are handled by explicit cases; this just keeps EBU
          * bus-config and overlay-control (OVC) registers self-consistent. */
         if (addr >= 0xF8000000u && addr < 0xF8010000u) {
-            s->ebu_shadow[(addr - 0xF8000000u) >> 2] = (uint32_t)val;
+            tc1797_shadow_store(&s->ebu_shadow[(addr - 0xF8000000u) >> 2],
+                                (uint32_t)val, addr);
             break;
         }
         /* Main peripheral cluster: record for coherent config read-back (see the
          * matching read default). Modeled registers handled above never reach
          * here, so this only backs the otherwise-unmodeled config registers. */
         if (addr >= 0xF0000000u && addr < 0xF0200000u) {
-            s->sfr_shadow[(addr - 0xF0000000u) >> 2] = (uint32_t)val;
+            tc1797_shadow_store(&s->sfr_shadow[(addr - 0xF0000000u) >> 2],
+                                (uint32_t)val, addr);
             break;
         }
         /* PMI register block (0xF87Fxxxx): instruction-memory-interface control
@@ -2136,6 +2164,39 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     s->scu_rststat = 0x00010000;   /* PORST set at cold reset */
     s->sfr_shadow = g_malloc0(0x200000); /* 2 MB SFR config read-back region */
     s->ebu_shadow = g_malloc0(0x10000);  /* 64 KB EBU/PMU/overlay-config read-back */
+    /*
+     * Seed both config-read-back shadows with the chip's true power-on reset
+     * values (Infineon DAVE device pack TC1797_v1_0.dip / TC1797.REGS, REV
+     * 20070702, TS Rev. 1.4 -- 489 nonzero-reset SFRs). The shadows were
+     * zero-init, so any SFR the firmware read before writing returned 0 instead
+     * of its documented reset value -- subtly unfaithful vs. silicon. The
+     * explicit switch cases in tc1797_sfr_read() still take priority (they
+     * intentionally deviate from reset to pass boot polls, e.g. PLLSTAT
+     * "locked"), and the peripheral models (ADC/CAN/GPTA/...) intercept their
+     * own ranges first -- so this only changes truly-unmodeled registers
+     * (SCU/Ports/Cerberus/Buses/MSC/PCP). Set TC1797_NO_RESET_SEED=1 to fall
+     * back to zero-init (A/B diagnostics / bisecting).
+     */
+    if (!getenv("TC1797_NO_RESET_SEED")) {
+        /* TC1797_SEED_LO/HI bound the seeded address range (diagnostics: bisect a
+         * register whose seeded reset value diverts the boot). Default: all. */
+        const char *lo_s = getenv("TC1797_SEED_LO");
+        const char *hi_s = getenv("TC1797_SEED_HI");
+        uint32_t lo = lo_s ? (uint32_t)strtoul(lo_s, NULL, 0) : 0;
+        uint32_t hi = hi_s ? (uint32_t)strtoul(hi_s, NULL, 0) : 0xFFFFFFFFu;
+        for (size_t i = 0; i < TC1797_RESET_SEED_N; i++) {
+            uint32_t a = tc1797_reset_seed[i].addr;
+            uint32_t v = tc1797_reset_seed[i].val;
+            if (a < lo || a > hi) {
+                continue;
+            }
+            if (a >= 0xF0000000u && a < 0xF0200000u) {
+                s->sfr_shadow[(a - 0xF0000000u) >> 2] = v;
+            } else if (a >= 0xF8000000u && a < 0xF8010000u) {
+                s->ebu_shadow[(a - 0xF8000000u) >> 2] = v;
+            }
+        }
+    }
     /* Boot-mode config pins (HWCFG[7:0], latched from P0[7:0] at PORST -> STSTAT).
      * Default 0x80 = the internal-flash/BMI path this firmware boots from. Override
      * with TC1797_HWCFG=<byte> to model the other strap modes (UM Table 7-1:

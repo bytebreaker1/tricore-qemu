@@ -13,7 +13,7 @@
  *   - the full 16-state TAP FSM (clocked by TMS/TDI -> TDO);
  *   - the standard IR (reset selects IDCODE) with IDCODE / BYPASS / SAMPLE +
  *     two Cerberus access instructions;
- *   - IDCODE = 0x101701C7 (matches the SoC JTAGID register), BYPASS = 1 bit;
+ *   - IDCODE = 0x1015A083 (matches the SoC JTAGID register), BYPASS = 1 bit;
  *   - the Cerberus data path: a 64-bit {address, data} scan that performs a real
  *     system-bus access via address_space_rw (read/write any SoC address, like a
  *     DAP);
@@ -35,7 +35,7 @@
 
 #include "chardev/char-fe.h"
 
-#define TC1797_JTAG_IDCODE 0x101701C7u   /* TC1797 device IDCODE (== JTAGID SFR) */
+#define TC1797_JTAG_IDCODE 0x1015A083u   /* TC1797 device IDCODE (== JTAGID SFR; DAVE TC1797.REGS) */
 #define TC1797_JTAG_IR_WIDTH 8
 
 /* TAP FSM states (IEEE 1149.1 order). */

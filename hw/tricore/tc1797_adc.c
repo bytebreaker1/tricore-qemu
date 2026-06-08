@@ -6,7 +6,8 @@
 #include "qemu/error-report.h"
 #include "tc1797_adc.h"
 
-#define ADC_STATUS   0x038u
+#define ADC_STATUS   0x038u               /* GLOBSTR */
+#define ADC_GLOBCTR  0x030u               /* GLOBCTR (ANON request, [9:8]) */
 #define RESR_BASE    0x180u
 #define RESRD_BASE   0x1C0u
 #define RESULT_MASK  0x3FFFu
@@ -18,6 +19,7 @@ void tc1797_adc_init(Tc1797Adc *a, uint32_t base0)
     a->base0 = base0;
     for (int ki = 0; ki < TC1797_ADC_NKERN; ki++) {
         a->k[ki].default_count = -1;
+        a->k[ki].shadow[ADC_GLOBCTR >> 2] = 0x000000FFu;  /* GLOBCTR power-on reset (DAVE TC1797.REGS) */
         for (int n = 0; n < TC1797_ADC_NRES; n++) {
             a->k[ki].input[n] = -1;
         }
@@ -79,7 +81,16 @@ uint32_t tc1797_adc_read(Tc1797Adc *a, uint32_t addr)
         return resr_word(k, (off - RESRD_BASE) >> 2);   /* debug: VF preserved */
     }
     if (off == ADC_STATUS) {
-        return STATUS_READY;
+        /*
+         * GLOBSTR.ANON[9:8] (analog-part status) follows the ANON request the
+         * firmware wrote into GLOBCTR[9:8]: 0 at reset (analog off), 0b11 once
+         * the bring-up enables the kernel (it writes 0x8712 to GLOBCTR -> ANON=3,
+         * then polls GLOBSTR for [9:8]==3). Faithful per DAVE TC1797.REGS
+         * (GLOBSTR reset=0, GLOBCTR reset=0xFF, ANON=[9:8]); models an
+         * instantaneous analog settle (no startup-time counter). Other status
+         * bits (CHNR[6:3], SAMPLE/BUSY[13:11]) read 0 -- no conversion pending.
+         */
+        return k->shadow[ADC_GLOBCTR >> 2] & 0x00000300u;
     }
     return k->shadow[off >> 2];
 }
@@ -123,7 +134,10 @@ void tc1797_adc_selftest(void)
         error_report("ADC selftest FAIL @%d", __LINE__); } } while (0)
     uint32_t base = TC1797_ADC0_BASE;
 
-    /* status ready */
+    /* GLOBSTR.ANON status follows the GLOBCTR ANON request (DAVE TC1797.REGS):
+     * analog off (0) at reset, 0x300 after the kernel-enable write sets ANON=3. */
+    CHK(tc1797_adc_read(&a, base + ADC_STATUS) == 0);
+    tc1797_adc_write(&a, base + ADC_GLOBCTR, 0x00008712u);
     CHK(tc1797_adc_read(&a, base + ADC_STATUS) == STATUS_READY);
 
     /* persistent input on RESR5: valid + value, survives repeated reads */
