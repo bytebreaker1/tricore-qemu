@@ -431,6 +431,18 @@ static void gen_mtcr(DisasContext *ctx, TCGv_i32 r1, int32_t offset)
             tcg_gen_andi_i32(merged, r1, ~R_ICR_PIPN_MASK);
             tcg_gen_or_i32(merged, merged, keep);
             tcg_gen_st_i32(merged, tcg_env, offsetof(CPUTriCoreState, ICR));
+            /*
+             * Writing ICR changes CCPN/IE, i.e. interrupt eligibility. On silicon
+             * the interrupt control unit continuously compares PIPN against CCPN,
+             * so the instant the firmware LOWERS CCPN (e.g. releasing an OSEK
+             * priority-ceiling lock) a higher pending request -- the SRPN-1 OSEK
+             * dispatch enqueued while the SRPN-7/8 tick held CCPN=8 -- is taken.
+             * End the TB so the main loop re-evaluates CPU_INTERRUPT_HARD now,
+             * matching the per-instruction recheck that (only) single-step had and
+             * that real hardware does. Mirrors the mtcr PSW case above. Without
+             * this the brief lower->work->raise CCPN window inside one TB is missed
+             * and the dispatch is starved in free-run (phase-3 -> 4 wedge). */
+            ctx->base.is_jmp = DISAS_EXIT_UPDATE;
         } else {
             switch (offset) {
 #include "csfr.h.inc"

@@ -430,13 +430,28 @@ static void pcp_step(PcpCore *c)
 
     default: {                                      /* am == 7: jump */
         unsigned ccB = (hw >> 6) & 0xF;
+        /*
+         * Relative-jump target = NEXT instruction + signed offset. c->pc was
+         * already advanced past this (1-hw) jump, so it already points at the
+         * next instruction -- add the offset directly. (The bridge/earlier code
+         * used `c->pc - 1 + off` = THIS instruction + off, an off-by-one that
+         * silently broke the GPTA-init dispatch channel's loops: e.g. the
+         * `R3 %= 60` modulo at CMEM 0x82b-0x82e -- `comp;jc.SLT exit;sub;jl top`
+         * -- only terminates when jc/jl are next-instruction relative; one short,
+         * the jc-exit lands on the loop-back jl and spins forever. Validated
+         * end-to-end: with next-instruction targets PCP channel 15 walks its
+         * state machine from state 0 and writes 0xD000416F=1; one short it hangs.
+         * The Ghidra tricore.pcp.sinc uses inst_start but is a rough community
+         * model (it also drops sign-extension) -- the firmware's own loops are
+         * the ground truth.
+         */
         switch (op1012) {
         case 0x0: {                                 /* jl off10 (signed) */
             int off = hw & 0x3FF;
             if (off & 0x200) {
                 off -= 0x400;
             }
-            c->pc = (uint16_t)((c->pc - 1 + off) & 0xFFFF);
+            c->pc = (uint16_t)((c->pc + off) & 0xFFFF);
             break;
         }
         case 0x1: {                                 /* jc off6 (signed) */
@@ -447,7 +462,7 @@ static void pcp_step(PcpCore *c)
             if (off & 0x20) {
                 off -= 0x40;
             }
-            c->pc = (uint16_t)((c->pc - 1 + off) & 0xFFFF);
+            c->pc = (uint16_t)((c->pc + off) & 0xFFFF);
             break;
         }
         case 0x2:                                   /* jc.a abs16 */
@@ -457,7 +472,7 @@ static void pcp_step(PcpCore *c)
             break;
         case 0x4:                                   /* jc.i (rel via Ra) */
             if (eval_cond(ccB, R[7])) {
-                c->pc = (uint16_t)((c->pc - 1 + (R[Ra] & 0xFFFF)) & 0xFFFF);
+                c->pc = (uint16_t)((c->pc + (R[Ra] & 0xFFFF)) & 0xFFFF);  /* next-instr relative */
             }
             break;
         case 0x5:                                   /* jc.ia (abs via Ra) */
@@ -518,11 +533,22 @@ static void *pcp_thread_fn(void *arg)
         e->qcount--;
         qemu_mutex_unlock(&e->mutex);
 
+        /* Per-channel restart vs resume (UM 10.20): the entry table (PC=2*SRPN)
+         * is used only for a channel's FIRST activation after reset; once it has
+         * run (saving its EP-resumable context) it resumes at its saved PC even
+         * while PCP_CS.RCB=1. This is the per-channel Channel-Resume disposition,
+         * not a chip-global flag -- so a channel driven repeatedly by a busy
+         * source (continuous ADC scan -> ch 0x1d) advances its state machine
+         * across triggers instead of re-cold-starting every conversion. */
+        bool chan_started = (e->started_mask[srpn >> 5] >> (srpn & 31)) & 1u;
+        bool eff_rcb = e->rcb && !chan_started;
+        e->started_mask[srpn >> 5] |= 1u << (srpn & 31);
+
         /* Run the channel holding the BQL: this serialises the shared bus
          * against the vCPU exactly like real silicon arbitrates the LMB. */
         bql_lock();
         bool exit_int = false;
-        unsigned ran = pcp_core_run_channel(&e->core, srpn, e->csa_base, e->rcb,
+        unsigned ran = pcp_core_run_channel(&e->core, srpn, e->csa_base, eff_rcb,
                                             e->context_model, e->max_insns,
                                             &exit_int);
         if (exit_int && e->irq_fn) {
@@ -563,6 +589,18 @@ void pcp_engine_init(PcpEngine *e, uint32_t csa_base, int context_model,
     e->irq_opaque = opaque;
     qemu_mutex_init(&e->mutex);
     qemu_cond_init(&e->cond);
+}
+
+void pcp_engine_reset(PcpEngine *e)
+{
+    /* The firmware's reboot re-runs its PCP context seeder (every channel's CR7
+     * is re-pinned to its entry PC), so each channel must cold-start again on
+     * its first post-reset service request. Drop any queued triggers from the
+     * previous boot too. */
+    qemu_mutex_lock(&e->mutex);
+    memset(e->started_mask, 0, sizeof(e->started_mask));
+    e->qhead = e->qtail = e->qcount = 0;
+    qemu_mutex_unlock(&e->mutex);
 }
 
 void pcp_engine_start(PcpEngine *e)

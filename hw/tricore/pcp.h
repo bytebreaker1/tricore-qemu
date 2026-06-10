@@ -48,6 +48,16 @@ typedef struct PcpEngine {
     bool      running;
     bool      started;
 
+    /* Per-channel "has been entered since the last PCP reset" bitmap (one bit
+     * per SRPN). PCP_CS.RCB=1 selects the entry table (PC=2*SRPN) for a channel's
+     * FIRST activation only; once a channel has run and saved a resumable EP
+     * context, subsequent service requests resume it at its saved PC (UM 10.20
+     * Channel Resume) -- the per-channel disposition, not a chip-global restart.
+     * Without this a busy result source (continuous ADC scan) would re-cold-start
+     * its PCP channel on every conversion, so a multi-pass channel (ch 0x1d, the
+     * DTC-0x3006 gate driver) could never advance past its cold init. */
+    uint32_t  started_mask[8];
+
     /* configuration */
     uint32_t  csa_base;     /* PRAM base of the per-SRPN context save areas */
     bool      rcb;          /* PCP_CS.RCB: 1 => entry table (PC=2*SRPN)     */
@@ -68,6 +78,10 @@ void pcp_engine_init(PcpEngine *e, uint32_t csa_base, int context_model,
                      bool rcb, PcpIrqFn irq_fn, void *opaque);
 void pcp_engine_start(PcpEngine *e);
 void pcp_engine_stop(PcpEngine *e);
+/* Clear the per-channel "started" state (call on SoC reset): the firmware's
+ * reboot re-seeds every channel's context, so each channel cold-starts again on
+ * its first post-reset service request. */
+void pcp_engine_reset(PcpEngine *e);
 /* CPU -> PCP: request channel `srpn` (1..255). Async; returns immediately. */
 void pcp_engine_trigger(PcpEngine *e, uint8_t srpn);
 

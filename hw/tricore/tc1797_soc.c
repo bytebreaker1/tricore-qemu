@@ -119,6 +119,23 @@ struct TC1797SoCState {
     uint32_t adc_src[TC1797_ADC_NKERN][16]; /* ADC0/1/2 kernel SRNs (top of each 0x400 kernel, off>=0x3C0): firmware pulses SETR to trigger PCP/CPU completion (e.g. ADC0 SRC@0x3F0 -> PCP ch 0x1d -> sets 0xD000416F, DTC 0x3006 gate) */
     QEMUTimer *ssc_done_timer[2];/* SPI transfer-latency: defer completion SRN raise */
     int64_t ssc_xfer_ns;         /* modelled per-transfer time (env TC1797_SSC_XFER_NS) */
+    /* ADC conversion-complete: the firmware ARMS each kernel's result-event SRC
+     * (e.g. ADC0 SRC@0x3F0) with SRE=1/TOS=1/SETR=0 and waits for the analog
+     * conversion to HW-assert that node's SRR (-> PCP channel = SRPN). On real
+     * silicon every armed result node is an INDEPENDENT conversion-complete
+     * event: arming a second node does not cancel the first's pending EOC. Model
+     * that faithfully with a PER-NODE pending deadline (one entry per
+     * [kernel][column] result node) plus a single timer set to the earliest due
+     * deadline; on expiry every node whose deadline has arrived is completed and
+     * the timer re-arms for the next-earliest. A single global slot (the old
+     * model) let a later arm clobber an earlier node's completion -- e.g. the
+     * firmware arms ADC0 SRC@0x3F0 (PCP ch 0x1d, the DTC-0x3006 gate driver) and
+     * then SRC@0x3FC (ch 0x14) one store later, so ch 0x1d's conversion-complete
+     * was destroyed before it could fire and ch 0x1d never serviced in its
+     * cold-init (RCB=1) window. */
+    QEMUTimer *adc_done_timer;   /* fires at the earliest pending node deadline */
+    int64_t adc_done_deadline[TC1797_ADC_NKERN][16]; /* abs ns; 0 = node idle */
+    int64_t adc_conv_ns;         /* modelled ADC conversion time (env TC1797_ADC_CONV_NS) */
     bool sw_reset_pending;       /* set when 0xF0000560=2 requested a SW reset */
     /* Forced OSEK systick. The ERCOSEK kernel promotes itself from phase 3 to
      * phase 4 only after it starts receiving periodic system ticks, but it never
@@ -667,6 +684,28 @@ static void tc1797_raise_srpn(TC1797SoCState *s, uint8_t srpn)
 static void tc1797_pcp_irq(void *opaque, uint8_t srpn)
 {
     tc1797_raise_srpn((TC1797SoCState *)opaque, srpn);
+}
+
+/*
+ * GPTA capture-cell service request -> route by the SRN's TOS bit, exactly like
+ * a software SETR on a GPTA SRC node (tc1797_src_node_write): to_pcp -> trigger
+ * the PCP channel for this SRPN (engine-position math runs on the PCP thread);
+ * else raise a CPU interrupt at this SRPN. This is the cell-event sink the GPTA
+ * model calls once it has looked up the cell's firmware-armed SRC node.
+ */
+static void tc1797_gpta_route(void *opaque, uint8_t srpn, bool to_pcp)
+{
+    TC1797SoCState *s = opaque;
+    if (srpn == 0) {
+        return;
+    }
+    if (to_pcp) {
+        if (s->pcp_enabled) {
+            pcp_engine_trigger(&s->pcp, srpn);
+        }
+    } else {
+        tc1797_raise_srpn(s, srpn);
+    }
 }
 
 /*
@@ -1338,6 +1377,97 @@ static void tc1797_ssc1_done(void *opaque)
     tc1797_raise_srpn(s, s->ssc_src[1][1] & 0xFFu);
 }
 
+/*
+ * ADC0 conversion-complete latency expiry. The firmware's ADC bring-up (gate
+ * FUN_800fbabc/FUN_800fbafe) ARMS the kernel-0 result-event SRC@0xF01013F0 with
+ * SRE=1/TOS=1/SETR=0 -- i.e. it programs the node enabled and PCP-routed but
+ * does NOT software-pulse it; it expects the ANALOG conversion-complete event to
+ * assert the node's SRR on hardware. On silicon the ADC then routes TOS=1 to PCP
+ * channel 0x1d, whose program writes the GPTA/ADC init-done flag byte
+ * 0xD000416F. QEMU's ADC kernels have no analog engine, so that completion SRR
+ * is never asserted, the byte stays 0, and the DTC-0x3006 gate (jeq d15,#1 at
+ * 0x800fbb18) fatals -> SCU software reset loop.
+ *
+ * Model the conversion latency the same way the SSC transfer latency is modelled
+ * (tc1797_ssc*_done): a short timer, armed when the firmware arms the node, that
+ * on expiry drives the node through the normal SRC write path with SETR set --
+ * exactly the register transaction the silicon's ADC sequencer performs at
+ * end-of-conversion. tc1797_src_node_write then asserts SRR and (TOS=1) triggers
+ * PCP ch 0x1d, which runs its real firmware microcode and sets 0xD000416F.
+ */
+/* SFR address of an ADC result node from its [kernel][column] coordinates. The
+ * result-event nodes sit at the top of each 0x400 kernel, column 0 == off 0x3C0. */
+static inline uint32_t tc1797_adc_node_addr(int ki, int idx)
+{
+    return TC1797_ADC0_BASE + (uint32_t)ki * TC1797_ADC_KSIZE
+         + 0x3C0u + (uint32_t)idx * 4u;
+}
+
+/* (Re)arm the single hardware timer to the earliest pending per-node deadline.
+ * 0 deadlines are idle nodes. With no pending node the timer is stopped. */
+static void tc1797_adc_rearm(TC1797SoCState *s)
+{
+    int64_t best = INT64_MAX;
+    for (int ki = 0; ki < TC1797_ADC_NKERN; ki++) {
+        for (int idx = 0; idx < 16; idx++) {
+            int64_t dl = s->adc_done_deadline[ki][idx];
+            if (dl && dl < best) {
+                best = dl;
+            }
+        }
+    }
+    if (best == INT64_MAX) {
+        timer_del(s->adc_done_timer);
+    } else {
+        timer_mod(s->adc_done_timer, best);
+    }
+}
+
+/*
+ * ADC conversion-complete latency expiry. Complete EVERY result node whose
+ * per-node deadline has arrived (each is an independent end-of-conversion event
+ * on silicon), driving its SRC node through the normal write path with SETR set
+ * -- exactly the register transaction the ADC sequencer performs at EOC.
+ * tc1797_src_node_write then asserts SRR and (TOS=1) triggers the PCP channel
+ * (= SRPN). Re-arm the timer for the next-earliest still-pending node.
+ */
+static void tc1797_adc_conv_done(void *opaque)
+{
+    TC1797SoCState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    for (int ki = 0; ki < TC1797_ADC_NKERN; ki++) {
+        for (int idx = 0; idx < 16; idx++) {
+            int64_t dl = s->adc_done_deadline[ki][idx];
+            if (!dl || now < dl) {
+                continue;                    /* idle, or still converting */
+            }
+            s->adc_done_deadline[ki][idx] = 0;   /* consume this completion */
+            uint32_t *node = &s->adc_src[ki][idx];
+            uint32_t addr = tc1797_adc_node_addr(ki, idx);
+            /* Re-drive the armed node (keep SRPN/SRE/TOS) with SETR=1. */
+            tc1797_src_node_write(s, node, (*node & 0x00001FFFu) | 0x8000u, addr);
+            /*
+             * Continuous conversion (TC1797 UM ch.23: an ADC kernel runs its
+             * programmed request source as a repeating SCAN -- a result-event
+             * node re-asserts every conversion period, not once). A TOS=1 result
+             * node services on the PCP, which clears its SRR on service entry; the
+             * next scan re-raises it. The PCP channel it drives (e.g. ch 0x1d, the
+             * DTC-0x3006 gate driver) is a multi-pass state machine that needs
+             * SEVERAL completions to advance from its cold init -- exactly as the
+             * free-running silicon ADC supplies. Re-arm the next conversion while
+             * the node stays enabled + PCP-routed. Opt-in (TC1797_ADC_CONTINUOUS)
+             * pending RE of the exact ADC scan-mode config bits, so the default
+             * build's one-shot-per-arm behaviour is unchanged. Bounded by the
+             * conversion latency -> a periodic source, never a busy-loop. */
+            if (getenv("TC1797_ADC_CONTINUOUS")
+                && ((*node >> 12) & 1u) && ((*node >> 10) & 1u)) {  /* SRE && TOS */
+                s->adc_done_deadline[ki][idx] = now + s->adc_conv_ns;
+            }
+        }
+    }
+    tc1797_adc_rearm(s);
+}
+
 static void tc1797_ssc_write(TC1797SoCState *s, int unit, uint32_t off,
                              uint32_t val)
 {
@@ -1513,9 +1643,37 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
                 int ki = (int)(aoff / TC1797_ADC_KSIZE);
                 if (ki >= 0 && ki < TC1797_ADC_NKERN
                     && koff >= 0x3C0u && (val & 0x1000u)) {
+                    int idx = (int)((koff - 0x3C0u) >> 2);
                     tc1797_adc_write(&s->adc, addr, val);  /* shadow read-back */
-                    tc1797_src_node_write(s, &s->adc_src[ki][(koff - 0x3C0u) >> 2],
-                                          val, addr);
+                    tc1797_src_node_write(s, &s->adc_src[ki][idx], val, addr);
+                    /*
+                     * Conversion-complete modelling. When the firmware ARMS a
+                     * result-event node enabled (SRE=1) but does NOT software-
+                     * trigger it (SETR=0) and it is not already pending (SRR=0),
+                     * it is waiting for the analog conversion to assert the SRR
+                     * on hardware. Schedule that completion after a short
+                     * conversion latency (the ADC analogue of the SSC transfer
+                     * latency). On expiry tc1797_adc_conv_done re-drives the node
+                     * with SETR -> SRR -> (TOS=1) PCP channel -> 0xD000416F.
+                     * Guard on TOS=1 so only PCP-routed result events self-fire;
+                     * CPU-routed/software-pulsed writes are unaffected.
+                     */
+                    if ((val & 0x8000u) == 0u                  /* not SW-pulsed   */
+                        && (val & 0x0400u)                     /* TOS=1 -> PCP    */
+                        && ((s->adc_src[ki][idx] >> 13) & 1u) == 0u) { /* SRR=0  */
+                        /* Schedule this node's INDEPENDENT conversion-complete.
+                         * Per-node deadline so a later arm of a different node
+                         * cannot clobber this one's pending EOC (the single-slot
+                         * model dropped ch 0x1d's completion, breaking the gate).
+                         * Idempotent: don't restart a deadline already pending. */
+                        if (idx >= 0 && idx < 16
+                            && s->adc_done_deadline[ki][idx] == 0) {
+                            s->adc_done_deadline[ki][idx] =
+                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                                + s->adc_conv_ns;
+                            tc1797_adc_rearm(s);
+                        }
+                    }
                     return true;
                 }
             }
@@ -1648,6 +1806,21 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
     case 0xF00005F4: return s->wdt_con1;  /* WDT_CON1 shadow */
     /* ── MSC0/MSC1 status: command/data ready (bit 0) ── */
     case 0xF0000844: case 0xF0000944: return 0x00000001;
+    /*
+     * ── MSC0/MSC1 downstream status (+0x30): bit16 = transmission complete ──
+     * The MSC actuator handler (FUN_8011630e, callers in the 0x800dd.. output
+     * drivers) loads a downstream command (write +0x48=1) then polls this
+     * register's bit16 for "shift complete", with an STM (TIM0) timeout, then
+     * acks by setting bit18. On silicon the MSC always completes its serial
+     * downstream shift -- there is no external handshake to stall it -- so bit16
+     * sets every transfer. We model the shift with zero latency, so it is done
+     * by the time the firmware polls: report bit16 set (preserving the firmware's
+     * written bits, incl. its bit18 ack, via the shadow). Without this the poll
+     * always falls through to its timeout, which under wall-clock burns time that
+     * advances the STM toward the premature OSEK tick and under icount stalls the
+     * phase-0 init outright -- neither is how the part behaves. */
+    case 0xF0000830: case 0xF0000930:
+        return s->sfr_shadow[(addr - 0xF0000000u) >> 2] | 0x00010000u;
     /*
      * ── PMU / PFlash0/1 FSR (Flash Status Register, +0x10) ──
      * Bits: 0 PROG, 1 ERASE, 2 PFOPER, 3 DFOPER, 4 FABUSY, 7 PFBUSY,
@@ -1861,11 +2034,10 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
          * SCU software-reset request. The firmware's fatal-error handler
          * FUN_800bf97c writes 0xF0000560=2 to reset the SoC after logging the
          * error (code/value/return-address) to its RAM crash-log at *(0xD0018AC8)
-         * -- struct [+0x14]=retaddr [+0x18]=value [+0x1f]=code. We do NOT reset
-         * (that just reboots into the same deterministic init failure -> loop);
-         * instead we surface the firmware's own crash report, which pinpoints the
-         * failing call site for the boot-bringup grind. The boot then continues
-         * (into a post-fatal spin) so the pre-fatal state stays analysable.
+         * -- struct [+0x14]=retaddr [+0x18]=value [+0x1f]=code. We first surface
+         * that crash report (it pinpoints the failing call site for the boot-
+         * bringup grind), then honour the reset as a warm reset -- capped during
+         * bring-up; see the reset block below.
          * First fatal observed: code=0x11 val=0x3023 from 0x80149134 (a coding/
          * consistency check `d0 != d15` at 0x801490F6 -> DFLASH/coding gate).
          */
@@ -1877,18 +2049,7 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
                             e->gpr_d[4], e->gpr_d[5], e->gpr_d[6], e->gpr_d[15],
                             e->gpr_a[11]);
             }
-            /*
-             * Observe (do not act on) the firmware's self-reset request. The
-             * fatal handler FUN_800bf97c writes 0xF0000560=2 to reset the SoC
-             * after logging to its DSPR crash-log at *(0xD0018AC8) -- struct
-             * [+0x14]=retaddr [+0x18]=value [+0x1f]=code. We surface that report
-             * (pinpoints the failing site for the boot-bringup grind) but do NOT
-             * reset: a warm reset just reboots into the same deterministic init
-             * failure and the firmware's reset-then-skip marker (0xD0018A76=0x96)
-             * is not, by itself, enough to make the reboot skip the self-test
-             * (see task #83). The boot continues into a post-fatal spin so the
-             * pre-fatal state stays analysable.
-             */
+            /* Surface the firmware's own crash report once. */
             uint32_t p = 0, ra = 0, v = 0, code = 0;
             static int once;
             cpu_physical_memory_read(0xD0018AC8, &p, 4);
@@ -2272,6 +2433,21 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
         }
     }
 
+    /* ADC0 conversion-complete latency: model the analog conversion time so the
+     * firmware-armed result-event SRC (ADC0 kernel-0 SRC@0x3F0, SRE=1/TOS=1/
+     * SETR=0) gets its SRR asserted by hardware -> PCP ch 0x1d -> 0xD000416F,
+     * clearing the DTC-0x3006 reset gate. ~50 us is a realistic per-conversion
+     * sequence time; env TC1797_ADC_CONV_NS overrides. See tc1797_adc_conv_done. */
+    s->adc_done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_adc_conv_done, s);
+    memset(s->adc_done_deadline, 0, sizeof(s->adc_done_deadline));
+    {
+        const char *e = getenv("TC1797_ADC_CONV_NS");
+        s->adc_conv_ns = e ? (int64_t)strtoll(e, NULL, 0) : 50000;
+        if (s->adc_conv_ns < 1000) {
+            s->adc_conv_ns = 1000;       /* floor 1 us */
+        }
+    }
+
     /* Forced OSEK systick: ~1 ms per priority, divided across the round-robin
      * set so one fire == one OSEK-counter advance (see tc1797_osek_tick). Armed
      * here and re-armed on every reset; per-fire IE/priority gating means it is
@@ -2511,13 +2687,13 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
                     "configurable via TC1797_DTS_TEMP)", tc, s->dts_stat);
     }
 
-    /* GPTA0/GPTA1/LTCA2 timer arrays. tc1797_pcp_irq is a generic SRN-raise
-     * (opaque + srpn -> tc1797_raise_srpn), reused here for capture-cell IRQs. */
-    tc1797_gpta_init(&s->gpta, TC1797_GPTA_LO, tc1797_pcp_irq, s);
+    /* GPTA0/GPTA1/LTCA2 timer arrays. A capture-cell event routes via
+     * tc1797_gpta_route, which honours the cell's SRC-node TOS bit (PCP vs CPU). */
+    tc1797_gpta_init(&s->gpta, TC1797_GPTA_LO, tc1797_gpta_route, s);
     s->gpta.t0_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->gpta.freerun = (getenv("TC1797_GPTA_FREERUN") != NULL);
     if (getenv("TC1797_GPTATEST")) {
-        tc1797_gpta_selftest(tc1797_pcp_irq, s);
+        tc1797_gpta_selftest(tc1797_gpta_route, s);
     }
 
     /* E-Ray (FlexRay CC) POC state machine (driven by the firmware at phase 4). */
@@ -2569,7 +2745,12 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
         info_report("tc1797: WDT timeout enforcement enabled (TC1797_WDT, 50ms window)");
     }
 
-    s->pcp_enabled = (getenv("TC1797_PCP") != NULL);
+    /* The PCP2 co-processor is part of the TC1797 silicon and is always present;
+     * the firmware routes TOS=1 service requests (ADC/GPTA completion, etc.) to it
+     * and polls the flags its channels set (e.g. the DTC-0x3006 gate waits on
+     * 0xD000416F set by PCP channel 0x1d). Default it ON to function as the chip
+     * does; TC1797_NO_PCP opts out for bring-up bisection. */
+    s->pcp_enabled = (getenv("TC1797_NO_PCP") == NULL);
     pcp_engine_init(&s->pcp, PCP_PRAM_BASE, /*context_model=*/0, /*rcb=*/true,
                     tc1797_pcp_irq, s);
     s->pcp.f_pcp_hz = s->f_pcp;   /* PCP runs on its own clock from the SoC tree */
@@ -2673,6 +2854,19 @@ static void tc1797_cpu_reset(void *opaque)
         s->ssc_tb[1] = 0;
         s->ssc_src[0][0] = s->ssc_src[0][1] = 0;
         s->ssc_src[1][0] = s->ssc_src[1][1] = 0;
+        /* Drop any ADC conversions left in flight from the previous boot so they
+         * cannot fire their EOC into the freshly re-initialising firmware (the
+         * reboot re-arms its result nodes from scratch). */
+        memset(s->adc_done_deadline, 0, sizeof(s->adc_done_deadline));
+        if (s->adc_done_timer) {
+            timer_del(s->adc_done_timer);
+        }
+        /* The reboot re-runs the firmware's PCP context seeder, re-pinning every
+         * channel's entry PC, so each channel cold-starts again on its first
+         * post-reset trigger (clear the engine's per-channel started state). */
+        if (s->pcp_enabled) {
+            pcp_engine_reset(&s->pcp);
+        }
         if (s->stm_timer) {
             /* Re-arm the edge-on-match poll floor (200us) so the CPU-SRC + CAN-RX
              * polls keep running after the warm reset; no compare is armed yet. */
