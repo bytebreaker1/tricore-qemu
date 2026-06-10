@@ -42,11 +42,26 @@
  */
 typedef void (*GptaRouteFn)(void *opaque, uint8_t srpn, bool to_pcp);
 
+/*
+ * The GPTA Global Timers (GTTIM0 @ module+0xE8, GTTIM1 @ module+0xF8) are
+ * free-running 24-bit up-counters clocked off the GPTA clock bus — unlike the
+ * config/capture shadow registers, they advance on their own once the firmware
+ * has seeded them (GTCTR0 + GTTIM0=0 via FUN_80108718). Real silicon shows the
+ * GPTA0_GTTIM0 mirror (DSPR 0xD0001BF4) at ~0x336E3D; a static 0 stalls the PCP
+ * GPTA-init state machine (ch15) that gates DTC-0x3006. We model the four GPTA0/
+ * GPTA1 global timers as live counters: a write seeds {base,epoch}; a read
+ * returns base + elapsed_ticks (24-bit). GTTIM_SLOTS = 2 modules * 2 timers.
+ */
+#define TC1797_GPTA_GT_SLOTS 4
+
 typedef struct Tc1797Gpta {
     uint32_t shadow[TC1797_GPTA_NREG];   /* config + capture-latch read-back */
     uint8_t  written[TC1797_GPTA_NREG];  /* 1 once firmware wrote the offset */
     uint64_t t0_ns;                      /* virtual-clock epoch for free-run */
     bool     freerun;                    /* expose free-running cell timers   */
+    uint64_t gt_t0_ns[TC1797_GPTA_GT_SLOTS]; /* per global-timer free-run epoch */
+    uint32_t gt_base[TC1797_GPTA_GT_SLOTS];  /* GTTIMx value seeded at epoch    */
+    uint8_t  gt_run[TC1797_GPTA_GT_SLOTS];   /* 1 once firmware seeded the timer */
     GptaRouteFn route_fn;
     void *route_opaque;
     uint32_t base;                       /* block base (relocatable per part) */
@@ -54,7 +69,7 @@ typedef struct Tc1797Gpta {
 
 void tc1797_gpta_init(Tc1797Gpta *g, uint32_t base, GptaRouteFn route_fn, void *opaque);
 uint32_t tc1797_gpta_read(Tc1797Gpta *g, uint32_t addr, uint64_t now_ns);
-void tc1797_gpta_write(Tc1797Gpta *g, uint32_t addr, uint32_t val);
+void tc1797_gpta_write(Tc1797Gpta *g, uint32_t addr, uint32_t val, uint64_t now_ns);
 /*
  * Model a capture-cell input edge: latch `value` into the cell's capture
  * register at `cell_off` (offset from TC1797_GPTA_LO), then route the service

@@ -18,6 +18,40 @@ static inline uint32_t gpta_idx(uint32_t addr)
     return (addr - TC1797_GPTA_LO) >> 2;
 }
 
+/*
+ * Map an IP-relative GPTA address to a global-timer free-run slot, or -1.
+ * GTTIM0 is at module+0xE8, GTTIM1 at module+0xF8, for GPTA0 (module 0) and
+ * GPTA1 (module 1). LTCA2 (module 2) is the capture array, not a global-timer
+ * module, so it is excluded.
+ */
+static int gpta_gttim_slot(uint32_t ip_addr)
+{
+    uint32_t off    = ip_addr - TC1797_GPTA_LO;
+    uint32_t mod    = off / GPTA_MOD_STRIDE;
+    uint32_t in_mod = off & (GPTA_MOD_STRIDE - 1u);
+    if (mod > 1u) {
+        return -1;
+    }
+    if (in_mod == 0xE8u) {
+        return (int)(mod * 2u + 0u);     /* GTTIMn0 */
+    }
+    if (in_mod == 0xF8u) {
+        return (int)(mod * 2u + 1u);     /* GTTIMn1 */
+    }
+    return -1;
+}
+
+/* Global-timer tick period in virtual ns. The GPTA bus clock that drives the
+ * global timers is ~90 MHz on this part; exact rate only affects how fast the
+ * count advances, not whether the firmware's timer polls progress, so it is
+ * tunable (TC1797_GTTIM_NS) with a faithful default. */
+static inline uint32_t gpta_gttim_period_ns(void)
+{
+    const char *e = getenv("TC1797_GTTIM_NS");
+    uint32_t ns = e ? (uint32_t)strtoul(e, NULL, 0) : 11u;   /* ~90 MHz */
+    return ns ? ns : 11u;
+}
+
 uint32_t tc1797_gpta_read(Tc1797Gpta *g, uint32_t addr, uint64_t now_ns)
 {
     addr = TC1797_GPTA_LO + (addr - g->base);   /* relocate to IP-relative space */
@@ -34,7 +68,13 @@ uint32_t tc1797_gpta_read(Tc1797Gpta *g, uint32_t addr, uint64_t now_ns)
      * boot, so it is gated rather than default.
      */
     uint32_t rv;
-    if (g->written[idx]) {
+    int gs = gpta_gttim_slot(addr);
+    if (gs >= 0 && g->gt_run[gs]) {
+        /* Free-running global timer: base seeded at the firmware's write, plus
+         * the elapsed bus ticks since, wrapped to the 24-bit GTTIM width. */
+        uint64_t ticks = (now_ns - g->gt_t0_ns[gs]) / gpta_gttim_period_ns();
+        rv = (g->gt_base[gs] + (uint32_t)ticks) & 0x00FFFFFFu;
+    } else if (g->written[idx]) {
         rv = g->shadow[idx];
     } else if (g->freerun) {
         rv = (uint32_t)((now_ns - g->t0_ns) / 10u);   /* 10 ns == 100 MHz */
@@ -51,13 +91,21 @@ uint32_t tc1797_gpta_read(Tc1797Gpta *g, uint32_t addr, uint64_t now_ns)
     return rv;
 }
 
-void tc1797_gpta_write(Tc1797Gpta *g, uint32_t addr, uint32_t val)
+void tc1797_gpta_write(Tc1797Gpta *g, uint32_t addr, uint32_t val, uint64_t now_ns)
 {
     addr = TC1797_GPTA_LO + (addr - g->base);
     uint32_t idx = gpta_idx(addr);
     if (idx < TC1797_GPTA_NREG) {
         g->shadow[idx] = val;
         g->written[idx] = 1;
+    }
+    /* Seeding a global timer (re)starts its free-run from the written value at
+     * this instant; reads thereafter advance it at the bus rate (see read). */
+    int gs = gpta_gttim_slot(addr);
+    if (gs >= 0) {
+        g->gt_base[gs]  = val & 0x00FFFFFFu;
+        g->gt_t0_ns[gs] = now_ns;
+        g->gt_run[gs]   = 1;
     }
     /*
      * Software service request on a service-request node (per-module SRC region
@@ -140,12 +188,12 @@ void tc1797_gpta_selftest(GptaRouteFn route_fn, void *opaque)
     CHK(t_b > t_a);
 
     /* config write reads back exactly (no longer free-running) */
-    tc1797_gpta_write(&g, 0xF0002020, 0xCAFE1234);
+    tc1797_gpta_write(&g, 0xF0002020, 0xCAFE1234, 0);
     CHK(tc1797_gpta_read(&g, 0xF0002020, 999999) == 0xCAFE1234);
 
     /* Arm LTCA2_SRC02 as the firmware does (PCP, SRPN 19, SRE=1), then a crank
      * capture must latch its LTCXR and route to PCP channel 19. */
-    tc1797_gpta_write(&g, 0xF0002FF4, 0x00001413);   /* LTCA2_SRC02: SRE|TOS|19 */
+    tc1797_gpta_write(&g, 0xF0002FF4, 0x00001413, 0);  /* LTCA2_SRC02: SRE|TOS|19 */
     gpta_test_srpn = 0; gpta_test_pcp = false;
     tc1797_gpta_capture(&g, GPTA_LTCA2_OFF + GPTA_LTC_OFF + GPTA_CRANK_CELL * 8u + 4u,
                         0x00ABCDEF);
@@ -153,7 +201,7 @@ void tc1797_gpta_selftest(GptaRouteFn route_fn, void *opaque)
         && tc1797_gpta_read(&g, 0xF0002A14, 0) == 0x00ABCDEF);
 
     /* An un-armed node (SRE=0) must NOT route — faithful to silicon. */
-    tc1797_gpta_write(&g, 0xF0002FF0, 0x00000413);   /* LTCA2_SRC03: TOS|19, SRE=0 */
+    tc1797_gpta_write(&g, 0xF0002FF0, 0x00000413, 0);  /* LTCA2_SRC03: TOS|19, SRE=0 */
     gpta_test_srpn = 0xFF;
     tc1797_gpta_capture(&g, GPTA_LTCA2_OFF + GPTA_LTC_OFF + GPTA_CAM_CELL * 8u + 4u,
                         0x00001234);

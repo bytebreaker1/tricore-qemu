@@ -1679,7 +1679,8 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
             }
             tc1797_adc_write(&s->adc, addr, val); return true;
         case TC_IP_FADC:     tc1797_fadc_write(&s->fadc, addr, val); return true;
-        case TC_IP_GPTA:     tc1797_gpta_write(&s->gpta, addr, val); return true;
+        case TC_IP_GPTA:     tc1797_gpta_write(&s->gpta, addr, val,
+                                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)); return true;
         case TC_IP_DMA:      tc1797_dma_write(&s->dma, addr, val); return true;
         case TC_IP_ERAY:     tc1797_eray_write(&s->eray, addr, val); return true;
         case TC_IP_ASC:      tc1797_asc_write(p->unit ? &s->asc1 : &s->asc0, addr, val);
