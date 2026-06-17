@@ -101,9 +101,13 @@ struct TC1797SoCState {
     uint32_t stm_isrr;           /* compare-match service-request pending bits */
     uint32_t stm_src0, stm_src1; /* STM SRC0/SRC1 nodes @0xF00002F8/FC (SRPN/SRE) */
     QEMUTimer *stm_timer;        /* drives the CMP0/CMP1 systick interrupts */
+    QEMUTimer *freeze_timer;     /* DIAGNOSTIC: wall-clock dump of the phase-3 freeze */
     int64_t stm_period_ns;       /* derived OSEK tick period */
     unsigned stm_rr;             /* round-robin across the enabled STM compares */
     int64_t stm_cmp_deadline[2]; /* edge-on-match: abs virtual-ns when CMP0/CMP1 next fire */
+    uint64_t stm_match_period[2];/* last good (non-overdue) CMP match delta = the fw's intended
+                                  * tick cadence; used to catch up an overdue compare instead
+                                  * of waiting a full ~47s 32-bit wrap (see tc1797_stm_match_ticks) */
     /* Clock tree (Hz) -- the SoC timing substrate. Every peripheral timer
      * derives its period from one of these rather than a hardcoded constant.
      * Defaults reproduce the previously-hardcoded rates exactly (behaviour-
@@ -115,6 +119,7 @@ struct TC1797SoCState {
     uint64_t f_stm;              /* System Timer Module clock */
     uint32_t stm_ns_per_tick;    /* cached 1e9 / f_stm (= 10 at the 100 MHz default) */
     uint32_t ssc_tb[2];          /* SSC0/SSC1 transmit-buffer shadow (loopback) */
+    uint32_t ssc_prev[2];        /* previous TB (SC900685 MSDI replies 1 frame behind) */
     uint32_t ssc_src[2][2];      /* SSC0/1 service-request nodes [unit][0]=+0xF8 (xfer), [1]=+0xFC (queue) */
     uint32_t adc_src[TC1797_ADC_NKERN][16]; /* ADC0/1/2 kernel SRNs (top of each 0x400 kernel, off>=0x3C0): firmware pulses SETR to trigger PCP/CPU completion (e.g. ADC0 SRC@0x3F0 -> PCP ch 0x1d -> sets 0xD000416F, DTC 0x3006 gate) */
     QEMUTimer *ssc_done_timer[2];/* SPI transfer-latency: defer completion SRN raise */
@@ -136,6 +141,8 @@ struct TC1797SoCState {
     QEMUTimer *adc_done_timer;   /* fires at the earliest pending node deadline */
     int64_t adc_done_deadline[TC1797_ADC_NKERN][16]; /* abs ns; 0 = node idle */
     int64_t adc_conv_ns;         /* modelled ADC conversion time (env TC1797_ADC_CONV_NS) */
+    QEMUTimer *gpta_cmp_timer;   /* polls/fires GPTA GTC compare-match SRC nodes */
+    QEMUTimer *sample_timer;     /* diag: 20us env->PC sampler (TC1797_SAMPLE), no inject */
     bool sw_reset_pending;       /* set when 0xF0000560=2 requested a SW reset */
     /* Forced OSEK systick. The ERCOSEK kernel promotes itself from phase 3 to
      * phase 4 only after it starts receiving periodic system ticks, but it never
@@ -144,6 +151,7 @@ struct TC1797SoCState {
      * native interrupt path -- the QEMU analogue of bridge_server.py's injected
      * SRPN 1/7/8 round-robin systick. See tc1797_osek_tick. */
     QEMUTimer *osek_timer;       /* forced OSEK systick timer (always-on) */
+    QEMUTimer *hb_timer;         /* diagnostic heartbeat (env TC1797_HBLOG) -- observe frozen PC/CCPN */
     int64_t osek_tick_ns;        /* inter-fire spacing (~1 ms / #tick-prios) */
     int64_t osek_t0_ns;          /* virtual-time origin (phase-4 detect floor) */
     int64_t osek_floor_ns;       /* min virtual time before delivering any tick */
@@ -256,6 +264,16 @@ static bool tc1797_stm_cmp_enabled(TC1797SoCState *s, int ch)
 {
     uint32_t en  = ch ? (s->stm_icr & 0x10u) : (s->stm_icr & 1u);
     uint32_t src = ch ? s->stm_src1 : s->stm_src0;
+    /* TEST (env TC1797_STMTICK): the firmware sets up CMCON + SRC0/SRC1 (SRPN-8/7,
+     * CPU-routed, SRE=1) and the cursor ISR FUN_80081870 writes CMP0 deadlines + acks via
+     * ISCR -- it clearly INTENDS the STM CMP to drive the schedule cursor -- but the final
+     * ICR.CMPxEN enable lives in the cold-init FUN_80001160 that the reachable boot path
+     * never executes (FUN_80000230 is non-returning). Model that intended enable (treat a
+     * configured+SRE'd compare as enabled) so the faithful hardware compare fires the
+     * cursor at the firmware's own programmed deadlines, replacing the fixed-1ms crutch. */
+    static int force = -1;
+    if (force < 0) { force = getenv("TC1797_STMTICK") ? 1 : 0; }
+    if (force) { en = 1; }
     return (s->stm_cmcon != 0) && en
         && ((src >> 12) & 1u) && !((src >> 10) & 1u);
 }
@@ -282,6 +300,97 @@ static uint64_t tc1797_stm_match_ticks(TC1797SoCState *s, int ch, uint64_t tim_n
     uint64_t start  = ((uint64_t)cmp & cmask) << mstart;  /* TIM value at the edge */
     uint64_t pos    = tim_now & (period - 1u);
     uint64_t delta  = (start - pos) & (period - 1u);
+    /* If the firmware armed CMP just BEHIND the live counter (delta lands in the
+     * upper half of the period = the compare value was recently PASSED, i.e. the
+     * schedule fell behind by a few ticks under QEMU's icount cadence), the
+     * windowed match would otherwise wait a FULL period for the counter to wrap
+     * back -- up to ~47s for a 32-bit compare (CMCON MSIZE=31). The STM then
+     * appears to stop and the CPU idles forever. Silicon keeps CMP ahead of the
+     * counter so it never reaches this state; faithfully fire the OVERDUE tick
+     * now (next tick) so the ISR re-arms ahead and the cadence resumes -- the
+     * same catch-up the narrow 18-bit window gives implicitly.
+     *
+     * BUGFIX 2026-06-14: this was COMMENTED but never implemented -- the code just
+     * `return delta` below, so an overdue 32-bit CMP0 (the OSEK system tick, period
+     * 2^32) returned ~47s and the OS tick STALLED for 47s every time the firmware
+     * re-armed it a few ticks behind. That throttled the whole OSEK time base:
+     * periodic tasks (the master + the 987c counter tick FUN_800c10de) ran ~once/2.5s
+     * instead of ~100us, so the path2 promote counter 987c never reached 100 and
+     * phase 3->4 never completed. Detect overdue (delta past the half-period) and
+     * CAP the overdue wait at the implicit narrow-window period (~2^18 ticks ≈
+     * 2.9ms) instead of the full ~47s 32-bit wrap. This bounds the stall without
+     * (a) the ~47s freeze, (b) a 1-tick refire that storms the SRN before the ISR
+     * is armed and wedges phase 2, or (c) overcorrecting to a tiny residual delta
+     * that fires the schedule ~100x too fast. The next on-time arm resumes the real
+     * cadence. Only applies to wide (>2^18) compares; narrow windows already bound
+     * the wait implicitly. */
+    /* REFINED 2026-06-15: the fixed 2^18 (~2.9 ms) overdue cap is itself LARGER than the
+     * firmware's own watchdog kick window (FUN_800c3c1a: 0x29bf TIM1 ticks = 1.9 ms). The
+     * OSEK system tick (CMP0) lands a few ticks behind tim_now on almost every re-arm --
+     * the icount read(FUN_80081836)->write(CMP0) instruction gap, which cannot happen on
+     * synchronous silicon -- so it takes the overdue path nearly every cycle and fires at
+     * 2.9 ms > 1.9 ms. The kick is then always late, cnt37 climbs past 9, and FUN_800c3c68
+     * software-resets (DTC-0x3045) every ~58 ms: the phase-3 watchdog reset loop that blocks
+     * the promote. FIX: when a re-arm is overdue (or exactly on the counter), fire at the
+     * firmware's OWN learned forward cadence for this channel -- the period it actually
+     * programs when it does land ahead -- instead of an arbitrary cap. That holds the OSEK
+     * tick at the firmware's real period (≈ the 90000-tick / 1 ms schedule), strictly inside
+     * the 1.9 ms watchdog window, so the kick stays fresh and cnt37 stays 0, exactly as on
+     * silicon -- without the 47 s 32-bit wrap freeze or a 1-tick storm. */
+    /* Learn the firmware's FULL cycle period per channel = the LARGEST forward re-arm delta
+     * it programs (CMP0 ~9000=100us, CMP1 ~90000=1ms from the cold-init), bounded just under
+     * the 1.9ms watchdog window. An overdue/exact re-arm then fires after one full cycle, NOT
+     * after the smallest sub-slot delta: firing at the tiny delta storms the SR (the schedule
+     * ISR re-fires before its deadline can advance -> the cursor stalls, the OSEK time base
+     * runs at a wrong rate, and alarm-driven refreshers lag -> DTC-0x3046/0x3047). Firing at
+     * the full cycle keeps the OSEK tick at the firmware's real cadence, inside the watchdog
+     * window, exactly as on silicon -- no 47s wrap, no storm. */
+    static uint64_t last_fwd[2] = { 0, 0 };
+    bool overdue = (delta > (period >> 1));
+    /* CMP1 (the OSEK alarm timer, cold-init CMP1 = TIM0 + 90000 = 1 ms) is intentionally NOT pinned: it
+     * must fire at the firmware's NEAR-alarm rate (the alarm queue FUN_801250e8 re-arms it sub-1 ms), so
+     * pinning it to its 1 ms cold-init period STARVES the dispatch and the boot holds at phase 3 (verified
+     * A/B: CMP0=9000 + CMP1=90000 stalls at phase 3; CMP0=9000 + CMP1 unpinned reaches phase 4). CMP1
+     * falls through to the learned-cadence path below (last_fwd[1] = its real programmed period). Pinning
+     * CMP1 to a fixed period was the reverted MAX-last_fwd / 1 ms failure -- it let the firmware arm a
+     * 2.2 ms alarm and tripped the DTC-0x3045 watchdog. Only CMP0 (the fixed 100 us system tick) is pinned. */
+    /* OSEK SYSTEM-TICK FIX (default-on; disable via TC1797_NO_OSEKTICK). The firmware's CMP0 schedule
+     * ISR (FUN_80081870) re-arms CMP0 = deadline by reading the live STM TIM (FUN_80081836); under
+     * -icount that read->write spans real instructions, so the re-arm lands a few ticks BEHIND the
+     * counter -- impossible on synchronous silicon. The model then saw CMP0 overdue and self-fired at
+     * the tiny catch-up delta (~49us, and degenerating), which ran the OSEK schedule/dispatch at the
+     * wrong cadence: the prio-10 COM tasks were re-activated too often and the prio-1 periodic
+     * module-dispatch task (FUN_80119cf6 -> engine Rx / 19c4 refresh) was STARVED, so the phase-3->4
+     * promote never completed and DTC-0x3045/0x3047 reset-looped. FIX: when CMP0's re-arm is overdue/
+     * un-rearmed, fire at CMP0's OWN cold-init period (FUN_80001160: CMP0 = TIM0 + 9000 = 100us, the
+     * firmware's intended OSEK system-tick) instead of the catch-up delta. This holds the schedule at
+     * the faithful 100us cadence, the dispatch runs, the debounce reaches 60 -> phase 4 -> os_running,
+     * and the watchdog kick stays inside its 1.9ms window. CMP1 (the 1ms alarm timer) is left to its own
+     * model -- pinning it to 1ms breaks the dispatch (it must fire at the firmware's near-alarm rate). */
+    if (!getenv("TC1797_NO_OSEKTICK")) {
+        uint64_t pin = (ch & 1) ? 0u : 9000u;            /* CMP0 = 100us OSEK tick; CMP1 unpinned */
+        const char *pe = (ch & 1) ? getenv("TC1797_OSEKTICK1") : getenv("TC1797_OSEKTICK0");
+        if (pe) {
+            pin = strtoull(pe, NULL, 0);
+        }
+        if (pin) {
+            if (delta != 0 && !overdue && delta < pin) {
+                return delta;
+            }
+            return pin;
+        }
+    }
+    if (delta != 0 && !overdue) {
+        last_fwd[ch & 1] = delta;          /* a normal forward arm: learn the cadence */
+        return delta;
+    }
+    if (last_fwd[ch & 1] >= 64) {
+        return last_fwd[ch & 1];           /* overdue/exact: reuse the firmware's own period */
+    }
+    /* cadence not learned yet: bounded fallback (avoid the 47 s wrap) */
+    if (overdue && period > (1ull << 18)) {
+        return (1ull << 18);
+    }
     return delta ? delta : period;
 }
 
@@ -310,6 +419,36 @@ static void tc1797_stm_arm(TC1797SoCState *s)
         }
     }
     s->stm_period_ns = (best == INT64_MAX) ? 0 : (best - now);
+    if (getenv("TC1797_STMLOG")) {
+        static int armn;
+        /* Log the first 60 arm calls with full state to see the exact CMP0/CMP1/ICR
+         * sequence and whether CMP0 (the ISR-rearmed channel) ever gets an enabled
+         * short deadline. best-now in us. */
+        if (armn++ < 60) {
+            info_report("tc1797: arm#%d icr=%02x cmcon=%06x | tim=%08x cmp0=%08x cmp1=%08x"
+                        " en0=%d en1=%d | best_us=%lld",
+                        armn, s->stm_icr & 0xff, s->stm_cmcon & 0xffffff,
+                        (uint32_t)tim_now, s->stm_cmp0, s->stm_cmp1,
+                        tc1797_stm_cmp_enabled(s, 0), tc1797_stm_cmp_enabled(s, 1),
+                        (long long)(best == INT64_MAX ? -1 : (best - now) / 1000));
+        }
+        /* Steady-state (phase 3): per-channel next-match in us -- shows whether CMP0
+         * and CMP1 are BOTH enabled and at what period (kick-task starvation check). */
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph == 3) {
+            static int p3n;
+            if (p3n++ < 24) {
+                int64_t d0 = tc1797_stm_cmp_enabled(s,0) ?
+                    (int64_t)(tc1797_stm_match_ticks(s,0,tim_now)*s->stm_ns_per_tick)/1000 : -1;
+                int64_t d1 = tc1797_stm_cmp_enabled(s,1) ?
+                    (int64_t)(tc1797_stm_match_ticks(s,1,tim_now)*s->stm_ns_per_tick)/1000 : -1;
+                fprintf(stderr, "STMP3 en0=%d en1=%d next0_us=%lld next1_us=%lld cmp0=%08x cmp1=%08x cmcon=%06x\n",
+                        tc1797_stm_cmp_enabled(s,0), tc1797_stm_cmp_enabled(s,1),
+                        (long long)d0, (long long)d1, s->stm_cmp0, s->stm_cmp1, s->stm_cmcon & 0xffffff);
+                fflush(stderr);
+            }
+        }
+    }
     if (best == INT64_MAX) {
         timer_del(s->stm_timer);
     } else {
@@ -319,10 +458,16 @@ static void tc1797_stm_arm(TC1797SoCState *s)
 
 static void tc1797_stm_ack(TC1797SoCState *s)
 {
-    /* Source acknowledged: drop the request line + pending priority. */
-    CPUTriCoreState *env = &s->cpu.env;
-    env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, 0);
-    cpu_reset_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
+    /* The firmware cleared the STM compare IR(s). RE-ARBITRATE the CPU ICU rather
+     * than blindly force PIPN=0: another CPU service request may still be pending in
+     * icu_pending -- notably the OSEK dispatch (cpu_src SRPN-1), which the higher STM
+     * tick out-ranks during the tick ISR. Forcing PIPN=0 here clobbered that
+     * re-arbitrated dispatch right before the tick ISR's RFE, so when the CPU returned
+     * to ccpn=0 nothing was pending and the SRPN-1 dispatcher never ran -- freezing
+     * curid/nextid and starving the prio-9 phase-driver task (the phase 3->4 stall).
+     * tc1797_icu_arbitrate presents the highest remaining pending source (and clears
+     * HARD itself when none remain), which is the faithful behaviour. */
+    tc1797_icu_arbitrate(s);
 }
 
 /*
@@ -373,11 +518,665 @@ static uint8_t tc1797_can_rx_srpn_of(Tc1797Can *c, uint32_t moipr)
  * software-counter object pointer DAT_d00009a4 unwritten (task #124). That
  * cold-init gate -- not the STM model -- is the real blocker.
  */
+/* Phase-2 profiler counters: how many STM CMP0/CMP1 fires (= schedule/alarm ticks) elapse per
+ * master-task run (per debounce cycle). Read+reset by tc1797_icount_prof. */
+uint64_t g_icprof_cmp0_fires, g_icprof_cmp1_fires;
+
 static void tc1797_stm_tick(void *opaque)
 {
     TC1797SoCState *s = opaque;
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     bool raised = false;
+
+    /* DIAGNOSTIC (env TC1797_PCHIST): sample the interrupted PC at each STM tick
+     * during phase 3. The kick lives in the idle loop (prio 1); it only runs <1.9ms
+     * if the CPU idles often. If a task SPINS ~2ms between idles (stealing the idle
+     * slack), the kick falls to ~2ms and trips the watchdog. This histogram (sorted
+     * offline) reveals the hot spin. */
+    if (getenv("TC1797_PCHIST")) {
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph >= 3 && ph < 0x40) {
+            static unsigned pn;
+            if (pn++ < 4000) {
+                uint32_t pc = s->cpu.env.PC & ~0x20000000u;
+                fprintf(stderr, "PCHIST %08x ccpn=%u\n", pc, s->cpu.env.ICR & 0xFFu);
+                fflush(stderr);
+            }
+        }
+    }
+    /* DIAGNOSTIC (env TC1797_READYCT): dump OSEK per-priority ready-counts at phase 3.
+     * descriptor base = [DAT_d000998c]; ready-count(prio) = *(base + prio*0x10). A prio
+     * whose count stays >0 across dumps is being re-activated as fast as it's dispatched
+     * -> keeps FUN_80124512 busy -> idle kick only ~1x/2ms-tick -> watchdog 0x3045. */
+    if (getenv("TC1797_READYCT")) {
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph == 3) {
+            static unsigned rn;
+            if (rn++ < 30) {
+                uint32_t base = 0; cpu_physical_memory_read(0xD000998Cu, &base, 4);
+                char line[256]; int o = 0;
+                o += snprintf(line+o, sizeof(line)-o, "READYCT base=%08x cur=", base);
+                uint32_t cur = 0; cpu_physical_memory_read(0xD0000984u, &cur, 4);
+                o += snprintf(line+o, sizeof(line)-o, "%u |", cur);
+                if (base >= 0x80000000u || base < 0xE0000000u) {
+                    for (int p = 1; p <= 15 && o < 230; p++) {
+                        uint32_t rc = 0;
+                        cpu_physical_memory_read((hwaddr)base + p*0x10, &rc, 4);
+                        o += snprintf(line+o, sizeof(line)-o, " p%d=%u", p, rc);
+                    }
+                }
+                fprintf(stderr, "%s\n", line); fflush(stderr);
+                /* prio-1 runnable list: descriptor[1][1]=[base+0x14] is the live list
+                 * ptr (advanced each dispatch). Dump the fn ptrs around it to see if
+                 * the kick (800c3c1a) is repeated / the list is circular (silicon kicks
+                 * continuously in idle) vs run-once (QEMU). */
+                uint32_t lp = 0; cpu_physical_memory_read((hwaddr)base + 0x14, &lp, 4);
+                char l2[256]; int o2 = snprintf(l2, sizeof(l2), "P1LIST ptr=%08x runnables:", lp);
+                if (lp >= 0x80000000u) {
+                    for (int k = -3; k <= 8 && o2 < 235; k++) {
+                        uint32_t fnp = 0;
+                        cpu_physical_memory_read((hwaddr)lp + k*4, &fnp, 4);
+                        o2 += snprintf(l2+o2, sizeof(l2)-o2, " %s%08x", k==0?">":"", fnp);
+                    }
+                }
+                fprintf(stderr, "%s\n", l2); fflush(stderr);
+                /* dump the two OSEK queues FUN_80124f0c scans: q1=0xD00185C0,
+                 * q2=0xD00042EC. Donor has cafeface guards + a few entries then
+                 * sentinel(abcddcba). Compare QEMU -- missing guards/entries = a
+                 * producer/init that didn't run. */
+                {
+                    char q[256]; int qo;
+                    uint32_t qbs[2] = {0xD00185C0u, 0xD00042ECu};
+                    for (int qi = 0; qi < 2; qi++) {
+                        qo = snprintf(q, sizeof(q), "QDUMP q%d@%08x:", qi+1, qbs[qi]);
+                        for (int w = 0; w < 12; w++) {
+                            uint32_t v = 0;
+                            cpu_physical_memory_read((hwaddr)qbs[qi] + w*4, &v, 4);
+                            qo += snprintf(q+qo, sizeof(q)-qo, " %08x", v);
+                        }
+                        fprintf(stderr, "%s\n", q); fflush(stderr);
+                    }
+                }
+            }
+        }
+    }
+
+    /* DIAGNOSTIC (env TC1797_KICKCAL, NOT a faithful fix): the watchdog-kick task's
+     * alarm period is set in FUN_8007f9be as ((int)DAT_d0016ed0 + 0x898)*0x5a = (offset+2200us)*90
+     * ticks/us. DAT_d0016ed0 has NO code writers -> it is a DFLASH-calibration value, absent in
+     * QEMU -> 0 -> a 2200us=2.2ms kick that EXCEEDS the 0x29bf=1.9ms watchdog threshold (FUN_800c3c1a)
+     * -> cnt37 grows -> DTC 0x3045. Seed it to -1200 ((-1200+2200)*90 = 90000 = 1.0ms kick, < 1.9ms)
+     * to CONFIRM that the kick cadence is the sole 0x3045 cause. Faithful fix = load the real
+     * calibration so the firmware sets DAT_d0016ed0 organically. */
+    if (getenv("TC1797_KICKCAL")) {
+        /* Donor (dspr_185523.bin off 0x16ed0) value: -65536 -> kick-alarm period
+         * (DAT_d0016ed0+2200)*90 clamps NEGATIVE -> -1 -> FUN_801243ae DISABLES the
+         * alarm (vs a positive period that re-SetRelAlarms an already-active alarm and
+         * fails -> d000004c -> DTC 0x302e). Use the donor value to test whether this one
+         * .bss-missing calibration is the single root of BOTH 0x3045 and 0x302a/e. */
+        const char *kv = getenv("TC1797_KICKVAL");
+        int32_t off = kv ? (int32_t)strtol(kv, NULL, 0) : -65536;
+        cpu_physical_memory_write(0xD0016ED0u, &off, 4);
+    }
+
+    /* DIAGNOSTIC (env TC1797_E2ECHK): dump the E2E redundant-storage mirror pairs that
+     * FUN_800644f4 checks (mirror == ~value; any mismatch -> DAT_c0002558=0x403008 fault).
+     * Shows which pair is inconsistent (the reset cause) without KICKCAL masking it. */
+    if (getenv("TC1797_E2ECHK")) {
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph == 3) {
+            static unsigned ec;
+            if (ec++ < 24) {
+                uint8_t ed2,ed3,ed4,ed5,ea5, cf8,cf9,cfa,cfb,cde, ce1=0;
+                uint16_t ed6,ed8,cfc,cfe;
+                uint32_t c2558=0;
+                cpu_physical_memory_read(0xD0016ED2u,&ed2,1);
+                cpu_physical_memory_read(0xD0016ED3u,&ed3,1);
+                cpu_physical_memory_read(0xD0016ED4u,&ed4,1);
+                cpu_physical_memory_read(0xD0016ED5u,&ed5,1);
+                cpu_physical_memory_read(0xD0016ED6u,&ed6,2);
+                cpu_physical_memory_read(0xD0016ED8u,&ed8,2);
+                cpu_physical_memory_read(0xD0016EA5u,&ea5,1);
+                cpu_physical_memory_read(0xD0016CF8u,&cf8,1);
+                cpu_physical_memory_read(0xD0016CF9u,&cf9,1);
+                cpu_physical_memory_read(0xD0016CFAu,&cfa,1);
+                cpu_physical_memory_read(0xD0016CFBu,&cfb,1);
+                cpu_physical_memory_read(0xD0016CFCu,&cfc,2);
+                cpu_physical_memory_read(0xD0016CFEu,&cfe,2);
+                cpu_physical_memory_read(0xD0016CDEu,&cde,1);
+                cpu_physical_memory_read(0xC0002558u,&c2558,4);
+                cpu_physical_memory_read(0xD0016CE1u,&ce1,1);
+                fprintf(stderr, "E2ECHK ed2=%02x~cf8=%02x%s ed3=%02x~cf9=%02x%s ed4=%02x~cfa=%02x%s "
+                        "ed5=%02x~cfb=%02x%s ed6=%04x~cfc=%04x%s ed8=%04x~cfe=%04x%s ea5=%02x~cde=%02x%s | fault=%08x ce1=%02x\n",
+                        ed2,(uint8_t)~cf8, ed2!=(uint8_t)~cf8?"!":"", ed3,(uint8_t)~cf9, ed3!=(uint8_t)~cf9?"!":"",
+                        ed4,(uint8_t)~cfa, ed4!=(uint8_t)~cfa?"!":"", ed5,(uint8_t)~cfb, ed5!=(uint8_t)~cfb?"!":"",
+                        ed6,(uint16_t)~cfc, ed6!=(uint16_t)~cfc?"!":"", ed8,(uint16_t)~cfe, ed8!=(uint16_t)~cfe?"!":"",
+                        ea5,(uint8_t)~cde, ea5!=(uint8_t)~cde?"!":"", c2558, ce1);
+                fflush(stderr);
+            }
+        }
+    }
+
+    /* DIAGNOSTIC (env TC1797_PHASELOG, no behaviour change): log every change of the RTOS phase byte
+     * 0xD0003643 in FREE-RUN (this tick runs in the default build), so phase-4 progress is observable
+     * without a gdb halt perturbing the boot. */
+    if (getenv("TC1797_PHASELOG")) {
+        static uint8_t last_ph = 0xFE;
+        static uint8_t last_osr = 0xFE;
+        uint8_t ph = 0, osr = 0;
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        cpu_physical_memory_read(0xD000400Fu, &osr, 1);   /* os_running flag */
+        if (ph != last_ph || osr != last_osr) {
+            last_ph = ph;
+            last_osr = osr;
+            fprintf(stderr, "PHASELOG 0xD0003643 -> %u  os_running(0xD000400F)=%u  (now=%lld ms)\n",
+                    ph, osr, (long long)(now / 1000000));
+            fflush(stderr);
+        }
+    }
+    /* DIAGNOSTIC (env TC1797_GRPDUMP): the COM active-IPDU-group state. Reads the runtime
+     * pointer DAT_d0001cbc (0xD0001CBC) and the 16-bit group word it targets. Confirms (a) the
+     * pointer's value (expect 0x7FFF9244 from FUN_800ff434) and (b) whether any group is active
+     * (non-zero) -- the gate that decides if the engine-CAN COM Rx runs at all. */
+    if (getenv("TC1797_GRPDUMP")) {
+        static unsigned gd;
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph >= 3 && gd++ < 10) {
+            uint32_t ptr = 0; cpu_physical_memory_read(0xD0001CBCu, &ptr, 4);
+            uint16_t grp = 0xDEAD;
+            if (ptr >= 0x70000000u && ptr < 0xE0000000u) {
+                cpu_physical_memory_read(ptr, &grp, 2);
+            }
+            fprintf(stderr, "GRPDUMP DAT_d0001cbc=0x%08x  *group=0x%04x  ph=%u\n", ptr, grp, ph);
+            fflush(stderr);
+        }
+    }
+    /* DIAGNOSTIC (env TC1797_COMCFG): for the engine-CAN indication messages (MO33=0x12f,
+     * MO51=0x328, MO57=0x388), find their COM message index in the runtime config
+     * (DAT_d0001cc0 + i*0x30, MO at +0x2c) and dump the per-message flags (DAT_d00168be[i])
+     * + scheduler state (DAT_d0016862[i]) + period counter (DAT_d001691a[i]) + group mask
+     * (DAT_80048cee[i*10]). Pinpoints why the scheduler skips them despite groups=0xFFFF. */
+    if (getenv("TC1797_COMCFG")) {
+        static int done, seen;
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph >= 3 && ph < 10 && !done && seen++ == 16) {
+            done = 1;
+            uint32_t cfg = 0; cpu_physical_memory_read(0xD0001CC0u, &cfg, 4);
+            fprintf(stderr, "COMCFG config_base=0x%08x\n", cfg);
+            for (int i = 0; i < 0x5c; i++) {
+                uint16_t mo = 0xFFFF;
+                if (cfg >= 0x80000000u) {
+                    cpu_physical_memory_read(cfg + i*0x30 + 0x2c, &mo, 2);
+                }
+                if (mo == 33 || mo == 51 || mo == 57) {
+                    uint8_t fl = 0, st = 0, ctr = 0;
+                    uint16_t gm = 0;
+                    cpu_physical_memory_read(0xD00168BEu + i, &fl, 1);
+                    cpu_physical_memory_read(0xD0016862u + i, &st, 1);
+                    cpu_physical_memory_read(0xD001691Au + i, &ctr, 1);
+                    cpu_physical_memory_read(0x80048CEEu + i*0x14, &gm, 2);
+                    fprintf(stderr, "COMCFG msg[%d] mo=%u flags=0x%02x state=0x%02x ctr=0x%02x groupmask=0x%04x\n",
+                            i, mo, fl, st, ctr, gm);
+                }
+            }
+            fflush(stderr);
+        }
+    }
+    /* DIAGNOSTIC (env TC1797_CANRXLOG): dump the firmware's configured RECEIVE message
+     * objects (the CAN IDs it expects from other modules) once at phase>=2, so we know
+     * which key-on-engine-off frames to inject for the COM-health / engine-state chain. */
+    if (getenv("TC1797_CANRXLOG")) {
+        static unsigned crl;
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph >= 2 && crl++ < 2) {
+            int rxn = 0;
+            for (int n = 0; n < TC1797_CAN_NMO; n++) {
+                if (s->can.mo[n].configured && s->can.mo[n].dir == 0) {
+                    uint32_t moipr = tc1797_can_read(&s->can,
+                        TC1797_CAN_MO_BASE + (uint32_t)n * 0x20u + 0x08u);
+                    fprintf(stderr, "CANRX MO%d id=0x%03x mask=0x%03x rxinp_node=%u\n",
+                            n, s->can.mo[n].id, s->can.mo[n].mask, (moipr >> 8) & 0x1Fu);
+                    rxn++;
+                }
+            }
+            fprintf(stderr, "CANRX total configured RX MOs=%d (ph=%u)\n", rxn, ph);
+            fflush(stderr);
+        }
+    }
+    /* KEY-ON-ENGINE-OFF BUS SIMULATOR (env TC1797_CANENV): the firmware is a DME that
+     * expects ~50 periodic CAN frames from the rest of the vehicle (gateway, modules).
+     * Without them the COM-health counter d00 climbs to 0xff and the CAN-derived signal
+     * block stays at FUN_800ff17c's invalid sentinels -> 4f6 engine-health never sets ->
+     * no phase-4 promote. Inject every configured RX MO's ID periodically with the
+     * key-on-engine-off payload (TC1797_CANDATA=hex, default all-zero = idle) so the
+     * firmware's COM processes them and the application reaches a healthy state. This is
+     * the bench/in-car environment, not a DSPR poke. */
+    if (getenv("TC1797_CANENV")) {
+        static int rr_mo;
+        static uint8_t e2ectr;
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        /* Inject ONE configured RX MO per tick, round-robin. Injecting all ~50 MOs at
+         * once bursts 50 SRPN-29 RX interrupts in a single tick, which stalls the STM
+         * tick and hangs the boot (the diagnostics then freeze after ph2). One-per-tick
+         * approximates a real per-message bus arrival rate and keeps the OS scheduled. */
+        /* RATE-LIMIT (fix the SRPN-29 flood that hangs the OS): this block runs in the STM tick,
+         * which fires every ~12us (CMP1 self-fire) -- injecting one MO per tick = ~80x faster than a
+         * real CAN frame, so the level-triggered NEWDAT re-raises SRPN-29 faster than the RX ISR can
+         * drain it and the OS dispatch wedges. Gate to a realistic per-frame interval (default 1ms;
+         * TC1797_CANRATE_NS overrides) so each injected frame gets one clean drained IRQ. */
+        static int64_t can_last_inj;
+        const char *canrl = getenv("TC1797_CANRATE_NS");
+        int64_t can_interval = canrl ? strtoll(canrl, NULL, 0) : 1000000;
+        if (ph >= 2 && now - can_last_inj >= can_interval) {
+            can_last_inj = now;
+            uint8_t data[8] = {0};
+            const char *cd = getenv("TC1797_CANDATA");
+            if (cd) {
+                for (int i = 0; i < 8 && cd[i*2] && cd[i*2+1]; i++) {
+                    char b[3] = { cd[i*2], cd[i*2+1], 0 };
+                    data[i] = (uint8_t)strtoul(b, NULL, 16);
+                }
+            }
+            /* alive-counter advances once per tick (consecutive frames are never stale) */
+            if (!getenv("TC1797_CANCTR_OFF")) {
+                e2ectr = (e2ectr + 1) & 0x0F;
+                data[1] = (data[1] & 0xF0) | e2ectr;
+            }
+            /* TC1797_CANALL: inject EVERY configured RX MO every tick so NEWDAT is always
+             * fresh when the polled COM Rx (FUN_800dc44c) reads it -> the valid-frame branch
+             * runs (signals copied) instead of the no-data invalidator. Pair with
+             * TC1797_NORXINT to avoid the SRPN-29 interrupt flood. Default: one MO/tick. */
+            int all = getenv("TC1797_CANALL") != NULL;
+            for (int tries = 0; tries < TC1797_CAN_NMO; tries++) {
+                int cand;
+                if (all) {
+                    cand = tries;
+                } else {
+                    cand = rr_mo % TC1797_CAN_NMO;
+                    rr_mo = (rr_mo + 1) % TC1797_CAN_NMO;
+                }
+                if (!(s->can.mo[cand].configured && s->can.mo[cand].dir == 0
+                      && s->can.mo[cand].id < 0x700
+                      && !(getenv("TC1797_CAN12FONLY") && s->can.mo[cand].id != 0x12F))) {
+                    continue;
+                }
+                uint8_t f[8];
+                memcpy(f, data, 8);
+                if (s->can.mo[cand].id == 0x12F || getenv("TC1797_CANSIGN_ALL")) {
+                    uint16_t dataid = 0;
+                    if (s->can.mo[cand].id == 0x12F) {
+                        uint32_t didptr = 0;
+                        cpu_physical_memory_read(0xD000007Cu, &didptr, 4);
+                        if (didptr >= 0x80000000u) {
+                            cpu_physical_memory_read(didptr, &dataid, 2);
+                        }
+                    }
+                    uint8_t seq[9] = { (uint8_t)dataid, (uint8_t)(dataid >> 8),
+                                       f[1], f[2], f[3], f[4], f[5], f[6], f[7] };
+                    uint8_t crc = 0;
+                    for (int j = 0; j < 9; j++) {
+                        uint8_t c = crc ^ seq[j];
+                        for (int b = 0; b < 8; b++) {
+                            c = (c & 0x80) ? (uint8_t)((c << 1) ^ 0x1D)
+                                          : (uint8_t)(c << 1);
+                        }
+                        crc = c;
+                    }
+                    f[0] = crc;
+                }
+                tc1797_can_rx_inject(&s->can, s->can.mo[cand].id, f, 8);
+                if (!all) break;
+            }
+        }
+    }
+    /* DIAGNOSTIC (env TC1797_PDULOG): does the injected CAN-id-0x12f data reach its COM
+     * I-PDU buffer 0xD0014BF4 (-> cb_8009c6e2 -> d00=0)? Tells us if the COM RX dispatch
+     * (CanIf->PduR->COM->callback) runs for injected frames or only the MO is drained. */
+    if (getenv("TC1797_PDULOG")) {
+        static unsigned pl;
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph >= 2 && ph < 0x40 && (pl++ & 0x1ffu) == 0u) {
+            uint32_t pdu = 0; uint8_t d00v = 0, c09v = 0, e2eerr = 0;
+            cpu_physical_memory_read(0xD0014BF4u, &pdu, 4);
+            cpu_physical_memory_read(0xC0003D00u, &d00v, 1);
+            cpu_physical_memory_read(0xD0003C09u, &c09v, 1);
+            cpu_physical_memory_read(0xD0016D46u, &e2eerr, 1); /* 0x12f E2E error counter */
+            fprintf(stderr, "PDULOG 0x12f-buf@D0014BF4=%08x d00=%02x c09=%02x e2eerr=%u (ph=%u)\n",
+                    pdu, d00v, c09v, e2eerr, ph);
+            /* E2E parameters: the 0x12f DataID (*_DAT_d000007c) + the CRC8 table @0x7FFF940C */
+            uint32_t p7c = 0; uint16_t dataid = 0; uint8_t t1[16] = {0}, t2[16] = {0};
+            cpu_physical_memory_read(0xD000007Cu, &p7c, 4);
+            if (p7c >= 0x80000000u && p7c < 0xF0000000u) {
+                cpu_physical_memory_read(p7c, &dataid, 2);
+            }
+            cpu_physical_memory_read(0x7FFF940Cu, t1, 16);
+            cpu_physical_memory_read(0x8000940Cu, t2, 16);
+            fprintf(stderr, "  E2E dataid_ptr=%08x dataid=%04x | tbl@7FFF940C=%02x%02x%02x%02x%02x%02x%02x%02x"
+                    " | tbl@8000940C=%02x%02x%02x%02x\n", p7c, dataid,
+                    t1[0],t1[1],t1[2],t1[3],t1[4],t1[5],t1[6],t1[7], t2[0],t2[1],t2[2],t2[3]);
+            fflush(stderr);
+        }
+    }
+    /* TEST (env TC1797_ADCPRAM=<hex>): model the ADC0 result-FIFO->PRAM by writing a conversion
+     * result into the PRAM slots the firmware's ADC PCP channel 0x1d reads (0xF0050eb0/ec4 = 0
+     * in QEMU; no producer). If a valid value here lights up 0xD000416F bit0 (reset #2 gate) and
+     * the sensor mirrors, the FIFO->PRAM is the mechanism and can be modelled per-channel. */
+    {
+        const char *ap = getenv("TC1797_ADCPRAM");
+        if (ap) {
+            uint32_t v = (uint32_t)strtoul(ap, NULL, 16);
+            cpu_physical_memory_write(0xF0050EB0u, &v, 4);
+            cpu_physical_memory_write(0xF0050EC4u, &v, 4);
+        }
+        /* TEST (env TC1797_416F=<hex>): poke the ADC-done flag 0xD000416F to see whether it
+         * gates the sensor reads (2b0X) -- if forcing it valid releases the sensor chain, the
+         * ADC-done is the single upstream gate. */
+        const char *af = getenv("TC1797_416F");
+        if (af) {
+            uint8_t v = (uint8_t)strtoul(af, NULL, 16);
+            cpu_physical_memory_write(0xD000416Fu, &v, 1);
+        }
+    }
+    /* DIAGNOSTIC (env TC1797_MAXPHASE): log ONLY when a new maximum phase is reached (rare -> negligible
+     * throttle, unlike PHASELOG which fprintf's on every oscillation). Lets free-run reach phase 4 fast. */
+    if (getenv("TC1797_MAXPHASE")) {
+        static uint8_t max_ph;
+        uint8_t ph = 0;
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph < 0x40 && ph > max_ph) {           /* log each NEW max phase once */
+            uint8_t osr = 0;
+            cpu_physical_memory_read(0xD000400Fu, &osr, 1);
+            max_ph = ph;
+            fprintf(stderr, "MAXPHASE new-max-phase=%u os_running=%u (now=%lld ms)\n",
+                    ph, osr, (long long)(now / 1000000));
+            fflush(stderr);
+        }
+        /* When at phase>=4, periodically dump the os_running gate variables so we
+         * see which gate blocks os_running (donor running-state: 400b=0xa0 bit5,
+         * 416f=0x01, osr=1; 400b=*(DAT_d00009a4+10) so a NULL counter struct -> 0). */
+        /* At phase 3: track the watchdog servicing (DAT_d00019c0, kicked by
+         * FUN_800c3c1a) + bump counter DAT_d0004037 + promote counter DAT_d000989c.
+         * If 19c0 is frozen, the kick task isn't running -> 5ms watchdog 0x3045. */
+        if (ph == 3) {
+            static unsigned g3; static uint32_t prev19c0;
+            static int dumped;
+            if (!dumped) {
+                dumped = 1;
+                /* One-shot ERCOSEK schedule-table dump: DAT_d0000978 -> *(+4) ->
+                 * [1] = table base; entries are [callback(4), period(4)]. Reveals
+                 * how often the watchdog-kick task body appears (every 1 or 2?). */
+                uint32_t cur = 0;
+                cpu_physical_memory_read(0xD0012498u, &cur, 4);
+                uint32_t tb = (cur >= 0x80000000u && cur < 0x80400000u) ? cur : 0;
+                for (int i = 0; tb && i < 64; i++) {
+                    uint32_t cb = 0, per = 0;
+                    cpu_physical_memory_read((hwaddr)tb + i*8, &cb, 4);
+                    cpu_physical_memory_read((hwaddr)tb + i*8 + 4, &per, 4);
+                    fprintf(stderr, "SCHEDENT[%d] @%08x cb=%08x period=%u\n",
+                            i, tb + i*8, cb, per);
+                }
+                fflush(stderr);
+            }
+            if (g3++ < 4000) {
+                CPUTriCoreState *env = &s->cpu.env;
+                uint32_t c19c0 = 0; uint8_t cnt37 = 0;
+                cpu_physical_memory_read(0xD00019C0u, &c19c0, 4);
+                cpu_physical_memory_read(0xD0004037u, &cnt37, 1);
+                /* CCPN/IE/PC: is a task (CCPN>=8) holding the CPU and masking the
+                 * tick SRPN 7/8? Where is the CPU spinning (PC)? */
+                uint8_t a9d = 0; uint32_t ostate = 0;
+                cpu_physical_memory_read(0xD0019A9Du, &a9d, 1);
+                cpu_physical_memory_read(0xF0000480u, &ostate, 4);
+                /* PROMOTE trajectory: e7e (phase-3->4 gate), 987c (master-task
+                 * counter), 989c (promote threshold counter). Shows whether the
+                 * master task runs (987c advancing) AND whether e7e is climbing. */
+                uint8_t e7e = 0; uint32_t c987c = 0, c989c = 0;
+                cpu_physical_memory_read(0xD0003E7Eu, &e7e, 1);
+                cpu_physical_memory_read(0xD000987Cu, &c987c, 4);
+                cpu_physical_memory_read(0xD000989Cu, &c989c, 4);
+                uint8_t eb1=0,eb5=0,c4041=0; uint16_t d2d32=0;
+                cpu_physical_memory_read(0xD0003EB1u, &eb1, 1);
+                cpu_physical_memory_read(0xD0003EB5u, &eb5, 1);
+                cpu_physical_memory_read(0xD0004041u, &c4041, 1);
+                cpu_physical_memory_read(0xD0002D32u, &d2d32, 2);
+                uint16_t d6f4=0; uint8_t a45=0;
+                cpu_physical_memory_read(0xD000D6F4u, &d6f4, 2);
+                cpu_physical_memory_read(0xD0000A45u, &a45, 1);
+                /* engine-health debounce FUN_800c2100: 340c=counter (++ while a45.2=1,
+                 * =0 when a45.2=0), 340e=output (1 when counter>=threshold). threshold
+                 * = *(*DAT_d0000820). 4041=1 needs 340e!=0. Surface counter/threshold to
+                 * see whether the debounce is climbing (threshold too high) or being reset
+                 * (a45.2 dips / resets zero the counter). */
+                uint16_t d340c=0; uint8_t d340e=0; uint32_t p820=0, thr820=0;
+                uint8_t msdimode=0;
+                cpu_physical_memory_read(0xD000340Cu, &d340c, 2);
+                cpu_physical_memory_read(0xD000340Eu, &d340e, 1);
+                cpu_physical_memory_read(0xD0000820u, &p820, 4);
+                cpu_physical_memory_read((hwaddr)p820, &thr820, 4);  /* read whatever it points at */
+                cpu_physical_memory_read(0xD000402Fu, &msdimode, 1);
+                fprintf(stderr, "  DEBOUNCE 340c(cnt)=%u 340e(out)=%u thr=*(%08x)=%u msdimode=%u\n",
+                        d340c, d340e, p820, thr820, msdimode);
+                /* COM activation: distributor FUN_8009f16c gates each signal on
+                 * (sig_mask & *DAT_d0001398). Read the pointer then deref the active
+                 * group mask -- if 0, the COM stack isn't activated (network mgmt);
+                 * if nonzero, it's active but rejecting frames at E2E (RX/CRC). */
+                uint32_t p1398=0; uint16_t commask=0; uint16_t p2b0c=0;
+                cpu_physical_memory_read(0xD0001398u, &p1398, 4);
+                if (p1398 >= 0xD0000000u && p1398 < 0xD0020000u)
+                    cpu_physical_memory_read(p1398, &commask, 2);
+                cpu_physical_memory_read(0xD0002B0Cu, &p2b0c, 2);
+                fprintf(stderr, "PH3GATE eb1=%u eb5=%u 4041=%u a45=%02x d6f4=%04x(type=%x bit0=%u) d2d32=%04x e7e=%u | COMmask=%04x(ptr=%08x) 2b0c=%04x\n",
+                        eb1, eb5, c4041, a45, d6f4, (d6f4>>9)&0x1f, d6f4&1, d2d32, e7e, commask, p1398, p2b0c);
+                /* FUN_800df7c6 disarm conditions: DBGSR.DE(bit0) && OSTATE.bit0 &&
+                 * (DAT_d0019a9d==0x55 || SWEVT&7==2). If all met -> watchdog disarmed. */
+                uint8_t curid = 0; uint32_t ccpn = env->PCXI; /* PCXI for context */
+                cpu_physical_memory_read(0xD0019A9Eu, &curid, 1); /* OSEK running task id */
+                fprintf(stderr, "PH3WD 19c0(%s) cnt37=%u e7e=%u 987c=%u 989c=%u | "
+                        "PC=%08x curid=%u ICR=%08x | OSTATE=%08x(b0=%u) (now=%lldms)\n",
+                        c19c0 != prev19c0 ? "MOVING" : "frozen", cnt37,
+                        e7e, c987c, c989c,
+                        (uint32_t)env->PC, curid, env->ICR, ostate, ostate & 1u,
+                        (long long)(now / 1000000));
+                (void)ccpn;
+                fflush(stderr);
+                prev19c0 = c19c0;
+            }
+        }
+        if (ph >= 4 && ph < 0x40) {
+            static unsigned g4;
+            if (g4++ < 25) {
+                uint8_t b400b=0, b416f=0, b4039=0, b4007=0, osr=0, e400e=0;
+                uint32_t p9a4=0;
+                cpu_physical_memory_read(0xD000400Bu, &b400b, 1);
+                cpu_physical_memory_read(0xD000400Eu, &e400e, 1);
+                cpu_physical_memory_read(0xD000400Fu, &osr, 1);
+                cpu_physical_memory_read(0xD0004007u, &b4007, 1);
+                cpu_physical_memory_read(0xD000416Fu, &b416f, 1);
+                cpu_physical_memory_read(0xD0004039u, &b4039, 1);
+                cpu_physical_memory_read(0xD00009A4u, &p9a4, 4);
+                fprintf(stderr, "PH4GATE 400b=%02x(bit5=%d) 416f=%02x 4039=%02x 4007=%02x "
+                        "400e=%02x 9a4=%08x osr=%u (now=%lldms)\n",
+                        b400b, !!(b400b & 0x20), b416f, b4039, b4007, e400e, p9a4, osr,
+                        (long long)(now / 1000000));
+                fflush(stderr);
+            }
+        }
+    }
+    /* DIAGNOSTIC ONLY (env TC1797_E7EPOKE, NOT a fix): the phase-3->4 transition-check h_800c40d2 returns
+     * (DAT_d0003e7e == 1). Force e7e=1 at phase 3 to confirm that gate is SUFFICIENT (phase advances to 4)
+     * vs. a further gate. The faithful path is to make the promote settle at e7e=1 (eb1=1 chain). */
+    if (getenv("TC1797_E7EPOKE")) {
+        uint8_t ph = 0;
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph == 3) {
+            uint8_t one = 1;
+            cpu_physical_memory_write(0xD0003E7Eu, &one, 1);
+        }
+    }
+    /* DIAGNOSTIC (env TC1797_CALSEED, NOT the final fix): the phase-4 chain bottoms out at the calibration
+     * block at DSPR 0xD0013378 (d6f4 source) which is NOT in the firmware image -- it lives on the physical
+     * ECU's DFLASH. Seed it with the donor's real value (0x2a33... = "config present" magic) to confirm the
+     * chain unblocks to phase 4. The FAITHFUL fix is to load the ECU calibration into QEMU's DFLASH so the
+     * firmware's loader populates 0xD0013378 organically. */
+    if (getenv("TC1797_CALSEED")) {
+        static gchar *cd = NULL; static gsize cl = 0; static int ld = 0;
+        if (!ld) {
+            ld = 1;
+            const char *f = getenv("TC1797_CALFILE");   /* donor DSPR dump = the chip's real calibration */
+            if (f && !g_file_get_contents(f, &cd, &cl, NULL)) { cd = NULL; }
+        }
+        if (cd && cl >= 0x14000u) {
+            uint8_t ph = 0;
+            cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            if (ph >= 3 && ph < 0x40) {
+                /* Seed the ECU calibration blocks from the donor DSPR. These (0xD00040xx / 0xD000Dxxx /
+                 * 0xD0013xxx, the 0x2a-magic config tables the periodic validator FUN_800e006e checks)
+                 * live on the physical chip's DFLASH and are absent from the firmware image -> zero in
+                 * QEMU. Re-seeded each phase-3 tick to survive the firmware's blank-DFLASH re-load. */
+                cpu_physical_memory_write(0xD0003560u, (uint8_t *)cd + 0x3560, 0x08);
+                cpu_physical_memory_write(0xD0004080u, (uint8_t *)cd + 0x4080, 0x80);
+                cpu_physical_memory_write(0xD0009890u, (uint8_t *)cd + 0x9890, 0x30);
+                cpu_physical_memory_write(0xD000D700u, (uint8_t *)cd + 0xD700, 0xA0);
+                cpu_physical_memory_write(0xD0013350u, (uint8_t *)cd + 0x13350, 0xA0);
+                /* NOTE: the phase-4 OSEK error-counter self-tests (FUN_8008026e DTC
+                 * 0x302a-f, FUN_80080800 DTC 0x3010/11, ...) latch because the abnormal
+                 * boot (early-selftest reset cascade leaves alarms active in persisted
+                 * RAM + missing alarm calibration) makes SetRelAlarm fail. Masking the
+                 * counters just reveals the next check in the chain -- the faithful fix
+                 * is a CLEAN boot (no reset cascade) so OSEK init runs once with no
+                 * failures. Tracked as remaining work; not masked here. */
+            }
+        }
+    }
+    /* DIAGNOSTIC (env TC1797_CHAINLOG): the e7e=1 chain inputs (eb1<-fb7<-4041<-FUN_8014065a logic that
+     * reads config bytes 4f6/340e/a45/d6f4/aa0). Donor @phase4: 4f6=e7 340e=01 a45=b7 4041=01 fb7=01.
+     * Log QEMU's values at phase 3 to pinpoint which config input diverges (=> why 4041=0 => eb1=0). */
+    if (getenv("TC1797_CHAINLOG")) {
+        static unsigned cn;
+        uint8_t ph = 0;
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph == 3 && (cn++ % 8) == 0 && cn < 2400) {
+            uint8_t f6=0,e=0,a45=0,e7e=0,eb1=0,c4041=0,d2d32=0; uint16_t d6f4=0,c340=0; uint32_t p820=0,thr=0;
+            cpu_physical_memory_read(0xD00004F6u,&f6,1);
+            cpu_physical_memory_read(0xD000340Eu,&e,1);
+            cpu_physical_memory_read(0xD0000A45u,&a45,1);
+            cpu_physical_memory_read(0xD0003E7Eu,&e7e,1);
+            cpu_physical_memory_read(0xD0003EB1u,&eb1,1);                /* eb1 gate */
+            cpu_physical_memory_read(0xD0004041u,&c4041,1);              /* 4041 */
+            cpu_physical_memory_read(0xD0002D32u,&d2d32,1);              /* 2d32 case0 gate */
+            cpu_physical_memory_read(0xD000D6F4u,(uint8_t*)&d6f4,2);
+            cpu_physical_memory_read(0xD000340Cu,(uint8_t*)&c340,2);     /* debounce counter */
+            cpu_physical_memory_read(0xD0000820u,(uint8_t*)&p820,4);     /* DAT_d0000820 ptr */
+            if (p820 >= 0x80000000u) cpu_physical_memory_read(p820,(uint8_t*)&thr,4); /* *ptr threshold */
+            fprintf(stderr, "CHAINLOG 4f6=%02x 4041=%u eb1=%u 2d32=%u e7e=%02x | a45=%02x[bit2=%d] 340c=%u 340e=%02x d6f4=%04x\n",
+                    f6,c4041,eb1,d2d32,e7e,a45,(a45>>2)&1,c340,e,d6f4);
+            /* SELF-TEST coding-complement (selftest_80148da4 -> FUN_800bf97c(0x3025)
+             * clobbers the promote): source 0xD00172AC, loaded 0xD0017294/5/8/9,
+             * checked 0xD0018A70/71/8E/8F. Pass = a71==~a70 && a8f==~a8e. */
+            uint8_t cd[12]={0}, a70=0,a71=0,a8e=0,a8f=0; uint32_t a8c=0;
+            uint8_t l94=0,l95=0,l98=0,l99=0;
+            cpu_physical_memory_read(0xD00172ACu, cd, 12);
+            cpu_physical_memory_read(0xD0017294u,&l94,1); cpu_physical_memory_read(0xD0017295u,&l95,1);
+            cpu_physical_memory_read(0xD0017298u,&l98,1); cpu_physical_memory_read(0xD0017299u,&l99,1);
+            cpu_physical_memory_read(0xD0018A70u,&a70,1); cpu_physical_memory_read(0xD0018A71u,&a71,1);
+            cpu_physical_memory_read(0xD0018A8Eu,&a8e,1); cpu_physical_memory_read(0xD0018A8Fu,&a8f,1);
+            cpu_physical_memory_read(0xD0018A8Cu,(uint8_t*)&a8c,4);
+            fprintf(stderr, "CODECHK 172ac=%02x%02x%02x%02x.%02x%02x%02x%02x.%02x%02x%02x%02x | "
+                    "ld94=%02x.%02x ld98=%02x.%02x | a70=%02x a71=%02x[~=%02x %s] a8e=%02x a8f=%02x[~=%02x %s] a8c=%08x\n",
+                    cd[0],cd[1],cd[2],cd[3],cd[4],cd[5],cd[6],cd[7],cd[8],cd[9],cd[10],cd[11],
+                    l94,l95,l98,l99,
+                    a70,a71,(uint8_t)~a70,(a71==(uint8_t)~a70)?"OK":"FAIL",
+                    a8e,a8f,(uint8_t)~a8e,(a8f==(uint8_t)~a8e)?"OK":"FAIL", a8c);
+            fflush(stderr);
+        }
+    }
+    /* DIAGNOSTIC (env TC1797_PROMOTELOG): free-run view of the phase-3->4 promote state machine
+     * FUN_800c43b6. Logs the promote state DAT_d0003e7e + its state-3 gate vars whenever the state
+     * changes, so the exact stall stage is visible without a gdb halt. */
+    if (getenv("TC1797_PROMOTELOG")) {
+        static uint8_t last_e7e = 0xFE;
+        static unsigned pn;
+        uint8_t e7e = 0, ph = 0, eb1 = 0;
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        cpu_physical_memory_read(0xD0003E7Eu, &e7e, 1);
+        /* Log on state change AND periodically (every 40th tick) at phase>=3, so the state-3 dynamics
+         * are visible: do the counters DAT_d000987c (ticked by FUN_800c10de) / DAT_d00019d0 advance
+         * (the master task is running), and does the config ptr DAT_d00009bc ever become non-NULL? */
+        if (e7e != last_e7e || (pn++ % 120u) == 0u) {   /* unconditional heartbeat: is the STM still firing? */
+            uint32_t c987c = 0, c19d0 = 0, p9bc = 0;
+            cpu_physical_memory_read(0xD0003EB1u, &eb1, 1);
+            cpu_physical_memory_read(0xD000987Cu, &c987c, 4);
+            cpu_physical_memory_read(0xD00019D0u, &c19d0, 4);
+            cpu_physical_memory_read(0xD00009BCu, &p9bc, 4);
+            last_e7e = e7e;
+            uint16_t d340c = 0; uint8_t d340e = 0, c4041 = 0;
+            cpu_physical_memory_read(0xD000340Cu, &d340c, 2);
+            cpu_physical_memory_read(0xD000340Eu, &d340e, 1);
+            cpu_physical_memory_read(0xD0004041u, &c4041, 1);
+            uint8_t r40b=0,r40e=0,r40c=0,r40f=0; uint32_t r18cc=0,r09a4=0;
+            cpu_physical_memory_read(0xD000400Bu,&r40b,1); cpu_physical_memory_read(0xD000400Eu,&r40e,1);
+            cpu_physical_memory_read(0xD000400Cu,&r40c,1); cpu_physical_memory_read(0xD000400Fu,&r40f,1);
+            cpu_physical_memory_read(0xD00018CCu,&r18cc,4); cpu_physical_memory_read(0xD00009A4u,&r09a4,4);
+            /* os_running START gate (fn_800bfaac): fires iff 4007==0 && (400c&1)==0 && (seg0[9]&1)!=0.
+             * seg0[2] gates the FIRST-half start; 0958 gates the inner first-half branch. With the
+             * TC1797_SEG0 probe mapped, seg0[2/9/10] are the live OS-object bytes the firmware wrote. */
+            uint8_t s0_2=0,s0_9=0,s0_a=0,r4007=0,r4006=0,r0958=0;
+            cpu_physical_memory_read(0x00000002u,&s0_2,1); cpu_physical_memory_read(0x00000009u,&s0_9,1);
+            cpu_physical_memory_read(0x0000000Au,&s0_a,1); cpu_physical_memory_read(0xD0004007u,&r4007,1);
+            cpu_physical_memory_read(0xD0004006u,&r4006,1); cpu_physical_memory_read(0xD0000958u,&r0958,1);
+            /* WATCHDOG 0x3047 state: 19c4 (refresh by fn_800c3c40), 19c0 (kick), 19bc, d4039 (arm
+             * 0x55=armed/0xAA=disarmed), d4038 (re-init countdown). If 19c4 is CONSTANT across samples,
+             * fn_800c3c40 isn't refreshing it -> stale -> 0x3047 every ~300ms. */
+            uint32_t r19c4=0,r19c0=0,r19bc=0; uint8_t r4039=0,r4038=0;
+            cpu_physical_memory_read(0xD00019C4u,&r19c4,4); cpu_physical_memory_read(0xD00019C0u,&r19c0,4);
+            cpu_physical_memory_read(0xD00019BCu,&r19bc,4); cpu_physical_memory_read(0xD0004039u,&r4039,1);
+            cpu_physical_memory_read(0xD0004038u,&r4038,1);
+            /* Does the phase-INDEPENDENT module dispatcher FUN_80119cf6 (counter DAT_d0003812) run at
+             * phase 3? It dispatches PTR_800629b4 which holds the 19c4-refresh callback. If d3812
+             * advances but 19c4 stays frozen, the refresh isn't scheduled in that module at phase 3;
+             * if d3812 is frozen, FUN_80119cf6 itself isn't reached. d37f2 = fn_801199d4 (phase==4). */
+            uint32_t d3812=0, d37f2=0;
+            cpu_physical_memory_read(0xD0003812u,&d3812,4); cpu_physical_memory_read(0xD00037F2u,&d37f2,4);
+            fprintf(stderr, "PROMOTELOG ph=%u e7e=%u eb1=%u 987c=%u 340c=%u 340e=%u 4041=%u | 40b=%02x 40c=%02x 40e=%02x osrun=%02x 18cc=%08x 9a4=%08x | seg0[2]=%02x [9]=%02x [a]=%02x 4007=%02x 4006=%02x 0958=%02x | 19c4=%08x 19c0=%08x 19bc=%08x d4039=%02x d4038=%02x (now=%lld ms)\n",
+                    ph, e7e, eb1, c987c, d340c, d340e, c4041, r40b, r40c, r40e, r40f, r18cc, r09a4,
+                    s0_2, s0_9, s0_a, r4007, r4006, r0958,
+                    r19c4, r19c0, r19bc, r4039, r4038, (long long)(now / 1000000));
+            if (getenv("TC1797_DISPLOG")) {
+                /* OSEK scheduler state: why the periodic module-dispatch task (FUN_80119cf6, d3812)
+                 * isn't scheduled at phase 3. cur=current prio, maxp=highest pending, stk=prio stack,
+                 * cursor=CMP0 schedule cursor (NULL => schedule dead). d3812/d37f2 low byte = actual
+                 * run counts (read 1B to avoid the 4B alias artifact). */
+                uint8_t d3812b=0, d37f2b=0, curp=0, maxp=0, stk=0;
+                uint32_t cursor=0, dl=0;
+                cpu_physical_memory_read(0xD0003812u,&d3812b,1); cpu_physical_memory_read(0xD00037F2u,&d37f2b,1);
+                cpu_physical_memory_read(0xD0000064u,&curp,1);   /* current task prio */
+                cpu_physical_memory_read(0xD0000984u,&maxp,1);   /* highest pending prio */
+                cpu_physical_memory_read(0xD000098Cu,&stk,1);    /* prio stack top */
+                cpu_physical_memory_read(0xD0012498u,&cursor,4); /* CMP0 schedule cursor */
+                cpu_physical_memory_read(0xD00124A0u,&dl,4);
+                fprintf(stderr, "  DISPLOG d3812=%u d37f2=%u | curprio=%u maxpend=%u priostk=%u | cursor=%08x deadline=%08x\n",
+                        d3812b, d37f2b, curp, maxp, stk, cursor, dl);
+            }
+            /* SCHEDLOG: is the CMP0 schedule (FUN_80081870 + the watchdog kick) set up?
+             * cursor DAT_d0012498 + deadline DAT_d00124a0 (silicon: 0x80060cXX / a TIM value),
+             * STM CMP0/ICR (cold-init FUN_80001160 arms CMP0=TIM0+9000 + ICR.CMP0EN), and the
+             * watchdog kick freshness 19c0/cnt37. Pinpoints whether only the CMP0 arm is missing
+             * (cursor valid) or the whole schedule-init is absent (cursor 0). */
+            if (getenv("TC1797_SCHEDLOG")) {
+                uint32_t cur = 0, dl = 0, lastk = 0, tim1 = 0; uint8_t c37 = 0;
+                cpu_physical_memory_read(0xD0012498u, &cur, 4);
+                cpu_physical_memory_read(0xD00124A0u, &dl, 4);
+                cpu_physical_memory_read(0xD00019C0u, &lastk, 4);
+                cpu_physical_memory_read(0xD0004037u, &c37, 1);
+                tim1 = (uint32_t)(tc1797_stm_count56(s->stm_ns_per_tick) >> 4);
+                fprintf(stderr, "  SCHEDLOG cursor=%08x deadline=%08x | cmp0=%08x cmp1=%08x icr=%02x en0=%d "
+                        "| last_kick=%08x tim1=%08x gap=%u cnt37=%u\n",
+                        cur, dl, s->stm_cmp0, s->stm_cmp1, s->stm_icr & 0xff,
+                        tc1797_stm_cmp_enabled(s, 0), lastk, tim1, tim1 - lastk, c37);
+            }
+            fflush(stderr);
+        }
+    }
 
     /* CONSENSUS FIX (3-agent tie-break, HIGH confidence): the OSEK schedule-tick ISR
      * (FUN_80081870, raised by the SRPN-7 STM compare) dispatches *(*cursor) as a
@@ -392,7 +1191,10 @@ static void tc1797_stm_tick(void *opaque)
     {
         static int gate = -1;
         if (gate < 0) {
-            gate = getenv("TC1797_TICK_GATE") ? 1 : 0;
+            /* Default-on: with the systick->STM handoff the real CMP0 must not dispatch the
+             * schedule ISR FUN_80081870 before the cursor (DAT_d0012498) is non-NULL, or it
+             * does calli 0 and marches NOPs through segment 0. Disable via TC1797_NO_TICK_GATE. */
+            gate = getenv("TC1797_NO_TICK_GATE") ? 0 : 1;
         }
         if (gate) {
             uint32_t cursor = 0;
@@ -414,18 +1216,64 @@ static void tc1797_stm_tick(void *opaque)
         }
         if (ch == 0) {
             s->stm_isrr |= 1u; s->stm_icr |= 2u;          /* CMP0 request + CMP0IR */
+            g_icprof_cmp0_fires++;
         } else {
             s->stm_isrr |= 2u; s->stm_icr |= 0x20u;       /* CMP1 request + CMP1IR */
+            g_icprof_cmp1_fires++;
+        }
+        if (getenv("TC1797_FIRERATE")) {
+            static int64_t lastf[2]; static uint32_t prevcmp[2]; static unsigned frn;
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            uint32_t curcmp = ch ? s->stm_cmp1 : s->stm_cmp0;
+            if (ph == 3 && frn++ < 80) {
+                int64_t d = lastf[ch] ? (now - lastf[ch]) : 0;
+                /* fire interval vs the cmp-register advance: if fire=2ms but
+                 * advance=1ms (90000), QEMU is dropping every other CMP fire. */
+                fprintf(stderr, "FIRERATE ch=%d fire_us=%lld cmp=%08x advance=%d\n",
+                        ch, (long long)(d/1000), curcmp,
+                        prevcmp[ch] ? (int)(curcmp - prevcmp[ch]) : 0);
+                fflush(stderr);
+            }
+            lastf[ch] = now; prevcmp[ch] = curcmp;
         }
         uint8_t srpn = (ch ? s->stm_src1 : s->stm_src0) & 0xFFu;
         if (srpn) {
             tc1797_icu_set(s, srpn);
             raised = true;
         }
+        if (getenv("TC1797_STMLOG")) {
+            static unsigned firen;
+            if (firen++ < 80) {
+                uint8_t ph = 0, e7e = 0, eb1 = 0; uint32_t c987c = 0, d2d32 = 0;
+                cpu_physical_memory_read(0xD0003643u, &ph, 1);
+                cpu_physical_memory_read(0xD0003E7Eu, &e7e, 1);
+                cpu_physical_memory_read(0xD0003EB1u, &eb1, 1);
+                cpu_physical_memory_read(0xD000987Cu, &c987c, 4);
+                cpu_physical_memory_read(0xD0002D32u, &d2d32, 4);
+                info_report("tc1797: STM-FIRE#%u ch=%d srpn=%u ph=%u e7e=%u eb1=%u c987c=%u d2d32=%x",
+                            firen, ch, srpn, ph, e7e, eb1, c987c, d2d32 & 1);
+            }
+        }
         /* Advance one full window-period; the ISR's CMP write re-arms sooner. */
         uint64_t tim_now = tc1797_stm_count56(s->stm_ns_per_tick);
-        s->stm_cmp_deadline[ch] = now +
-            (int64_t)(tc1797_stm_match_ticks(s, ch, tim_now) * s->stm_ns_per_tick);
+        uint64_t per_ticks = tc1797_stm_match_ticks(s, ch, tim_now);
+        s->stm_cmp_deadline[ch] = now + (int64_t)(per_ticks * s->stm_ns_per_tick);
+        /* DIAGNOSTIC (env TC1797_STMLOG): the STM systick cadence -- is it firing so fast it leaves no
+         * idle window for the SRPN-1 OSEK dispatch? Logs the re-armed period per channel at phase>=3. */
+        if (getenv("TC1797_STMLOG")) {
+            uint8_t ph = 0;
+            cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            if (ph >= 3 && ph < 0x40) {
+                static unsigned sn;
+                if (sn++ < 90) {
+                    uint64_t per_ns = per_ticks * s->stm_ns_per_tick;
+                    fprintf(stderr, "STMLOG ch=%d srpn=%u period=%llu ns (%llu us) cmcon=%08x now=%lld ph=%u\n",
+                            ch, srpn, (unsigned long long)per_ns,
+                            (unsigned long long)(per_ns / 1000u), s->stm_cmcon, (long long)now, ph);
+                    fflush(stderr);
+                }
+            }
+        }
     }
 
     if (raised) {
@@ -443,8 +1291,285 @@ static void tc1797_stm_tick(void *opaque)
     }
 }
 
+/* DIAGNOSTIC (env TC1797_SAMPLE): always-on 20us env->PC sampler that does NOT inject
+ * anything (unlike the osek_timer). Reveals the ~2.2ms priority-14 spin PC at phase 3
+ * by oversampling it ~100x per occurrence. */
+static void tc1797_sample_tick(void *opaque)
+{
+    TC1797SoCState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+    if (ph == 3) {
+        static unsigned sn;
+        if (sn++ < 6000) {
+            uint32_t icr = s->cpu.env.ICR;
+            fprintf(stderr, "SAMPLE %08x ccpn=%u ie=%u pipn=%u\n",
+                    s->cpu.env.PC & ~0x20000000u,
+                    FIELD_EX32(icr, ICR, CCPN),
+                    FIELD_EX32(icr, ICR, IE_13),
+                    FIELD_EX32(icr, ICR, PIPN));
+            fflush(stderr);
+        }
+    }
+    timer_mod(s->sample_timer, now + 20000);   /* 20 us */
+}
+
+/* DIAGNOSTIC heartbeat (env TC1797_HBLOG): a 5 ms always-on timer that logs the CPU PC + CCPN/IE/PIPN +
+ * stm_isrr + cpu_src + phase/promote-state, so we can observe the post-~121ms freeze WITHOUT a gdb halt
+ * (which perturbs the boot). Reveals whether a dispatched task is stuck at a fixed PC / high CCPN
+ * (blocking the OS-tick ISR) or the OS switched tick source. No behaviour change (separate timer). */
+static void tc1797_hb_tick(void *opaque)
+{
+    TC1797SoCState *s = opaque;
+    CPUTriCoreState *env = &s->cpu.env;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    static unsigned hn;
+    uint8_t ph = 0, e7e = 0, nid = 0, cid = 0;
+    uint32_t tcb = 0, body = 0;
+    cpu_physical_memory_read(0xD0003643u, &ph, 1);
+    cpu_physical_memory_read(0xD0003E7Eu, &e7e, 1);
+    cpu_physical_memory_read(0xD0000988u, &nid, 1);
+    cpu_physical_memory_read(0xD0000064u, &cid, 1);
+    cpu_physical_memory_read(0xD000096Cu, &tcb, 4);     /* dispatch TCB ptr DAT_d000096c */
+    if (tcb >= 0x80000000u && tcb < 0x80140000u) {
+        cpu_physical_memory_read((hwaddr)tcb + 0x1cu, &body, 4);  /* the calli'd body */
+    }
+    if (hn < 900) {
+        fprintf(stderr, "HBLOG #%u pc=%08x ccpn=%u ie=%u pipn=%u stm_isrr=%x cpu_src=%08x ph=%u e7e=%u "
+                "nid=%u cid=%u tcb=%08x body=%08x (now=%lld ms)\n", hn, env->PC,
+                FIELD_EX32(env->ICR, ICR, CCPN), FIELD_EX32(env->ICR, ICR, IE_13),
+                FIELD_EX32(env->ICR, ICR, PIPN), s->stm_isrr, s->cpu_src, ph, e7e, nid, cid, tcb, body,
+                (long long)(now / 1000000));
+        /* engine-I/O chain (env TC1797_HBENG): the e7e==1 phase-4 gate inputs. Donor (phase4):
+         * c09=0x0a 4f6=0xe7 ba4_2=1 b52=1 efb=1. FUN_801291fa sets 4f6 bits0+2 only when
+         * engine-state c09 in [0xa..0xd] AND health counter d00==0 (reset by COM event 0x17). */
+        if (getenv("TC1797_HBENG") && ph == 3) {
+            uint8_t c09=0,d00=0,f6=0,f5=0,ba4=0,b52=0,efb=0,eb1=0,fb7=0,ee8=0,faf=0; uint32_t w4041=0,d32=0; uint16_t s2fac=0;
+            cpu_physical_memory_read(0xD0003C09u,&c09,1);
+            cpu_physical_memory_read(0xC0003D00u,&d00,1);
+            cpu_physical_memory_read(0xD00004F6u,&f6,1);
+            cpu_physical_memory_read(0xD00004F5u,&f5,1);
+            cpu_physical_memory_read(0xD0002FACu,&s2fac,2);
+            cpu_physical_memory_read(0xD0003EE8u,&ee8,1);
+            cpu_physical_memory_read(0xD0003BA6u,&ba4,1);   /* DAT_d0003ba4._2_1_ */
+            cpu_physical_memory_read(0xD0003B52u,&b52,1);
+            cpu_physical_memory_read(0xD0003EFBu,&efb,1);
+            cpu_physical_memory_read(0xD0003EB1u,&eb1,1);
+            cpu_physical_memory_read(0xD0003FB7u,&fb7,1);
+            cpu_physical_memory_read(0xD0003FAFu,&faf,1);    /* promote window (needs ==3) */
+            cpu_physical_memory_read(0xD0002D32u,&d32,4);    /* e7e 3rd condition: bit0 */
+            cpu_physical_memory_read(0xD0004041u,&w4041,4);
+            fprintf(stderr, "HBENG c09=%02x(0a) 2fac=%04x(7fff) ee8=%02x(04) 4f5=%02x(00) 4f6=%02x(e7) "
+                    "b52=%02x ba4=%02x efb=%02x 4041=%02x fb7=%02x eb1=%02x faf=%02x d32.0=%u d00=%02x e7e=%u\n",
+                    c09,s2fac,ee8,f5,f6,b52,ba4,efb,w4041&0xff,fb7,eb1,faf,d32&1,d00,e7e);
+        }
+        if (getenv("TC1797_MSDILOG")) {
+            /* MSDI driver state: DAT_d000402f mode (0=enqueue,2=drain), the OSEK-init
+             * error counters d000004b/c/d/e (FUN_8008026e fatals 0x302c-f at >5/>1), and
+             * DAT_d00040b6. Reveals whether the MSDI queue ever flips to drain mode. */
+            uint8_t mode=0,e4e=0,p42=0,p43=0,faa=0,faf=0;
+            cpu_physical_memory_read(0xD000402Fu,&mode,1);
+            cpu_physical_memory_read(0xD000004Eu,&e4e,1);
+            cpu_physical_memory_read(0xD0003642u,&p42,1);  /* faa source: MSDI-drain gate (==3) */
+            cpu_physical_memory_read(0xD0003643u,&p43,1);  /* master phase */
+            cpu_physical_memory_read(0xD0003FAAu,&faa,1);   /* DAT_d0003faa (drain gate in FUN_800c3f6c) */
+            cpu_physical_memory_read(0xD0003FAFu,&faf,1);
+            uint8_t a0=0,a1c=0,a38=0,qb=0,st=0; uint32_t reqp=0;
+            cpu_physical_memory_read(0xD0011AB0u,&a0,1);    /* transfer-in-progress flag, queue 0 */
+            cpu_physical_memory_read(0xD0011ACCu,&a1c,1);   /* queue 1 (idx 0x1c) */
+            cpu_physical_memory_read(0xD0011AE8u,&a38,1);   /* queue 2 (idx 0x38) */
+            cpu_physical_memory_read(0xD00040E7u,&qb,1);    /* FUN_800e06d8 req+0x22: (>>4)=queue index */
+            cpu_physical_memory_read(0xD00040C5u,&reqp,4);  /* req[0] = ptr to state byte */
+            if (reqp >= 0xD0000000u && reqp < 0xD0020000u) cpu_physical_memory_read(reqp,&st,1);
+            uint8_t fcsrr = (s->ssc_src[0][1] >> 13) & 1u, fcsrpn = s->ssc_src[0][1] & 0xFFu;
+            uint32_t icup = (fcsrpn < 256) ? (s->icu_pending[fcsrpn >> 5] >> (fcsrpn & 31)) & 1u : 0;
+            fprintf(stderr, "MSDILOG mode=%u e=%u 3643=%u | 11ab0[0]=%u q=%u state=%u | fcSRPN=%u SRR=%u icu_pending=%u ccpn=%u ie=%u (now=%lldms)\n",
+                    mode,e4e,p43, a0, qb>>4, st, fcsrpn, fcsrr, icup,
+                    FIELD_EX32(env->ICR, ICR, CCPN), FIELD_EX32(env->ICR, ICR, IE_13), (long long)(now/1000000));
+        }
+        if (getenv("TC1797_A2LOG")) {
+            uint32_t pc = env->PC & ~0x20000000u;
+            if (pc >= 0x800dd384u && pc < 0x800dd440u) {   /* spinning in fn_800dd384 on (*a2 & 1)==0 */
+                uint32_t a2 = env->gpr_a[2]; uint8_t a2v = 0;
+                const char *reg = (a2 >= 0xF0100100u && a2 <= 0xF01002FFu) ? "SSC"
+                                : (a2 >= 0xD0000000u && a2 < 0xD0020000u) ? "DSPR"
+                                : (a2 >= 0xF0000000u) ? "SFR" : "?";
+                if (a2 >= 0xD0000000u && a2 < 0xD0020000u) cpu_physical_memory_read(a2,&a2v,1);
+                fprintf(stderr, "A2LOG pc=%08x a2=%08x(%s) *a2=%02x\n", pc, a2, reg, a2v);
+            }
+        }
+        fflush(stderr);
+    }
+    hn++;
+    timer_mod(s->hb_timer, now + (getenv("TC1797_HBFINE") ? 200000 : 5000000));  /* 0.2ms fine / 5ms */
+}
+
 static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
 {
+    if (getenv("TC1797_TASKTBL")) {
+        /* The scheduler FUN_801258c8 keeps the OS busy iff some task[i][0]!=0 with
+         * i>=threshold(DAT_80060f94=8). Donor active=[0,1,9]: task 9 (prio-9 master,
+         * struct 0x8006141c) is ACTIVE>=8 so it's always dispatched -> OS never idles ->
+         * debounce climbs. If QEMU lacks task[9][0] the OS retires task 1 -> idle-MPX ->
+         * resets zero the debounce. Dump the live active set to see what's missing. */
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph == 3) {
+            static unsigned tn; static uint32_t last9 = 0xDEADBEEF;
+            uint32_t base = 0; cpu_physical_memory_read(0xD000998Cu, &base, 4);
+            uint32_t t1 = 0, t9 = 0;
+            if (base >= 0xD0000000u && base < 0xD0020000u) {
+                cpu_physical_memory_read(base + 1*0x10u, &t1, 4);
+                cpu_physical_memory_read(base + 9*0x10u, &t9, 4);
+            }
+            if ((t9 != last9 || tn < 8) && tn < 60) {
+                /* build active-index list */
+                char act[96]; int p = 0;
+                for (int i = 0; i < 20; i++) {
+                    uint32_t t0 = 0;
+                    cpu_physical_memory_read(base + (uint32_t)i*0x10u, &t0, 4);
+                    if (t0 != 0) p += snprintf(act+p, sizeof(act)-p, "%d ", i);
+                }
+                fprintf(stderr, "TASKTBL base=%08x task1=%08x task9=%08x active=[ %s]\n",
+                        base, t1, t9, act);
+                fflush(stderr);
+                last9 = t9; tn++;
+            }
+        }
+    }
+    if (getenv("TC1797_D6F4OBS")) {
+        /* OBSERVE (no write): catch d6f4[0] in the BAD state (type 0x15, bit0=0) that
+         * the engine-health FUN_800e0910(0,1) reads as 0 -> a45.2 clear -> debounce reset.
+         * PROMOTELOG samples too sparsely to see it; STM reads are frequent. Logs the
+         * bad value so we know HOW d6f4[0] gets corrupted (which reg's data lands there). */
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph == 3) {
+            uint16_t d0 = 0; cpu_physical_memory_read(0xD000D6F4u, &d0, 2);
+            if (((d0 >> 9) & 0x1f) == 0x15 && (d0 & 1) == 0) {
+                static unsigned bn;
+                if (bn++ < 40) {
+                    fprintf(stderr, "D6F4BAD d6f4[0]=%04x (reg=%02x) pc=%08x\n",
+                            d0, (d0 & 0xff), (uint32_t)s->cpu.env.PC & ~0x20000000u);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+    if (getenv("TC1797_D6F4PIN")) {
+        /* DIAGNOSTIC (env-gated, NOT a default fix): pin the d6f4[] engine-health
+         * MSDI block to the donor's stable key-on-engine-off values. Confirms the
+         * phase-3->4 gate chain end-to-end: d6f4[0]=0x2a33 -> FUN_800e0910(0,1)=1 ->
+         * a45.2 -> debounce 340e -> 4041=1 -> eb1 -> e7e=1 -> phase 4. If phase 4 is
+         * reached with this pin, d6f4 STABILITY is the sole remaining blocker and the
+         * organic fix is purely the SSC/MSDI command-response model (no CAN, no data). */
+        static const uint16_t donor[7] = {
+            0x2a33, 0x2a25, 0x2a90, 0x2a1f, 0x2aff, 0x2a1f, 0x2aff };
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph == 3) {
+            cpu_physical_memory_write(0xD000D6F4u, donor, sizeof(donor));
+            /* ALSO force the engine-health bit a45.2 set directly (skip the d6f4->
+             * FUN_800e0910 layer): if THIS latches 4041 then the debounce input is the
+             * confirmed blocker; if not, 4041 has another gate (4f4 override / reset
+             * cadence). Definitive test of the chain below a45.2. */
+            if (getenv("TC1797_A45PIN")) {
+                uint8_t a45 = 0; cpu_physical_memory_read(0xD0000A45u, &a45, 1);
+                a45 |= 4; cpu_physical_memory_write(0xD0000A45u, &a45, 1);
+            }
+        }
+    }
+    if (getenv("TC1797_KICKCAL")) {
+        /* Seed the kick-alarm period offset continuously on STM access (happens all
+         * through cold-init, BEFORE the relocated alarm setup reads it) so the cyclic
+         * watchdog-kick alarm is armed faster than 2.2ms. Diagnostic confirmation only.
+         * Offset overridable via TC1797_KICKOFF (period = (off+2200)us * 90 ticks). */
+        const char *ov = getenv("TC1797_KICKOFF");
+        int32_t off = ov ? atoi(ov) : -1200;
+        /* DAT_d0016ed0 is a signed SHORT (low 2 bytes); ed2/ed3 are a separate var
+         * (FUN_800644a6 sets them 0xFF). Write only the 2-byte short to avoid corrupting
+         * the neighbour (which produced spurious 0x302d alarm-error resets). */
+        int16_t off16 = (int16_t)off;
+        cpu_physical_memory_write(0xD0016ED0u, &off16, 2);
+    }
+    if (addr == 0xF0000214u && getenv("TC1797_KICKINT")) {
+        /* Log the actual watchdog kick interval (current STM_TIM1 - DAT_d00019c0)
+         * + cnt37/cnt38 at the kick body PC. This is the GROUND TRUTH for why
+         * different -icount ratios trip/don't-trip the 0x29bf=10687-tick (1.9ms)
+         * threshold in FUN_800c3c1a. */
+        CPUTriCoreState *e = &s->cpu.env;
+        if ((e->PC & ~0x20000000u) == 0x800c3c3cu) {
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            uint64_t v56k = tc1797_stm_count56(s->stm_ns_per_tick);
+            uint32_t tim1 = (uint32_t)(v56k >> 4);
+            uint32_t last = 0; uint8_t c37 = 0, c38 = 0;
+            cpu_physical_memory_read(0xD00019C0u, &last, 4);
+            cpu_physical_memory_read(0xD0004037u, &c37, 1);
+            cpu_physical_memory_read(0xD0004038u, &c38, 1);
+            uint32_t ival = tim1 - last;
+            /* CCPN (current CPU priority = the ISR servicing this kick): SRPN-8=CMP0
+             * (~0.5ms tick) vs SRPN-7=CMP1 (~2ms alarm). If the kick runs at CCPN 7
+             * (CMP1/2ms) it ALWAYS exceeds the 1.9ms threshold -> wrong compare. */
+            uint32_t ccpn = e->ICR & 0xFFu;
+            static unsigned kn;
+            if (kn++ < 80) {
+                fprintf(stderr, "KICKINT ph=%u ccpn=%u ra=%08x ival=%u (%s 10687) cnt37=%u cnt38=%u\n",
+                        ph, ccpn, e->gpr_a[11] & ~0x20000000u, ival,
+                        ival > 0x29bf ? "OVER" : "under", c37, c38);
+                fflush(stderr);
+            }
+        }
+    }
+    if (addr == 0xF0000214u && getenv("TC1797_TIMPC")) {
+        /* Find the live (PSPR-relocated) watchdog kick: it reads STM_TIM1 right
+         * before writing DAT_d00019c0. With -icount the PC is synced at MMIO. */
+        CPUTriCoreState *e = &s->cpu.env;
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        /* Only at the kick body (0x800c3c3c, seg-A normalised): log the OSEK current
+         * priority DAT_d0000984 + pending DAT_d0000990 so we see WHICH of the 3 kick
+         * tasks (prio 12/14/...) is the one being dispatched in QEMU. */
+        if (ph >= 2 && (e->PC & ~0x20000000u) == 0x800c3c3cu) {
+            static unsigned tn;
+            if (tn++ < 60) {
+                uint32_t cur = 0, pend = 0;
+                cpu_physical_memory_read(0xD0000984u, &cur, 4);
+                cpu_physical_memory_read(0xD0000990u, &pend, 4);
+                fprintf(stderr, "KICKPRIO ph=%u cur_prio=%u pend_prio=%u ra=%08x\n",
+                        ph, cur, pend, e->gpr_a[11]);
+                fflush(stderr);
+            }
+        }
+    }
+    static int tim0pc_en = -1;
+    if (tim0pc_en < 0) tim0pc_en = getenv("TC1797_TIM0PC") ? 1 : 0;
+    if (addr == 0xF0000210u && tim0pc_en) {
+        /* Histogram the PC reading TIM0 -> the busy-wait/timeout that overruns a task.
+         * env->PC only. TC1797_TIM0PC3: gate to phase 3 (read the phase byte every 64th
+         * TIM0 read to keep perturbation low) so the master's ph3 timeout-poll isn't
+         * drowned out by the ph0 post-reset delay loops. */
+        static int p3 = -1;
+        if (p3 < 0) { p3 = getenv("TC1797_TIM0PC3") ? 1 : 0; }
+        static uint8_t cph; static unsigned long phn; int do_hist = 1;
+        if (p3) {
+            if ((phn++ & 0x3fu) == 0u) { cpu_physical_memory_read(0xD0003643u, &cph, 1); }
+            do_hist = (cph == 3);
+        }
+        if (do_hist) {
+            static uint32_t pcs[96]; static unsigned long pcc[96];
+            static unsigned pn; static unsigned long tot;
+            uint32_t pc = (uint32_t)s->cpu.env.PC;
+            unsigned i;
+            for (i = 0; i < pn; i++) { if (pcs[i] == pc) break; }
+            if (i == pn && pn < 96) { pcs[pn++] = pc; }
+            if (i < 96) { pcc[i]++; }
+            if (++tot % 4000 == 0) {
+                fprintf(stderr, "--- TIM0PC%s top (tot=%lu) ---\n", p3 ? "(ph3)" : "", tot);
+                for (unsigned k = 0; k < pn; k++) {
+                    if (pcc[k] > tot / 30) {
+                        fprintf(stderr, "TIM0PC pc=%08x cnt=%lu\n", pcs[k], pcc[k]);
+                    }
+                }
+                fflush(stderr);
+            }
+        }
+    }
     if (addr >= 0xF0000210 && addr <= 0xF000022C) {
         /* TC1797 UM 11.x: TIMk = bits[k*4+31 : k*4] (k=0..6); +0x2C = CAP =
          * bits[63:32] of the 56-bit counter. */
@@ -483,8 +1608,40 @@ static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
 
 static void tc1797_stm_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
 {
+    /* STMLOG: surface every write to the OSEK-tick registers (CMP0/CMP1/CMCON/
+     * ICR/SRC0/SRC1). If the firmware arms its STM system tick we see it here;
+     * silence means the tick-arming code (FUN_80001160 via FUN_8000123c) was
+     * never reached -> the phase 3->4 promotion counters never advance. */
+    if (getenv("TC1797_STMLOG") &&
+        (addr == 0xF0000230 || addr == 0xF0000234 || addr == 0xF0000238 ||
+         addr == 0xF000023C || addr == 0xF00002F8 || addr == 0xF00002FC)) {
+        info_report("tc1797: STM-tick-reg write 0x%08x = 0x%08x (PC=0x%08x)",
+                    addr, val, (uint32_t)s->cpu.env.PC);
+    }
     switch (addr) {
     case 0xF0000230:                            /* CMP0 */
+        /* DIAGNOSTIC (env TC1797_CBTIME): the schedule ISR FUN_80081870 writes CMP0
+         * after each cursor callback. Log the STM_TIM0 advance since the prior CMP0
+         * write = that callback's STM-time cost. The callback before a ~90000-tick
+         * (1ms) jump is the ~1ms spin that doubles the schedule tick. The just-run
+         * callback = *(cursor-2) = *(DAT_d0012498 - 8). */
+        if (getenv("TC1797_CBTIME")) {
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            if (ph == 3) {
+                static unsigned cbn; static uint32_t prevt;
+                uint32_t now0 = (uint32_t)tc1797_stm_count56(s->stm_ns_per_tick);
+                uint32_t cur = 0, cb = 0;
+                cpu_physical_memory_read(0xD0012498u, &cur, 4);
+                if (cur >= 0x80000008u) {
+                    cpu_physical_memory_read((hwaddr)cur - 8, &cb, 4);
+                }
+                if (cbn++ < 120) {
+                    fprintf(stderr, "CBTIME cb=%08x dt=%u\n", cb, now0 - prevt);
+                    fflush(stderr);
+                }
+                prevt = now0;
+            }
+        }
         s->stm_cmp0 = val;
         tc1797_stm_arm(s);
         break;
@@ -612,6 +1769,34 @@ static void tc1797_icu_arbitrate(TC1797SoCState *s)
         }
     }
     env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, best);
+    /* DIAGNOSTIC (env TC1797_ARBLOG, no behaviour change): in the DEFAULT build the OSEK dispatch
+     * (cpu_src SRPN-1) is frozen (SRR stuck). Log the arbiter's view -- best/PIPN vs CCPN/IE -- whenever
+     * the dispatch is pending at phase>=3, to see why SRPN-1 is never taken (CCPN>=1? IE=0? out-arbitrated?). */
+    if (getenv("TC1797_ARBLOG") && ((s->cpu_src >> 13) & 1u)) {
+        uint8_t ph = 0;
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph >= 3 && ph < 0x40) {
+            static unsigned an;
+            if (an++ < 160) {
+                fprintf(stderr, "ARBLOG best=%u ccpn=%u ie=%u icu0=%08x cpu_src=%08x phase=%u\n",
+                        best, FIELD_EX32(env->ICR, ICR, CCPN), FIELD_EX32(env->ICR, ICR, IE_13),
+                        s->icu_pending[0], s->cpu_src, ph);
+                fflush(stderr);
+            }
+        }
+    }
+    /* Faithful TC1.3.1 ICU rule: the CPU interrupt line is asserted only when a pending request's
+     * priority STRICTLY EXCEEDS the current CCPN (the same gate the CPU enforces, PIPN>CCPN). Asserting
+     * HARD on any nonzero best regardless of CCPN re-presents the perpetually-pending OSEK dispatch
+     * (SRPN-1) mid-drain -- while the dispatcher holds CCPN at the dispatch level -- so when the
+     * dispatcher epilogue lowers CCPN one extra reschedule fires, dispatching the prio-0 guard at
+     * curid=9 (silicon unwinds the curid stack to the prio-1 base and idles at nextid=0/curid=1). Gating
+     * on best>CCPN closes that level-vs-edge gap (a hardware rule, not firmware magic). */
+    /* Assert the CPU line whenever any source is pending; the CPU's own gate
+     * (tricore_cpu_exec_interrupt: PIPN>CCPN && IE) decides when to actually take
+     * it, re-checked every TB so a request out-arbitrated at high CCPN is taken as
+     * soon as an RFE lowers CCPN below it. (Gating HARD on best>CCPN here instead
+     * would stop that re-check and starve the low-priority OSEK dispatch.) */
     if (best) {
         cpu_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
     } else {
@@ -623,6 +1808,27 @@ static void tc1797_icu_set(TC1797SoCState *s, uint8_t srpn)
 {
     if (srpn) {
         s->icu_pending[srpn >> 5] |= 1u << (srpn & 31u);
+    }
+    if (getenv("TC1797_IRQRATE") && srpn) {
+        static unsigned long cnt[256]; static int64_t t0;
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph == 3) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            if (t0 == 0) t0 = now;
+            cnt[srpn]++;
+            static unsigned long tot;
+            if (++tot % 300 == 0) {
+                int64_t span = now - t0;
+                fprintf(stderr, "--- IRQRATE span=%lldus ---\n", (long long)(span/1000));
+                for (int i = 1; i < 256; i++) {
+                    if (cnt[i] > 3) {
+                        fprintf(stderr, "IRQRATE srpn=%d cnt=%lu rate=%lld/s\n", i, cnt[i],
+                                span > 0 ? (long long)(cnt[i]*1000000000LL/span) : 0);
+                    }
+                }
+                fflush(stderr);
+            }
+        }
     }
 }
 
@@ -641,6 +1847,24 @@ static void tc1797_icu_clr(TC1797SoCState *s, uint8_t srpn)
 static void tc1797_icu_service_ack(void *opaque, uint32_t taken)
 {
     TC1797SoCState *s = opaque;
+    /* DIAGNOSTIC (env TC1797_TAKELOG): log every SRPN-1 dispatch TAKE with the
+     * firmware's nextid/curid at that instant. The idle-MPX is a dispatch taken
+     * while nextid==0 (the dispatcher then derefs task[0][0]=0xFFFFFFFF). */
+    if (getenv("TC1797_TAKELOG") && (uint8_t)taken == 1) {
+        uint8_t nid = 0, cid = 0, ph = 0;
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph >= 3 && ph < 0x40) {
+            cpu_physical_memory_read(0xD0000988u, &nid, 1);
+            cpu_physical_memory_read(0xD0000064u, &cid, 1);
+            static unsigned tk;
+            if (tk++ < 400) {
+                fprintf(stderr, "TAKELOG #%u srpn=1 nextid=%u curid=%u SRR=%u cpu_src=%08x "
+                        "ccpn=%u%s\n", tk, nid, cid, (s->cpu_src >> 13) & 1u, s->cpu_src,
+                        FIELD_EX32(s->cpu.env.ICR, ICR, CCPN), nid == 0 ? "  <<< IDLE-DISPATCH" : "");
+                fflush(stderr);
+            }
+        }
+    }
     tc1797_icu_clr(s, (uint8_t)taken);
     /* SRR auto-clears on service entry for edge nodes the firmware SETRs (the
      * CPU service-request/dispatch node). Without this its SRR stays set and the
@@ -657,6 +1881,53 @@ static void tc1797_irq_bh(void *opaque)
     tc1797_icu_arbitrate((TC1797SoCState *)opaque);
 }
 
+/* RFE re-arbitrate: re-present the highest pending SRN against the CCPN the CPU just
+ * lowered on interrupt return (helper_rfe). Faithful TC1.3.1 continuous arbitration --
+ * PIPN tracks the pending set the instant CCPN changes. Once the OS runs, the level-held
+ * SRPN-1 dispatch that was enqueued while the STM tick held CCPN=8 is presented as PIPN
+ * the instant this RFE drops CCPN, so the dispatcher runs in the idle gap after EVERY STM
+ * ISR (~2ms) instead of only on a rare full stack-unwind (~115ms) -- which is what starved
+ * the watchdog kick task into the DTC-0x3045 reset loop. */
+static void tc1797_icu_rfe(void *opaque)
+{
+    TC1797SoCState *s = (TC1797SoCState *)opaque;
+    CPUTriCoreState *env = &s->cpu.env;
+    /* Find the highest still-pending SRN. The dispatch-loop hazard -- re-arbitrating the
+     * firmware's continuously-held SRPN-1 from the dispatcher's OWN rfe -- is prevented
+     * upstream by op_helper's rfe_old_ccpn>1 gate, so this only ever runs returning from a
+     * HIGHER-priority ISR (the CCPN 7/8 STM tick). */
+    uint8_t best = 0;
+    for (int w = 7; w >= 0; w--) {
+        uint32_t v = s->icu_pending[w];
+        if (v) {
+            int b = 31;
+            while (!(v & (1u << b))) {
+                b--;
+            }
+            best = (uint8_t)(w * 32 + b);
+            break;
+        }
+    }
+    if (!best) {
+        return;                       /* nothing pending: leave HARD as-is (no spurious deassert) */
+    }
+    /* If the BQL is held -- the normal post-cold-init execution state, where helper_rfe runs
+     * with it locked -- arbitrate INLINE: PIPN + HARD are presented now, so the RFE's own forced
+     * DISAS_EXIT interrupt re-check takes the just-presented SRPN-1 OSEK dispatch IMMEDIATELY.
+     * That per-tick (~2ms) delivery is what feeds the prio-1 watchdog kick (without it the kick
+     * gap exceeds 5ms -> DTC-0x3045). During cold-init the BQL is transiently dropped by some
+     * bring-up steps; cpu_interrupt() asserts bql_locked() and would abort there, so fall back
+     * to a fresh inline PIPN write (sticks: helper_rfe is declared without TCG_CALL_NO_WG) plus
+     * the between-TB irq_bh, which re-runs arbitrate with the BQL held. bql_locked() is exactly
+     * the predicate cpu_interrupt() requires, so this is the faithful, crash-free split. */
+    if (bql_locked()) {
+        tc1797_icu_arbitrate(s);
+    } else {
+        env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, best);
+        qemu_bh_schedule(s->irq_bh);
+    }
+}
+
 /*
  * Raise a CPU-bound service request at priority srpn. Callers run in MMIO/TB
  * context (a peripheral SRN SETR write), so set the pending bit now and defer
@@ -669,10 +1940,22 @@ static void tc1797_raise_srpn(TC1797SoCState *s, uint8_t srpn)
         return;
     }
     tc1797_icu_set(s, srpn);
-    qemu_bh_schedule(s->irq_bh);
-    /* Kick the vCPU out of its current TB so the BH runs promptly; the HARD line
-     * persists (it lives in CPUState, not the clobbered TCG global). */
-    cpu_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
+    /* Arbitrate INLINE when the BQL is held (the normal case: this runs from an
+     * MMIO SETR store, which holds the BQL). Setting ICR.PIPN now -- rather than
+     * deferring to qemu_bh_schedule(irq_bh), which fires at a HOST-dependent main-
+     * loop point not tied to icount -- makes interrupt delivery deterministic: the
+     * CPU takes the request at the next TB boundary (icount-deterministic) instead
+     * of whenever the BH happens to run. This is the SAME proven-safe pattern as
+     * tc1797_icu_rfe's bql_locked() branch, and it removes the diag-env-sensitive
+     * non-determinism that raced the OSEK cooperative dispatch into the idle-MPX.
+     * Fall back to the deferred BH only on the rare BQL-unlocked cold-init path
+     * (cpu_interrupt asserts bql_locked()). */
+    if (bql_locked()) {
+        tc1797_icu_arbitrate(s);            /* sets PIPN + asserts HARD */
+    } else {
+        qemu_bh_schedule(s->irq_bh);
+        cpu_interrupt(CPU(&s->cpu), CPU_INTERRUPT_HARD);
+    }
 }
 
 /*
@@ -683,6 +1966,13 @@ static void tc1797_raise_srpn(TC1797SoCState *s, uint8_t srpn)
  */
 static void tc1797_pcp_irq(void *opaque, uint8_t srpn)
 {
+    if (getenv("TC1797_PCPIRQ")) {
+        static unsigned pn;
+        if (pn++ < 400) {
+            fprintf(stderr, "PCPIRQ srpn=%u(0x%x)\n", srpn, srpn);
+            fflush(stderr);
+        }
+    }
     tc1797_raise_srpn((TC1797SoCState *)opaque, srpn);
 }
 
@@ -735,6 +2025,14 @@ static void tc1797_can_rx_irq(void *opaque, int mo)
     uint32_t moipr = tc1797_can_read(&s->can,
                                      TC1797_CAN_MO_BASE + mo * 0x20 + 0x08);
     uint8_t srpn = tc1797_can_rx_srpn_of(&s->can, moipr);  /* node -> real SRPN */
+    if (getenv("TC1797_CANRXIRQ")) {
+        static unsigned ri;
+        if (ri++ < 60) {
+            fprintf(stderr, "CANRXIRQ mo=%d id=0x%03x moipr=%08x srpn=%u\n",
+                    mo, s->can.mo[mo].id, moipr, srpn);
+            fflush(stderr);
+        }
+    }
     if (srpn) {
         tc1797_raise_srpn(s, srpn);                    /* prompt best-effort raise */
     }
@@ -1126,6 +2424,18 @@ static void tc1797_src_node_write(TC1797SoCState *s, uint32_t *node,
     }
     *node = (val & 0x00001FFFu) | (srr << 13);
     if (!(srr && ((*node >> 12) & 1u))) {
+        /* SRR is now clear (CLRR), or the node is disabled. Sync the arbiter's
+         * pending bit with the SRR: a software-cleared request must stop being
+         * presented. This is the faithful TC1.3.1 behaviour -- the SRN's request
+         * to the ICU IS its SRR -- and is load-bearing for the OSEK dispatcher,
+         * which CLRRs its own SRPN-1 service node on every scheduling pass. Without
+         * it icu_pending[1] survives the CLRR and is re-presented at the
+         * dispatcher's epilogue, forcing a spurious extra reschedule so the curid
+         * stack never unwinds to the prio-1 idle base (the phase-3->4 wedge). */
+        if (!srr) {
+            tc1797_icu_clr(s, *node & 0xFFu);
+            tc1797_icu_arbitrate(s);
+        }
         return;                           /* not a set, enabled request */
     }
     if ((*node >> 10) & 1u) {             /* TOS=1: peripheral control processor */
@@ -1154,6 +2464,58 @@ static void tc1797_src_node_write(TC1797SoCState *s, uint32_t *node,
     }
 }
 
+/* DIAGNOSTIC (env TC1797_FREEZEDUMP): a WALL-CLOCK timer that fires regardless of guest
+ * virtual time, so it catches the phase-3 freeze (where the guest halts/spins and virtual
+ * time stops). Dumps the prio-level fn-list runner FUN_80124512 state: nextid, the fn-list
+ * pointer task[nextid][1] (post-incremented past the LAST calli'd fn), so last_fn = the
+ * task that is hung (never returned/retired). */
+static void tc1797_freeze_dump(void *opaque)
+{
+    TC1797SoCState *s = opaque;
+    CPUTriCoreState *env = &s->cpu.env;
+    uint8_t ph = 0;
+    cpu_physical_memory_read(0xD0003643u, &ph, 1);
+    if (ph == 3) {
+        /* Phase-3 PC histogram (wall-clock sampled, so it captures the overrun even when
+         * guest virtual time crawls). The hottest NON-idle PC = the master sub-function
+         * that poll-waits/overruns the watchdog kick window. */
+        static uint32_t pcs[160]; static unsigned long pcc[160]; static unsigned char ccp[160];
+        static unsigned pn; static unsigned long tot;
+        uint32_t pc = (uint32_t)env->PC & ~0x20000000u;
+        unsigned cc = env->ICR & 0xffu;
+        unsigned i;
+        for (i = 0; i < pn; i++) { if (pcs[i] == pc) break; }
+        if (i == pn && pn < 160) { pcs[pn] = pc; ccp[pn] = (unsigned char)cc; pn++; }
+        if (i < 160) { pcc[i]++; }
+        if (++tot % 60 == 0) {
+            uint8_t cnt37 = 0; uint32_t lastk = 0, tim1 = 0; uint16_t d340c = 0, d987c = 0;
+            uint32_t deadline = 0, cursor = 0, mbc = 0, c987 = 0;
+            cpu_physical_memory_read(0xD0004037u, &cnt37, 1);
+            cpu_physical_memory_read(0xD00019C0u, &lastk, 4);
+            cpu_physical_memory_read(0xD000340Cu, &d340c, 2);
+            cpu_physical_memory_read(0xD000987Cu, &c987, 4);
+            cpu_physical_memory_read(0xD00124A0u, &deadline, 4);   /* cursor accumulated deadline */
+            cpu_physical_memory_read(0xD0012498u, &cursor, 4);     /* cursor pointer */
+            cpu_physical_memory_read(0xD00019BCu, &mbc, 4);        /* monitor last-run TIM1 */
+            tim1 = (uint32_t)(tc1797_stm_count56(s->stm_ns_per_tick) >> 4);
+            uint32_t tim0 = (uint32_t)tc1797_stm_count56(s->stm_ns_per_tick);
+            (void)d987c;
+            fprintf(stderr, "FREEZEW tot=%lu 340c=%u 987c=%u cnt37=%u | kick(t1-lastk)=%u "
+                    "MON(t1-019bc)=%u(reset>0x1a17b) | cur=%08x dl-now=%d\n",
+                    tot, d340c, c987, cnt37, tim1 - lastk, tim1 - mbc, cursor, (int)(deadline - tim0));
+            for (unsigned k = 0; k < pn; k++) {
+                if (pcc[k] > tot / 25) {
+                    fprintf(stderr, "FREEZEHIST pc=%08x ccpn=%u cnt=%lu\n",
+                            pcs[k], ccp[k], pcc[k]);
+                }
+            }
+            fflush(stderr);
+        }
+    }
+    timer_mod(s->freeze_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 2000000);  /* 2ms wall */
+}
+
 static void tc1797_osek_tick(void *opaque)
 {
     TC1797SoCState *s = opaque;
@@ -1162,6 +2524,161 @@ static void tc1797_osek_tick(void *opaque)
     uint32_t ie   = FIELD_EX32(env->ICR, ICR, IE_13);
     uint32_t ccpn = FIELD_EX32(env->ICR, ICR, CCPN);
     bool raised = false;
+
+    /* HANDOFF to the firmware's own STM tick (default-on; disable via TC1797_NO_HANDOFF).
+     *
+     * The forced systick is a BOOTSTRAP crutch: the firmware programs its OSEK system tick
+     * on STM CMP0 (100us, the schedule + watchdog kick) and CMP1 (1ms, the master schedule)
+     * in the cold-init FUN_80001160 (ICR.CMP0EN/CMP1EN | 0x51, CMP0=TIM0+9000, CMP1=TIM0+
+     * 90000), but that cold-init is only reached ~120ms into boot. Until then nothing drives
+     * the OS, so the forced systick raises SRPN 1/7/8 to advance the boot to the point the
+     * cold-init runs. Once the cold-init has armed+enabled the real STM compare, the hardware
+     * tick (tc1797_stm_tick) drives SRPN-8/7 at the firmware's exact programmed deadlines --
+     * EXACTLY as on silicon. Continuing to ALSO run the forced systick from here double-drives
+     * the schedule cursor and the watchdog kick: the kick interval jitters past the 1.9ms
+     * window, cnt37 climbs past 9, and FUN_800c3c68 software-resets (DTC-0x3045) every ~58ms
+     * (the 6x watchdog reset loop). Retire the crutch the moment the firmware's tick is live.
+     * A SoC reset clears ICR (cold-init must re-run) and re-arms this timer (see reset hook),
+     * so the bootstrap restarts cleanly each boot. */
+    bool tick_handed_off = false;
+    {
+        static int no_handoff = -1;
+        if (no_handoff < 0) { no_handoff = getenv("TC1797_NO_HANDOFF") ? 1 : 0; }
+        if (!no_handoff &&
+            (tc1797_stm_cmp_enabled(s, 0) || tc1797_stm_cmp_enabled(s, 1))) {
+            /* PARTIAL handoff: the real STM tick now drives the periodic SRPN-8/7 schedule,
+             * so stop raising the forced tick SRPNs 1/7/8 below (double-driving them jitters
+             * the watchdog kick past 1.9ms -> the DTC-0x3045 reset loop). But KEEP delivering
+             * the OSEK event-dispatch node (cpu_src 0xF7E0FFFC / SRPN-1): the firmware sets SRR
+             * on it to request event-task switches -- e.g. the COM task chain that refreshes the
+             * secondary watchdog timestamp 0xD00019C4 (FUN_800c3c68's 0x3047 300ms check) and
+             * 0xD00019BC (0x3046 19ms check). QEMU's SRC node does not self-raise that request,
+             * so retiring the forced timer entirely starves those refreshers -> DTC-0x3047 every
+             * ~300ms. So skip only the tick raise; still run the cpu_src dispatch + re-arm. */
+            tick_handed_off = true;
+        }
+    }
+
+    /* DIAGNOSTIC (env TC1797_FIRECNT): FULLY non-perturbing osek-timer fire counter -- NO
+     * cpu_physical_memory_read at all (only the fire count + virtual clock). Tells us
+     * whether the osek_timer keeps firing past the ~133ms phase-3 freeze (CPU spin not
+     * preempted) or STOPS firing (QEMU/timer-level stall). Also logs ie/ccpn/PC (env-side,
+     * non-perturbing) so we see the CPU state at the freeze. */
+    {
+        static int fc = -1;
+        if (fc < 0) { fc = getenv("TC1797_FIRECNT") ? 1 : 0; }
+        if (fc) {
+            /* Histogram the interrupted CPU PC when a TASK is running (ccpn>=8) -- this
+             * is sampled by virtual time (the osek timer), so it captures the master's
+             * spin where wall-clock sampling could not. The hot ccpn>=8 PC = the
+             * peripheral poll-wait that overruns the master. */
+            {
+                static uint32_t pcs[128]; static unsigned long pcc[128]; static unsigned char ccs[128];
+                static unsigned pn; static unsigned long tot;
+                uint32_t pc = (uint32_t)env->PC & ~0x20000000u;
+                unsigned i;
+                for (i = 0; i < pn; i++) { if (pcs[i] == pc) break; }
+                if (i == pn && pn < 128) { pcs[pn] = pc; ccs[pn] = (unsigned char)ccpn; pn++; }
+                if (i < 128) { pcc[i]++; }
+                if (++tot % 200 == 0) {
+                    fprintf(stderr, "--- FIRECNT task-PC hist (tot=%lu) top ---\n", tot);
+                    for (unsigned k = 0; k < pn; k++) {
+                        if (pcc[k] > tot / 15) {
+                            fprintf(stderr, "TASKPC pc=%08x ccpn=%u cnt=%lu\n",
+                                    pcs[k], ccs[k], pcc[k]);
+                        }
+                    }
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+
+    /* DIAGNOSTIC (env TC1797_OSEKCNT): at phase 3, every 300th osek_tick fire, log the
+     * schedule-drive dynamics over time -- fires, raises (srpn>ccpn delivered), the
+     * current ccpn/ie, the cpu_src SRR (dispatch request, bit13), and the periodic-task
+     * progress (340c debounce, 987c master counter, curid). Reveals whether the tick
+     * STOPS firing/raising, or keeps firing but the periodic tasks stop being dispatched. */
+    {
+        static int oc = -1;
+        if (oc < 0) { oc = getenv("TC1797_OSEKCNT") ? 1 : 0; }
+        if (oc) {
+            static unsigned long fires;
+            fires++;
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            if (ph == 3 && (fires % 50u) == 0u) {
+                uint16_t d340c = 0; uint8_t d340e = 0, curid = 0; uint32_t c987c = 0;
+                cpu_physical_memory_read(0xD000340Cu, &d340c, 2);
+                cpu_physical_memory_read(0xD000340Eu, &d340e, 1);
+                cpu_physical_memory_read(0xD0000064u, &curid, 1);
+                cpu_physical_memory_read(0xD000987Cu, &c987c, 4);
+                fprintf(stderr, "OSEKCNT fires=%lu | ccpn=%u ie=%u SRR=%u ready_gate(BIV=%u) | "
+                        "340c=%u 340e=%u 987c=%u curid=%u (now=%lldms)\n",
+                        fires, ccpn, ie, (s->cpu_src >> 13) & 1u, env->BIV != 0,
+                        d340c, d340e, c987c, curid,
+                        (long long)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000));
+                fflush(stderr);
+            }
+        }
+    }
+
+    /* DIAGNOSTIC (env TC1797_POLLHIST): sample the interrupted PC every osek_tick
+     * (~333us) at phase 3. The schedule lags to 2ms because per-fire work poll-waits
+     * ~1ms of STM-time (CPU-independent); this finer sampler reveals the spin PC. */
+    if (getenv("TC1797_POLLHIST")) {
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        static unsigned qn;
+        if (qn++ < 4000) {
+            fprintf(stderr, "POLLHIST %08x ccpn=%u ph=%u\n",
+                    env->PC & ~0x20000000u, ccpn, ph);
+            fflush(stderr);
+        }
+    }
+
+    /* DIAGNOSTIC (env TC1797_MAXPHASE): the osek_timer is always-on (when systick
+     * enabled) and fires on the virtual clock independent of the firmware arming
+     * STM CMP0, so it gives a reliable free-run phase measurement (the stm_tick
+     * logger goes dark pre-CMP0-config). Log each new max phase reached. */
+    if (getenv("TC1797_MAXPHASE")) {
+        static uint8_t mx; static unsigned fc;
+        uint8_t ph = 0;
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph < 0x40 && ph > mx) {
+            uint8_t osr = 0;
+            cpu_physical_memory_read(0xD000400Fu, &osr, 1);
+            mx = ph;
+            fprintf(stderr, "MAXPHASE(osek) new-max=%u os_running=%u (now=%lldms)\n",
+                    ph, osr, (long long)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000));
+            fflush(stderr);
+        }
+        /* Non-perturbing free-run PC sampler: where is the cold-init spinning? */
+        if ((fc++ % 300) == 0) {
+            fprintf(stderr, "PCSAMPLE pc=0x%08x phase=%u ccpn=%u ie=%u (now=%lldms)\n",
+                    (uint32_t)env->PC, ph, ccpn, ie,
+                    (long long)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / 1000000));
+            fflush(stderr);
+        }
+    }
+
+    /* DIAGNOSTIC (env TC1797_DISPLOG, no behaviour change): why the SRPN-1 OSEK
+     * dispatch (cpu_src @0xF7E0FFFC) never switches curid->nextid at phase 3.
+     * Logs CCPN/IE + the dispatch node SRR + the kernel's nextid/curid each fire. */
+    if (getenv("TC1797_DISPLOG")) {
+        uint8_t nid = 0, cid = 0, ph = 0;
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        if (ph >= 3 && ph < 0x40) {        /* only the phase-3+ window */
+            static unsigned dn;
+            if (dn++ < 240) {
+                cpu_physical_memory_read(0xD0000988u, &nid, 1);
+                cpu_physical_memory_read(0xD0000064u, &cid, 1);
+                fprintf(stderr, "DISPLOG #%u ccpn=%u ie=%u pipn=%u SRR=%u cpu_src=%08x "
+                        "nextid=%u curid=%u phase=%u\n", dn, ccpn, ie,
+                        FIELD_EX32(env->ICR, ICR, PIPN), (s->cpu_src >> 13) & 1u,
+                        s->cpu_src, nid, cid, ph);
+                fflush(stderr);
+            }
+        }
+    }
 
     /* Phase-4 observability: latch + report once the RTOS phase byte reaches 4.
      * The byte reads garbage before the DSPR block-init (a transient >=4 can
@@ -1200,11 +2717,26 @@ static void tc1797_osek_tick(void *opaque)
         ready = (phase >= s->osek_minphase);
     }
 
-    /* Deliver one round-robin systick when ready. */
-    if (ready) {
+    /* Deliver one round-robin systick when ready -- UNLESS the firmware's real STM tick has
+     * taken over (partial handoff): then the hardware CMP0/CMP1 drive the schedule and we must
+     * not double-drive it here. The cpu_src OSEK event dispatch below still runs. */
+    if (ready && !tick_handed_off) {
         uint8_t srpn = tc1797_osek_tick_prios[s->osek_rr
                                               % ARRAY_SIZE(tc1797_osek_tick_prios)];
         s->osek_rr++;
+        /* DIAGNOSTIC (env TC1797_FORCE_CMP1_OFF): the schedule-table tick is the STM CMP1
+         * (SRPN-7), which the firmware ARMS itself in FUN_80081870 (DAT_f0000230 = next
+         * deadline). The forced systick ALSO raising SRPN-7 every ~1ms double-drives the
+         * schedule cursor and adds jitter (the >1.9ms tick gaps that trip the watchdog).
+         * Suppress the forced SRPN-7 so only the real STM CMP1 (tc1797_stm_tick) walks the
+         * cursor at the programmed 90000-tick (=1ms@90MHz) cadence. */
+        static int no_cmp1 = -1;
+        if (no_cmp1 < 0) {
+            no_cmp1 = getenv("TC1797_FORCE_CMP1_OFF") ? 1 : 0;
+        }
+        if (srpn == 7 && no_cmp1) {
+            srpn = 0;   /* not raised (0 is never > ccpn); real STM CMP1 drives the schedule */
+        }
         if (srpn > ccpn) {
             env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, srpn);
             cpu_interrupt(cs, CPU_INTERRUPT_HARD);
@@ -1218,7 +2750,8 @@ static void tc1797_osek_tick(void *opaque)
      * activated periodic tasks are starved -- bridge task #22). Only when we did
      * not already raise a systick this fire (keep one source in flight at a
      * time), under the same readiness + IE && SRPN > CCPN rule. */
-    if (!raised && ready && ((s->cpu_src >> 13) & 1u)) {
+    if (!getenv("TC1797_EVENTDISP")
+        && !raised && ready && ((s->cpu_src >> 13) & 1u)) {
         uint8_t srpn = s->cpu_src & 0xFFu;
         if (srpn > ccpn) {
             env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, srpn);
@@ -1336,8 +2869,68 @@ static uint64_t tc1797_ssc_read(TC1797SoCState *s, int unit, uint32_t off)
     case 0x08: return 0x00004500;            /* ID: MOD=0x45 (SSC) */
     case 0x0C: return 0x10000000;            /* FDR reset-ish (baud) */
     case 0x20: return s->ssc_tb[unit];       /* TB readback */
-    case 0x24: {                             /* RB: loopback echo of last TB */
+    case 0x24: {                             /* RB: SPI receive */
         uint32_t tb = s->ssc_tb[unit];
+        /*
+         * SSC0 = SC900685 MSDI (Multiple Switch Detection Interface). The firmware
+         * clocks a command/NOP stream and reads back the switch-status frames it
+         * builds into the coding/diagnostic blocks the validator FUN_800e006e checks
+         * (each channel must be type (hw>>9)&0x1f==0x15, i.e. high byte 0x2a). The MSDI
+         * returns its 0x2a status tag for the NOP (0x00) clock bytes and a switch-state
+         * byte for a register command. The old loopback returned 0 for the NOP -> the
+         * channels never carried the 0x2a tag -> validation failed -> phase stalled at 2.
+         * Faithful minimal model: NOP -> 0x2a status; register read -> switch byte
+         * (0xFF = idle/open per the SC900685 pull-ups at key-on-engine-off; sets bit0
+         * so the d6f4 chain reads "present"). SSC1 (TLE7183F/L9959 drivers) keeps loopback.
+         */
+        if (unit == 0) {
+            /*
+             * SC900685 MSDI (Multiple Switch Detection Interface) register model. The
+             * firmware (FUN_8011a800 mode-2) clocks command words out and reads the
+             * switch-status frames into the coding/diagnostic blocks the validator
+             * FUN_800e006e checks (each channel must be type (hw>>9)&0x1f==0x15, i.e.
+             * high byte 0x2a). The MSDI answers each register-select command with a
+             * 0x2a-status frame carrying the switch-state byte, and a NOP/clock byte
+             * (0x00) with the bare 0x2a tag. The register-select byte is the command's
+             * high byte (halfword mode, cmd 0xRR00) or low byte (byte mode, cmd 0xRR).
+             *
+             * sw[] is the SC900685's switch registers at KEY-ON-ENGINE-OFF, reverse-
+             * engineered from the real-ECU donor snapshot (the exact frames the firmware
+             * built: c8->0x2a33, ca->0x2a25, f6->0x2a90, e4->0x2a1f, fc->0x2aff, ...).
+             * Unmapped registers default to 0x2a00 (valid frame, switch idle). The old
+             * loopback echoed the command back -> channels never carried the 0x2a tag ->
+             * the coding validation failed and the boot stalled at phase 2.
+             */
+            static const uint8_t sw[256] = {
+                [0xC0] = 0xA4, [0xC2] = 0x29, [0xC6] = 0x3F, [0xC8] = 0x33,
+                [0xCA] = 0x25, [0xCC] = 0x2F, [0xCE] = 0xC0, [0xE4] = 0x1F,
+                [0xE8] = 0x16, [0xEA] = 0xC4, [0xF6] = 0x90, [0xFC] = 0xFF,
+            };
+            uint32_t ptb = s->ssc_prev[unit];    /* reply is to the PRIOR command */
+            uint8_t reg = (ptb >> 8) & 0xFFu;
+            if (reg == 0) {
+                reg = ptb & 0xFFu;
+            }
+            if (reg == 0) {
+                return 0x2Au;                    /* NOP/clock -> status tag */
+            }
+            /* register-select -> 0x2a-status switch frame. Unmapped registers are
+             * idle/open switches: the SC900685 reads them as its pull-up state 0xFF
+             * (NOT 0x00), per the key-on-engine-off rest state. Returning 0x00 there
+             * dropped bit0 of the d6f4 chain on every unmapped read -> a45-bit2/340e
+             * debounce never latched -> 4041=0 -> phase-4 promote stalled. */
+            if (getenv("TC1797_MSDITRACE")) {
+                extern bool g_pcp_in_exec;
+                uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+                if (ph == 3) {
+                    fprintf(stderr, "MSDI R reg=%02x -> %04x pc=%08x pcp=%u\n",
+                            reg, 0x2A00u | (sw[reg] ? sw[reg] : 0xFFu),
+                            (uint32_t)s->cpu.env.PC & ~0x20000000u, g_pcp_in_exec ? 1 : 0);
+                    fflush(stderr);
+                }
+            }
+            return 0x2A00u | (sw[reg] ? sw[reg] : 0xFFu);
+        }
         return (tb & 0xFF) == 0 ? 0u : (tb & 0xFFFF);
     }
     case 0x28: return 0x00000000;            /* STAT: ready, BSY=0 (bit12 clear) */
@@ -1366,15 +2959,23 @@ static uint64_t tc1797_ssc_read(TC1797SoCState *s, int unit, uint32_t off)
 /* SPI transfer-latency expiry: the modelled transfer finished, so raise the
  * SSC completion (queue-node) service request now -- the deferred analogue of
  * the PCP signalling transfer-done. (See tc1797_ssc_write +0xF8.) */
+/* SSC shift-complete (one full-duplex frame transmitted+received). Per the UM SSC
+ * register map (Table, F010 01F8H) the RECEIVE interrupt RSRC is at +0xF8, and
+ * "RIR is activated when the received frame is moved to RBUF". The firmware routes
+ * RSRC TOS=1 -> PCP channel 43 (the receive handler that loads the next transmit
+ * word). [QEMU previously mislabelled +0xF8 "transfer" and +0xFC "queue"; +0xFC is
+ * actually ESRC (Error). Raising RSRC drives the next frame of the MSDI transfer.] */
 static void tc1797_ssc0_done(void *opaque)
 {
     TC1797SoCState *s = opaque;
-    tc1797_raise_srpn(s, s->ssc_src[0][1] & 0xFFu);
+    tc1797_src_node_write(s, &s->ssc_src[0][0],
+                          (s->ssc_src[0][0] & 0x00001FFFu) | 0x8000u, 0xF01001F8u);
 }
 static void tc1797_ssc1_done(void *opaque)
 {
     TC1797SoCState *s = opaque;
-    tc1797_raise_srpn(s, s->ssc_src[1][1] & 0xFFu);
+    tc1797_src_node_write(s, &s->ssc_src[1][0],
+                          (s->ssc_src[1][0] & 0x00001FFFu) | 0x8000u, 0xF01002F8u);
 }
 
 /*
@@ -1468,11 +3069,47 @@ static void tc1797_adc_conv_done(void *opaque)
     tc1797_adc_rearm(s);
 }
 
+/* GPTA GTC compare-match poll: fire any compare whose deadline elapsed (routing
+ * the SR per TOS), and re-arm while compares are still pending. The GPTA-init
+ * PCP state machine schedules these to advance its key-on/engine-off timer
+ * sequence (GTC compare -> SRC node -> next PCP channel); see tc1797_gpta.h. */
+static void tc1797_gpta_cmp_tick(void *opaque)
+{
+    TC1797SoCState *s = opaque;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    int pending = tc1797_gpta_compare_poll(&s->gpta, now);
+    if (pending > 0) {
+        timer_mod(s->gpta_cmp_timer, now + 20000);   /* 20 us poll */
+    }
+}
+
 static void tc1797_ssc_write(TC1797SoCState *s, int unit, uint32_t off,
                              uint32_t val)
 {
     if (off == 0x20) {
+        if (unit == 0 && getenv("TC1797_MSDITRACE")) {
+            extern bool g_pcp_in_exec;
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            if (ph == 3) {
+                uint8_t mode = 0; cpu_physical_memory_read(0xD000402Fu, &mode, 1);
+                fprintf(stderr, "MSDI W tb=%04x (prev->%04x) pc=%08x ccpn=%u pcp=%u mode=%u\n",
+                        val & 0xffff, s->ssc_tb[unit] & 0xffff,
+                        (uint32_t)s->cpu.env.PC & ~0x20000000u,
+                        (unsigned)(s->cpu.env.ICR & 0xFFu), g_pcp_in_exec ? 1 : 0, mode);
+                fflush(stderr);
+            }
+        }
+        s->ssc_prev[unit] = s->ssc_tb[unit];  /* MSDI replies to the prior command */
         s->ssc_tb[unit] = val;               /* TB: latch for loopback */
+        /* UM 18/19: writing TBUF moves it to the transmit shift register (TSRC/+0xF4
+         * fires, polled), which shifts out (TX) and shifts in (RX, loopback). When the
+         * frame is fully received it is moved to RBUF and the RECEIVE interrupt RSRC
+         * (+0xF8) fires. Model that shift latency: schedule RSRC, which (TOS=1) re-
+         * triggers PCP ch43 to load the next transmit word -- driving the MSDI transfer
+         * one frame at a time. The chain self-terminates when ch43 stops reloading TBUF
+         * (command exhausted). This replaces the old +0xFC (Error-node) RX timer. */
+        timer_mod(s->ssc_done_timer[unit],
+                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->ssc_xfer_ns);
         return;
     }
     /*
@@ -1488,39 +3125,24 @@ static void tc1797_ssc_write(TC1797SoCState *s, int unit, uint32_t off,
      */
     if (off == 0xF8) {
         /*
-         * SSC transfer SRN, configured TOS=1 -- routed to the PCP (Peripheral
-         * Control Processor), NOT the CPU. The SSC ISR (fn_80083610) programs a
-         * transfer then SETRs this node so the PCP performs the SPI shift and, on
-         * completion, signals the CPU to run the ISR's completion stage (which
-         * sets the per-device ready byte = 1). We do not model the PCP and the
-         * loopback transfer is instantaneous, so simulate the PCP completing by
-         * re-raising the partner CPU SSC interrupt -- the +0xFC node's SRPN --
-         * which re-enters fn_80083610 on the completion path (*(saved entry) = 1).
-         * Without this the boot wedges at fn_800dd384 polling that byte (phase 2).
-         */
-        uint32_t srr = (s->ssc_src[unit][0] >> 13) & 1u;
-        if (val & 0x8000u) {
-            srr = 1;                          /* SETR */
-        }
-        if (val & 0x4000u) {
-            srr = 0;                          /* CLRR */
-        }
-        s->ssc_src[unit][0] = (val & 0x00001FFFu) | (srr << 13);
-        if (srr) {
-            /* Model the SPI transfer LATENCY. On silicon the PCP shifts the
-             * frame over the transfer time (tens of us at the SSC baud) and only
-             * THEN signals completion. Raising the completion SRN immediately
-             * makes the SSC ISR (fn_80083610) re-fire back-to-back at full CPU
-             * speed -- ~90% of all interrupts -- starving the lower-priority OSEK
-             * counter ticks (SRPN 7/8) so the OS time base freezes (no alarms ->
-             * no periodic tasks -> no os_running). Defer the completion raise by
-             * a transfer time so the OSEK ticks run in the gaps. */
-            timer_mod(s->ssc_done_timer[unit],
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->ssc_xfer_ns);
-        }
+         * RSRC -- the SSC RECEIVE Interrupt node (UM SSC reg map: SSC0 +0xF8 =
+         * F010 01F8H "RSRC SSC0 Receive Interrupt"). TOS=1 -> PCP channel 43, the
+         * MSDI receive handler that copies the next command word DSPR->TBUF. The
+         * firmware's SSC ISR (fn_80083610 / FUN_800c0bfa) SETRs this node to START a
+         * transfer (kick the first receive); thereafter the SSC HW re-raises RSRC
+         * itself after each shift (modelled by the +0x20 TBUF-write timer above), so
+         * the receive->load-next-TX chain runs frame by frame until ch43 stops
+         * reloading TBUF. Route the SETR through the generic SRN handler (TOS=1 ->
+         * pcp_engine_trigger). [Pre-UM-audit this was mislabelled the "transfer" node
+         * and a +0xFC "RX timer" was used; +0xFC is actually ESRC (Error).] */
+        tc1797_src_node_write(s, &s->ssc_src[unit][0], val,
+                              0xF0100100u + (uint32_t)unit * 0x100u + 0xF8u);
         return;
     }
     if (off == 0xFC) {
+        /* ESRC -- the SSC ERROR Interrupt node (UM: SSC0 +0xFC = F010 01FCH). TOS=0
+         * here; the firmware repurposes it as a software-triggered queue/drain service
+         * request (SRPN 37 -> fn_80083610). Route through the generic SRN handler. */
         tc1797_src_node_write(s, &s->ssc_src[unit][1], val,
                               0xF0100100u + (uint32_t)unit * 0x100u + 0xFCu);
         return;
@@ -1641,6 +3263,26 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
                 uint32_t aoff = addr - TC1797_ADC0_BASE;
                 uint32_t koff = aoff & (TC1797_ADC_KSIZE - 1);
                 int ki = (int)(aoff / TC1797_ADC_KSIZE);
+                /* Diagnostic (env TC1797_ADCLOG): log every ADC write so we can see
+                 * whether cold-init ever configures ch26's result-SRC node 0xF01013EC
+                 * (koff 0x3EC, SRPN 0x1a) or ch28's 0xF01013F4 -- the load-bearing
+                 * question for the continuous-scan fix. Non-perturbing (in the MMIO
+                 * write path, no breakpoints). */
+                if (getenv("TC1797_ADCLOG")) {
+                    extern bool g_pcp_in_exec;
+                    static unsigned an;
+                    uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+                    /* Focus on the ch 0x1d result-event node (SRPN 29 = 0x1d) re-arms:
+                     * is the SETR write from the PCP (ch29 re-arming the scan) or the
+                     * CPU (firmware periodic arm)? Determines the idle-between-scans model. */
+                    if (an++ < 500 && koff >= 0x3C0u) {
+                        fprintf(stderr, "ADCw ph=%u k%d koff=%03x val=%08x srpn=%u %s PC=%08x\n",
+                                ph, ki, koff, (uint32_t)val, (uint32_t)val & 0xFFu,
+                                g_pcp_in_exec ? "PCP" : "CPU",
+                                (uint32_t)s->cpu.env.PC & ~0x20000000u);
+                        fflush(stderr);
+                    }
+                }
                 if (ki >= 0 && ki < TC1797_ADC_NKERN
                     && koff >= 0x3C0u && (val & 0x1000u)) {
                     int idx = (int)((koff - 0x3C0u) >> 2);
@@ -1679,8 +3321,13 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
             }
             tc1797_adc_write(&s->adc, addr, val); return true;
         case TC_IP_FADC:     tc1797_fadc_write(&s->fadc, addr, val); return true;
-        case TC_IP_GPTA:     tc1797_gpta_write(&s->gpta, addr, val,
-                                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)); return true;
+        case TC_IP_GPTA: {
+            uint64_t gnow = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            tc1797_gpta_write(&s->gpta, addr, val, gnow);
+            /* A write may have scheduled a GTC compare; poll soon to fire it. */
+            timer_mod(s->gpta_cmp_timer, gnow + 20000);   /* 20 us */
+            return true;
+        }
         case TC_IP_DMA:      tc1797_dma_write(&s->dma, addr, val); return true;
         case TC_IP_ERAY:     tc1797_eray_write(&s->eray, addr, val); return true;
         case TC_IP_ASC:      tc1797_asc_write(p->unit ? &s->asc1 : &s->asc0, addr, val);
@@ -1699,6 +3346,132 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
     uint32_t addr = 0xF0000000u + (uint32_t)offset;
     int ssc_u;
     uint32_t ssc_off;
+
+    /* TEST (env TC1797_IDLECTX): the OSEK idle task (task 0) has context sentinel
+     * task[0][0]=0xFFFFFFFF; the dispatcher FUN_801255da does task[0][1]=*(task[0][0])
+     * =*(0xFFFFFFFF) then calli *(task[0][1]). StartOS sets task[0][1]=&DAT_d0000970=
+     * 0xD0000970 (and *0xD0000970=0x801257e4 the idle loop), so the firmware DESIGN
+     * requires *(0xFFFFFFFF)==0xD0000970 for the idle to dispatch (else calli 0 -> MPX
+     * trap -> reset, which zeroes the engine-health debounce). QEMU reads 0 there. Model
+     * the read the firmware expects so the OS idles cleanly between gaps (no reset),
+     * letting the debounce accumulate. If this reaches phase 4, the idle-MPX was THE
+     * blocker. (Word read of 0xFFFFFFFF lands at the top 4 bytes of the SFR region.) */
+    if (addr >= 0xFFFFFFFCu) {
+        /* FAITHFUL FIX (default-on, opt-out TC1797_NO_IDLECTX): this read is the OSEK
+         * idle-task dispatch -- FUN_801255da does task[0][1]=*(task[0][0])=*(0xFFFFFFFF)
+         * then calli *(task[0][1]). StartOS (FUN_801247ac) sets task[0][1]=&DAT_d0000970=
+         * 0xD0000970 and *(0xD0000970)=0x801257e4 (idle loop). 3 donor DSPR snapshots
+         * (real silicon @os_running=1) all show task[0][1] still =0xD0000970, proving
+         * silicon's read of the unmapped segment-15 top word returns the idle-context
+         * pointer (the reload is idempotent and idle dispatches cleanly). QEMU's blank SFR
+         * stub returned 0 -> task[0][1] corrupted -> calli 0 -> MPX reset that wiped the
+         * engine-health debounce every ~140ms. Model the silicon value (paired with the
+         * TC1.3.1 force-aligned load in translate.c gen_align_ea, so the word read lands
+         * fully in-region at 0xFFFFFFFC instead of wrapping the 4GB boundary). Analogous to
+         * the seg7 CRC-table seed: modelling memory/bus content the firmware reads. */
+        static int no_idle = -1;
+        if (no_idle < 0) { no_idle = getenv("TC1797_NO_IDLECTX") ? 1 : 0; }
+        if (no_idle) {
+            /* fall through to the normal SFR stub (0) -- A/B: restores the idle-MPX reset */
+        } else {
+        /* SCHEDLOG: log the scheduler state at the idle dispatch (which periodic tasks
+         * were activated but not chosen). */
+        if (getenv("TC1797_SCHEDLOG")) {
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            if (ph == 3) {
+                static unsigned sn;
+                if (sn++ < 40) {
+                    uint32_t d984=0, curid=0, nextid=0, base=0;
+                    cpu_physical_memory_read(0xD0000984u, &d984, 4);
+                    cpu_physical_memory_read(0xD0000064u, &curid, 4);
+                    cpu_physical_memory_read(0xD0000988u, &nextid, 4);
+                    cpu_physical_memory_read(0xD000998Cu, &base, 4);
+                    char act[80]; int p=0;
+                    if (base >= 0xD0000000u && base < 0xD0020000u) {
+                        for (int i=0;i<16;i++){ uint32_t t0=0;
+                            cpu_physical_memory_read(base+(uint32_t)i*0x10u,&t0,4);
+                            if (t0) p+=snprintf(act+p,sizeof(act)-p,"%d ",i); }
+                    }
+                    fprintf(stderr, "SCHEDLOG idle-dispatch: DAT_984(scanstart)=%u curid=%u nextid=%u active=[ %s]\n",
+                            d984, curid, nextid, act);
+                    fflush(stderr);
+                }
+            }
+        }
+        return 0xD0000970u;
+        }   /* end else (!no_idle) */
+    }
+
+    /* DIAGNOSTIC (env TC1797_SFRSPIN): NON-PERTURBING spin detector. The phase-3 freeze is
+     * a firmware poll-wait spin (QEMU at 106% CPU) reading the SAME SFR from the SAME PC
+     * forever, waiting on a peripheral-completion signal QEMU never sets. Track consecutive
+     * repeats of (addr,PC) and log when it crosses thresholds -- using ONLY env->PC + addr
+     * (NO cpu_physical_memory_read, which perturbs the fragile boot to phase 2). The logged
+     * (addr,PC) is the poll target + the spin = the missing completion signal. */
+    {
+        static int sp = -1;
+        if (sp < 0) { sp = getenv("TC1797_SFRSPIN") ? 1 : 0; }
+        if (sp) {
+            /* Non-perturbing (addr,pc) histogram: which SFR + PC dominate the wedge loop.
+             * No cpu_physical_memory_read. Dump the top entries every 200000 SFR reads. */
+            static uint32_t ha[48], hp[48]; static unsigned long hc[48]; static unsigned hn;
+            static unsigned long tot;
+            uint32_t cpc = (uint32_t)s->cpu.env.PC & ~0x20000000u;
+            unsigned i, f = 48;
+            int byaddr = getenv("TC1797_SFRADDR") != NULL;  /* addr-only histogram */
+            for (i = 0; i < hn; i++) { if (ha[i] == addr && (byaddr || hp[i] == cpc)) { f = i; break; } }
+            if (f == 48 && hn < 48) { f = hn++; ha[f] = addr; hp[f] = cpc; hc[f] = 0; }
+            if (f < 48) { hc[f]++; }
+            if (++tot % 200000u == 0u) {
+                fprintf(stderr, "--- SFRSPIN hist (tot=%lu) top (addr pc cnt) ---\n", tot);
+                for (i = 0; i < hn; i++) {
+                    if (hc[i] > tot / 40u) {
+                        fprintf(stderr, "SFRSPIN %08x pc=%08x cnt=%lu\n", ha[i], hp[i], hc[i]);
+                    }
+                }
+                fflush(stderr);
+            }
+        }
+    }
+
+    /* DIAGNOSTIC (env TC1797_MMIOHIST): histogram MMIO read addresses at phase 3 to
+     * find the peripheral the idle-task walk polls (the runnable that holds the kick
+     * at 2.2ms). The hot address = the poll target. Non-perturbing (device side). */
+    {
+        static int mh = -1;
+        if (mh < 0) { mh = getenv("TC1797_MMIOHIST") ? 1 : 0; }
+        if (mh) {
+            static uint32_t haddr[64]; static unsigned long hcnt[64];
+            static unsigned hn; static unsigned long tot;
+            uint8_t mph = 0; cpu_physical_memory_read(0xD0003643u, &mph, 1);
+            if (mph != 3) { goto mmiohist_done; }
+            if (addr == 0xF0000210u) {
+                static unsigned pn; static uint32_t lastpc;
+                uint32_t cpc = (uint32_t)s->cpu.env.PC;
+                if (cpc != lastpc && pn++ < 40) {
+                    fprintf(stderr, "TIM0POLL pc=%08x\n", cpc);
+                    fflush(stderr);
+                    lastpc = cpc;
+                }
+            }
+            {
+                int i, f = -1;
+                for (i = 0; i < (int)hn; i++) { if (haddr[i] == addr) { f = i; break; } }
+                if (f < 0 && hn < 64) { f = hn++; haddr[f] = addr; hcnt[f] = 0; }
+                if (f >= 0) { hcnt[f]++; }
+                if (++tot % 2000 == 0) {
+                    fprintf(stderr, "--- MMIOHIST(ph3) top (tot=%lu) ---\n", tot);
+                    for (i = 0; i < (int)hn; i++) {
+                        if (hcnt[i] > tot / 100) {
+                            fprintf(stderr, "MMIOHIST addr=%08x cnt=%lu\n", haddr[i], hcnt[i]);
+                        }
+                    }
+                    fflush(stderr);
+                }
+            }
+        }
+        mmiohist_done: ;
+    }
 
     /* DIAGNOSTIC (env TC1797_MOLOG): trace the firmware's reads of MO84 (the diag
      * request MO, 0xF0005A80..0xF0005A9F) -- which register/offset it polls and
@@ -1782,6 +3555,15 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
     /* ── SCU clock / PLL / reset status ── */
     case 0xF0000510: return 0x00000F00;   /* OSCCON: PLLLV/PLLHV/OSC2L/OSC2H */
     case 0xF0000514: return 0xFFFFFFFF;   /* PLLSTAT: all lock flags ready */
+    case 0xF0000520:   /* SCU clock/PLL config register: reflect the firmware's written
+                        * config bits AND assert the "config applied/ready" bit 17 -- the
+                        * firmware (FUN_8009bd54) writes 0xF0000520 |= 0x80ba05 (under ENDINIT)
+                        * then polls bit 17 up to 1ms for the request to take effect. On
+                        * silicon the SCU applies the clock request and sets that bit promptly;
+                        * unmodelled (=0) it eats the full 1ms timeout each call (which, in a
+                        * scheduled task, overruns the 118us idle-kick window -> watchdog 0x3045).
+                        * Reflect+ready is the faithful model (like the PLLSTAT lock flags). */
+        return (s->sfr_shadow[(0xF0000520u - 0xF0000000u) >> 2] & ~0x00020000u) | 0x00020000u;
     case 0xF0000550: return s->scu_rststat; /* RSTSTAT (PORST sticky shadow) */
     case 0xF0000558: return 0x00000000;   /* RSTCON: no pending reset */
     case 0xF0000560: return 0x00000007;   /* PLL-lock OK */
@@ -1879,7 +3661,26 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
      * The ERCOSEK dispatcher polls SRR (bit13) on this node to find pending
      * task-switch work (FUN_801255da / FUN_80124512). Reflect the shadow so the
      * poll sees the request the scheduler set; the systick timer injects it. */
-    case 0xF7E0FFFC: return s->cpu_src;
+    case 0xF7E0FFFC: {
+        static int badsrr_en = -1;
+        if (badsrr_en < 0) badsrr_en = getenv("TC1797_BADSRR") ? 1 : 0;
+        if (badsrr_en && ((s->cpu_src >> 13) & 1u)) {
+            uint8_t nid = 0, cid = 0, ph = 0;
+            cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            cpu_physical_memory_read(0xD0000988u, &nid, 1);
+            cpu_physical_memory_read(0xD0000064u, &cid, 1);
+            if (ph >= 3 && ph < 0x40 && nid == 0) {
+                static unsigned bn;
+                if (bn++ < 30) {
+                    fprintf(stderr, "BADSRR pc=%08x cpu_src=%08x nextid=%u curid=%u "
+                            "icu0=%08x\n", (uint32_t)s->cpu.env.PC & ~0x20000000u,
+                            s->cpu_src, nid, cid, s->icu_pending[0]);
+                    fflush(stderr);
+                }
+            }
+        }
+        return s->cpu_src;
+    }
     default:
         /* EBU / PMU / overlay-control region (0xF8000000+): coherent config
          * read-back. The boot-critical PMU IDs and flash status registers are
@@ -1970,6 +3771,42 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
         if (addr == 0xF0043F10u) {
             s->pcp.rcb = ((uint32_t)val >> 4) & 1u;
             s->pcp.context_model = ((uint32_t)val >> 6) & 3u;
+            /* TEST (env TC1797_PCP_COLDRUN): model the PCP2 cold-start dispatching
+             * its firmware-seeded channels when the engine run-bit (PCP_CS.EN bit0)
+             * is set. MEASURED: ch26 (srpn 0x1a, the only dispatch-state-0 writer)
+             * and ch28 (0x1c) have NO SRC node configured at cold-init (only ch29's
+             * 0xF01013F0 is) and are never triggered by the ADC/GTC chain -- so on
+             * silicon their first run must come from the engine start. With this
+             * firmware's PCP_CS=0x3D000001 (RCB=0) they resume at their seeded CR7
+             * PC (ch26 -> 0x629). This tests whether that one dispatch lets the
+             * firmware's own microcode advance the state machine to flag=1. */
+            if (((uint32_t)val & 1u) && s->pcp_enabled
+                && !getenv("TC1797_NO_COLDRUN")) {
+                /* Faithful form: dispatch exactly the channels the firmware SEEDED
+                 * a resumable context for. A channel's seeded context word0 lives at
+                 * PRAM csa_base + srpn*0x20; its high 16 bits are the resume PC. A
+                 * channel with a valid (non-zero, in-CMEM) seeded PC is one the
+                 * firmware pre-armed to run on engine start -- dispatch it (rcb=0 ->
+                 * it resumes at that PC). Channels with no seeded context (word0=0)
+                 * are skipped. No hardcoded channel list, no fake flag. */
+                for (unsigned srpn = 1; srpn < 64; srpn++) {
+                    uint32_t ctx0 = 0;
+                    cpu_physical_memory_read(PCP_PRAM_BASE + srpn * 0x20u,
+                                             (uint8_t *)&ctx0, 4);
+                    /* A seeded channel's R7 (context word0 low 16) holds DPTR in
+                     * bits[15:8] = the PRAM data page it operates on (page<<6 = byte
+                     * offset). The dispatch-state machine lives at PRAM 0x380/0x382
+                     * = page 0x0e, so the channels seeded to run the gate state
+                     * machine on engine-start are exactly those with DPTR==0x0e.
+                     * (Channels pointed at other data pages are not part of this
+                     * chain and must NOT be force-run -- dispatching all seeded
+                     * channels floods the PCP and breaks the handshake.) */
+                    uint32_t dptr = (ctx0 >> 8) & 0xFFu;
+                    if (dptr == 0x0eu) {
+                        pcp_engine_trigger(&s->pcp, (uint8_t)srpn);
+                    }
+                }
+            }
         }
         return;
     }
@@ -2049,6 +3886,26 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
                             "d6=%08x d15=%08x a11=%08x", (uint32_t)e->PC,
                             e->gpr_d[4], e->gpr_d[5], e->gpr_d[6], e->gpr_d[15],
                             e->gpr_a[11]);
+                /* Dump the exact self-test values so each reset's root is visible:
+                 * #1 0x3026 coding (a70/a71 value+complement, 172ac src, 18a8c marker),
+                 * #2 0x3006 ADC (416f must==1), #3 0x3045 wdog (4037 must<=9, 4039 gate). */
+                uint8_t af = 0, w37 = 0, w39 = 0, w38 = 0, a70 = 0, a71 = 0, a75 = 0;
+                uint8_t ph2 = 0; uint32_t c172 = 0, m18a8c = 0;
+                cpu_physical_memory_read(0xD000416Fu, &af, 1);
+                cpu_physical_memory_read(0xD0004037u, &w37, 1);
+                cpu_physical_memory_read(0xD0004039u, &w39, 1);
+                cpu_physical_memory_read(0xD0004038u, &w38, 1);
+                cpu_physical_memory_read(0xD0018A70u, &a70, 1);
+                cpu_physical_memory_read(0xD0018A71u, &a71, 1);
+                cpu_physical_memory_read(0xD0018A75u, &a75, 1);
+                cpu_physical_memory_read(0xD0018A8Cu, &m18a8c, 4);
+                cpu_physical_memory_read(0xD00172ACu, &c172, 4);
+                cpu_physical_memory_read(0xD0003643u, &ph2, 1);
+                info_report("tc1797:  selftest-state ph=%u | 416f=%02x(adc:want1) | "
+                            "4037=%u(wdog:want<=9) 4039=%02x 4038=%02x | "
+                            "a70=%02x a71=%02x(~a70=%02x) a75=%u 18a8c=%08x 172ac=%08x",
+                            ph2, af, w37, w39, w38, a70, a71, (uint8_t)~a70, a75,
+                            m18a8c, c172);
             }
             /* Surface the firmware's own crash report once. */
             uint32_t p = 0, ra = 0, v = 0, code = 0;
@@ -2056,13 +3913,18 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
             cpu_physical_memory_read(0xD0018AC8, &p, 4);
             /* Only a real fatal has a valid DSPR crash-log pointer; the early
              * clock-config also writes 0xF0000560=2 but with the log ptr still
-             * at its power-on value -- skip that so we report the real fatal. */
-            if (p >= 0xD0000000u && p < 0xD0020000u && !once++) {
+             * at its power-on value -- skip that so we report the real fatal.
+             * Under DTCLOG report EVERY fatal so the reset-loop driver's DTC-code
+             * distribution (0x3026 self-test vs 0x300a cold-init vs 0x3006 gate)
+             * is visible, not only the first one. */
+            if (p >= 0xD0000000u && p < 0xD0020000u) {
                 cpu_physical_memory_read((hwaddr)p + 0x14, &ra, 4);
                 cpu_physical_memory_read((hwaddr)p + 0x18, &v, 4);
                 cpu_physical_memory_read((hwaddr)p + 0x1f, &code, 1);
-                warn_report("tc1797 firmware FATAL: code=0x%02x val=0x%04x "
-                            "from 0x%08x", code & 0xff, v & 0xffff, ra);
+                if (getenv("TC1797_DTCLOG") || !once++) {
+                    warn_report("tc1797 firmware FATAL: code=0x%02x val=0x%04x "
+                                "from 0x%08x", code & 0xff, v & 0xffff, ra);
+                }
             }
             /* Honour the firmware's SCU software-reset (clock-switch + self-test
              * reset-then-skip). Warm reset preserves RAM/DFLASH; the reboot
@@ -2085,8 +3947,18 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
                 }
                 if (rstn < cap) {
                     rstn++;
-                    info_report("tc1797: SCU sw-reset #%d/%d PC=0x%08x",
-                                rstn, cap, (uint32_t)s->cpu.env.PC);
+                    {
+                        /* A[11]=return addr from FUN_800bf97c = the CALLER that decided
+                         * to reset; DAT_d0018ac8 reset-reason struct holds the DTC. */
+                        uint32_t ra = (uint32_t)s->cpu.env.gpr_a[11];
+                        uint32_t rsp = 0, dtc = 0;
+                        cpu_physical_memory_read(0xD0018AC8u, &rsp, 4);
+                        if (rsp >= 0xD0000000u && rsp < 0xD0020000u) {
+                            cpu_physical_memory_read(rsp + 0x18u, &dtc, 2);
+                        }
+                        info_report("tc1797: SCU sw-reset #%d/%d PC=0x%08x caller_A11=0x%08x dtc=0x%04x",
+                                    rstn, cap, (uint32_t)s->cpu.env.PC, ra, dtc);
+                    }
                     s->sw_reset_pending = true;
                     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
                 }
@@ -2114,12 +3986,23 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
     case 0xF010C214:                      /* FCE CRC0 value: write = seed */
         s->fce_crc = (uint32_t)val;
         break;
-    case 0xF010C210: {                    /* FCE CRC0 input: CRC32-Ethernet step */
+    case 0xF010C210: {                    /* FCE CRC0 input: CRC32 step */
         uint32_t v = (uint32_t)val, crc = s->fce_crc;
-        for (int bp = 0; bp < 4; bp++) {
-            crc ^= (v >> (bp * 8)) & 0xFF;
-            for (int i = 0; i < 8; i++) {
-                crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
+        if (getenv("TC1797_FCE_FWD")) {
+            /* TEST: non-reflected CRC32 (poly 0x04C11DB7, MSB-first byte+bit order)
+             * -- the alternative FCE variant if the firmware sets REFIN/REFOUT=0. */
+            for (int bp = 3; bp >= 0; bp--) {
+                crc ^= ((v >> (bp * 8)) & 0xFFu) << 24;
+                for (int i = 0; i < 8; i++) {
+                    crc = (crc << 1) ^ (0x04C11DB7u & (uint32_t)(-(int32_t)((crc >> 31) & 1)));
+                }
+            }
+        } else {
+            for (int bp = 0; bp < 4; bp++) {
+                crc ^= (v >> (bp * 8)) & 0xFF;
+                for (int i = 0; i < 8; i++) {
+                    crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
+                }
             }
         }
         s->fce_crc = crc;
@@ -2145,6 +4028,38 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
          * model needed the forced systick to inject the dispatch; with a real SRN
          * raise the firmware drives its own dispatcher exactly as on hardware.
          */
+        if (getenv("TC1797_DISPSRPN")) {
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            if (ph == 3 && ((uint32_t)val & 0x8000)) {   /* SETR */
+                static unsigned ds;
+                if (ds++ < 40) {
+                    fprintf(stderr, "DISPSRPN srpn=%u ccpn=%u val=%08x\n",
+                            (uint32_t)val & 0xFFu,
+                            FIELD_EX32(s->cpu.env.ICR, ICR, CCPN), (uint32_t)val);
+                    fflush(stderr);
+                }
+            }
+        }
+        if (getenv("TC1797_SRRLOG")) {
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            if (ph >= 3 && ph < 0x40) {
+                uint8_t nid = 0, cid = 0;
+                cpu_physical_memory_read(0xD0000988u, &nid, 1);
+                cpu_physical_memory_read(0xD0000064u, &cid, 1);
+                uint32_t before = s->cpu_src;
+                const char *op = ((uint32_t)val & 0x8000) ? "SETR" :
+                                 ((uint32_t)val & 0x4000) ? "CLRR" : "????";
+                static unsigned sn;
+                /* Flag the illegal state: a SETR leaving SRR=1 while nextid==0 (the
+                 * idle-dispatch trigger). Also flag a CLRR that finds SRR already 0. */
+                if (sn++ < 600) {
+                    fprintf(stderr, "SRRLOG %s val=%08x before=%08x nextid=%u curid=%u%s\n",
+                            op, (uint32_t)val, before, nid, cid,
+                            (((uint32_t)val & 0x8000) && nid == 0) ? "  <<< SETR while nextid=0!" : "");
+                    fflush(stderr);
+                }
+            }
+        }
         tc1797_src_node_write(s, &s->cpu_src, (uint32_t)val, addr);
         break;
     }
@@ -2234,6 +4149,235 @@ static void make_alias(MemoryRegion *mr, const char *name,
     memory_region_add_subregion(get_system_memory(), base, mr);
 }
 
+/* DIAGNOSTIC (env TC1797_SENSORWATCH): an IO overlay over the sensor-source region
+ * 0xD0002B00.. that stores the bytes itself but logs the CPU PC of any write that
+ * makes 2b0c (offset 0x0c) a VALID (!=0xffff) value -- i.e. the ADC/sensor read that
+ * the firmware does via a computed address (which Ghidra can't attribute statically). */
+static uint8_t g_sprobe[0x100];
+static uint64_t sprobe_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint64_t v = 0;
+    if (addr + size <= sizeof(g_sprobe)) {
+        memcpy(&v, g_sprobe + addr, size);
+    }
+    return v;
+}
+static void sprobe_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    TC1797SoCState *s = opaque;
+    if (addr + size <= sizeof(g_sprobe)) {
+        memcpy(g_sprobe + addr, &val, size);
+    }
+    /* watch offset given by TC1797_SPROBE_OFF (default 0x0c=2b0c; 0xd0 = DAT_d0016ed0
+     * when the region base is moved to 0xD0016E00). Logs every distinct writer PC. */
+    {
+        const char *os = getenv("TC1797_SPROBE_OFF");
+        hwaddr woff = os ? (hwaddr)strtoul(os, NULL, 16) : 0x0c;
+        if (addr <= woff && addr + size > woff) {
+            uint32_t pc = (uint32_t)s->cpu.env.PC;
+            /* TC1797_SPROBE_ALL: log EVERY write (value+PC) instead of distinct-PC dedup --
+             * catches a transient bad value a periodic writer would otherwise hide. */
+            if (getenv("TC1797_SPROBE_ALL")) {
+                static unsigned aw;
+                uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+                if (ph == 3 && aw++ < 120) {
+                    fprintf(stderr, "SPROBEALL @+%02x pc=%08x val=%08llx sz=%u (ph=3)\n",
+                            (unsigned)woff, pc, (unsigned long long)(val & 0xFFFFFFFFu), size);
+                    fflush(stderr);
+                }
+            } else {
+                static uint32_t seen[24]; static int nseen;
+                bool found = false;
+                for (int i = 0; i < nseen; i++) {
+                    if (seen[i] == pc) { found = true; break; }
+                }
+                if (!found && nseen < 24) {
+                    seen[nseen++] = pc;
+                    fprintf(stderr, "SPROBE @+%02x DISTINCT writer pc=%08x val=%08llx\n",
+                            (unsigned)woff, pc, (unsigned long long)(val & 0xFFFFFFFFu));
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+}
+static const MemoryRegionOps sprobe_ops = {
+    .read = sprobe_read, .write = sprobe_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+static MemoryRegion g_sprobe_mr;
+
+/* SEGMENT-0 PROBE (env TC1797_SEG0). The OSEK schedule processor fn_800bfaac reads
+ * *(DAT_d00009a4 + 2/9/10) with DAT_d00009a4 == NULL (verified: never written; both
+ * donor snapshots = 0 even at os_running=1). So on silicon it dereferences physical
+ * address 0x00000002/9/A -- segment 0 -- and the os_running START fires on a 0->1 edge
+ * of *(0x9)&1. QEMU leaves segment 0 unmapped (reads 0) so the edge never comes. This
+ * region backs segment 0 with RAM AND logs every access, to settle the question: does
+ * the firmware itself WRITE the OS-object into segment 0 (=> seg0 RAM is the faithful
+ * model), or does it never touch it (=> the pointer must be set by an OSEK init we are
+ * not reaching, and seg0 is the wrong lever)? Diagnostic only -- opt-in, no default change. */
+static uint8_t g_seg0[0x1000];
+static uint64_t seg0_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint64_t v = 0;
+    if (addr + size <= sizeof(g_seg0)) {
+        memcpy(&v, g_seg0 + addr, size);
+    }
+    if (getenv("TC1797_SEG0_RD")) {
+        static unsigned rn;
+        if (rn++ < 200) {
+            TC1797SoCState *s = opaque;
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            fprintf(stderr, "SEG0 RD @%04x sz=%u -> %0*llx pc=%08x ph=%u\n",
+                    (unsigned)addr, size, size * 2, (unsigned long long)v,
+                    (uint32_t)s->cpu.env.PC, ph);
+            fflush(stderr);
+        }
+    }
+    return v;
+}
+static void seg0_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    TC1797SoCState *s = opaque;
+    if (addr + size <= sizeof(g_seg0)) {
+        memcpy(g_seg0 + addr, &val, size);
+    }
+    static unsigned wn;
+    if (wn++ < 400) {
+        uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        fprintf(stderr, "SEG0 WR @%04x sz=%u val=%0*llx pc=%08x ph=%u\n",
+                (unsigned)addr, size, size * 2, (unsigned long long)(val & 0xFFFFFFFFu),
+                (uint32_t)s->cpu.env.PC, ph);
+        fflush(stderr);
+    }
+}
+static const MemoryRegionOps seg0_ops = {
+    .read = seg0_read, .write = seg0_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1, .valid.max_access_size = 4,
+};
+static MemoryRegion g_seg0_mr;
+
+/* POINTER WATCH (env TC1797_P9A4). 16-byte logging-RAM window over DSPR 0xD00009A0..0xAF, to
+ * settle whether DAT_d00009a4 (0xD00009A4) is ever written non-zero. Static analysis found no
+ * resolvable store to it, and both donors read 0 at os_running -- but a *based* store (a loop
+ * "DAT_d00009a4 = obj->next") would be invisible to that analysis. If this catches a non-zero
+ * write, DAT_d00009a4 is a transient loop pointer to a real DSPR object (fn_800bfaac's OS-object
+ * lives in DSPR, not segment 0); if it never fires, segment 0 truly is the object. Donor shows
+ * 0xD00009A0..0xAF all zero at steady state, so a zero-init backing buffer matches silicon. */
+static uint8_t g_p9a4[0x10];
+static uint64_t p9a4_read(void *opaque, hwaddr addr, unsigned size)
+{
+    uint64_t v = 0;
+    if (addr + size <= sizeof(g_p9a4)) {
+        memcpy(&v, g_p9a4 + addr, size);
+    }
+    return v;
+}
+static void p9a4_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    TC1797SoCState *s = opaque;
+    if (addr + size <= sizeof(g_p9a4)) {
+        memcpy(g_p9a4 + addr, &val, size);
+    }
+    /* offset 4 == 0xD00009A4 */
+    if (addr <= 4 && addr + size > 4 && (val & 0xFFFFFFFFu)) {
+        static unsigned wn;
+        if (wn++ < 60) {
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            fprintf(stderr, "P9A4 WRITE 0xD00009A4 <- %08llx (off=%u sz=%u pc~%08x ph=%u)\n",
+                    (unsigned long long)(val & 0xFFFFFFFFu), (unsigned)addr, size,
+                    (uint32_t)s->cpu.env.PC, ph);
+            fflush(stderr);
+        }
+    }
+}
+static const MemoryRegionOps p9a4_ops = {
+    .read = p9a4_read, .write = p9a4_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1, .valid.max_access_size = 4,
+};
+static MemoryRegion g_p9a4_mr;
+
+/* DIAGNOSTIC (env TC1797_ICOUNT_PROF): fine instruction-budget profiler. Samples the guest PC every
+ * ~2us of virtual time (~500 instructions at shift=2 -- far finer than PCHIST's STM-tick sampling),
+ * buckets it by 256-byte PFLASH window, and snapshots the per-bucket counts between consecutive
+ * path2-debounce increments (DAT_d000987c). Output = the exact per-function instruction budget of ONE
+ * OSEK cycle at phase 3, which localizes the shift=2 instruction surplus (the FlexRay/COM inflation).
+ * The vtime timer fires between guest instructions (host-side) so it does NOT add guest instructions
+ * = non-perturbing to the count it measures. Map the top PCs to functions offline (_pchfn.py style). */
+#define ICPROF_NBKT 32768u                       /* 0x80000000..0x80800000 in 256-byte windows */
+static uint32_t *icprof_bkt;
+static uint64_t icprof_total, icprof_other, icprof_base, icprof_isr;
+static uint32_t icprof_last987c = 0xFFFFFFFFu;
+static unsigned icprof_cycn;
+static QEMUTimer *icprof_timer;
+static int64_t  icprof_lastcyc;
+
+static void tc1797_icount_prof(void *opaque)
+{
+    TC1797SoCState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint8_t ph = 0;
+    cpu_physical_memory_read(0xD0003643u, &ph, 1);
+    if (ph == 3 && icprof_bkt) {
+        uint32_t pc = (uint32_t)s->cpu.env.PC;
+        uint8_t ccpn = (uint8_t)(s->cpu.env.ICR & 0xFFu);
+        icprof_total++;
+        if (ccpn == 0) {
+            icprof_base++;
+        } else {
+            icprof_isr++;
+        }
+        if (pc >= 0x80000000u && pc < 0x80800000u) {
+            icprof_bkt[(pc - 0x80000000u) >> 8]++;
+        } else {
+            icprof_other++;
+        }
+        uint32_t c987c = 0;
+        cpu_physical_memory_read(0xD000987Cu, &c987c, 4);
+        if (c987c != icprof_last987c && icprof_last987c != 0xFFFFFFFFu && icprof_total > 50) {
+            uint32_t topidx[12] = { 0 }, topcnt[12] = { 0 };
+            for (uint32_t i = 0; i < ICPROF_NBKT; i++) {
+                uint32_t c = icprof_bkt[i];
+                if (c <= topcnt[11]) {
+                    continue;
+                }
+                int j = 11;
+                while (j > 0 && topcnt[j - 1] < c) {
+                    topcnt[j] = topcnt[j - 1]; topidx[j] = topidx[j - 1]; j--;
+                }
+                topcnt[j] = c; topidx[j] = i;
+            }
+            if (icprof_cycn++ < 80) {
+                uint32_t osekc = 0, d340c = 0; uint8_t a45 = 0;
+                cpu_physical_memory_read(0xD0000964u, &osekc, 4);   /* OSEK counter (FUN_80125044) */
+                cpu_physical_memory_read(0xD000340Cu, &d340c, 2);   /* debounce 340c */
+                cpu_physical_memory_read(0xD0000A45u, &a45, 1);     /* a45 (bit2 gates 340c++) */
+                extern uint64_t g_icprof_cmp0_fires, g_icprof_cmp1_fires;
+                fprintf(stderr, "ICPROF cyc#%u 987c=%u 340c=%u a45b2=%u cmp0f=%llu cmp1f=%llu dur_us=%lld total=%llu base=%llu isr=%llu other=%llu | top:",
+                        icprof_cycn, c987c, d340c, (a45 >> 2) & 1,
+                        (unsigned long long)g_icprof_cmp0_fires, (unsigned long long)g_icprof_cmp1_fires,
+                        (long long)((now - icprof_lastcyc) / 1000),
+                        (unsigned long long)icprof_total, (unsigned long long)icprof_base,
+                        (unsigned long long)icprof_isr, (unsigned long long)icprof_other);
+                g_icprof_cmp0_fires = g_icprof_cmp1_fires = 0;
+                (void)osekc;
+                for (int k = 0; k < 12 && topcnt[k]; k++) {
+                    fprintf(stderr, " %08x=%u", 0x80000000u + (topidx[k] << 8), topcnt[k]);
+                }
+                fprintf(stderr, "\n");
+                fflush(stderr);
+            }
+            icprof_lastcyc = now;
+            memset(icprof_bkt, 0, ICPROF_NBKT * sizeof(uint32_t));
+            icprof_total = icprof_base = icprof_isr = icprof_other = 0;
+        }
+        icprof_last987c = c987c;
+    }
+    timer_mod(icprof_timer, now + 2000);         /* ~2us = ~500 instr at shift=2 */
+}
+
 static void tc1797_soc_realize(DeviceState *dev, Error **errp)
 {
     TC1797SoCState *s = TC1797_SOC(dev);
@@ -2283,6 +4427,31 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     make_alias(&s->dflash1_a, "tc1797.dflash1.cached", &s->dflash1, 0x8FE10000UL);
     tc1797_seed_dflash_bank(memory_region_get_ram_ptr(&s->dflash0), 0x0001);
     tc1797_seed_dflash_bank(memory_region_get_ram_ptr(&s->dflash1), 0x0002);
+    /*
+     * FAITHFUL CALIBRATION (env TC1797_DFLASH_FILE=<path>): instead of the synthetic
+     * coding seed, load a REAL DFLASH/EEPROM dump (e.g. ecu_eeprom_ref.bin, 0x10000 =
+     * bank0[0:0x8000] + bank1[0x8000:0x10000]). The firmware's calibration apply-steps
+     * (watchdog DAT_d0016ed0, ADC-done 416f, coding complement) are gated on a VALID
+     * cal in DFLASH; the synthetic seed passes the coding scanner but not the full cal,
+     * so those writers stay gated. A real cal dump is the un-hacky way to un-gate them.
+     */
+    {
+        const char *df = getenv("TC1797_DFLASH_FILE");
+        if (df) {
+            FILE *f = fopen(df, "rb");
+            if (f) {
+                uint8_t *b0 = memory_region_get_ram_ptr(&s->dflash0);
+                uint8_t *b1 = memory_region_get_ram_ptr(&s->dflash1);
+                size_t n0 = fread(b0, 1, 0x8000, f);
+                size_t n1 = fread(b1, 1, 0x8000, f);
+                fclose(f);
+                info_report("tc1797: DFLASH loaded from %s (bank0=%zu bank1=%zu bytes)",
+                            df, n0, n1);
+            } else {
+                warn_report("tc1797: TC1797_DFLASH_FILE=%s could not be opened", df);
+            }
+        }
+    }
 
     /*
      * SRAM at 0xAFE80000..0xAFE81FFF (8 KB). The boot RAM-integrity self-test
@@ -2320,6 +4489,55 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
      * the sibling testers (func_0xa0073e82/eb4) that read nearby sources also pass.
      */
     make_ram(&s->seg7, "tc1797.seg7", 0x7FFF0000UL, 0x10000);
+    /*
+     * The BMW E2E CRC8 lookup table lives in seg7 on silicon: the COM Rx validator
+     * FUN_80067768 computes the per-frame CRC as table[idx] reading the 256-byte table
+     * based at 0x7FFF940C, and compares it to the frame's byte0. That table is the
+     * SAE-J1850 CRC8 (poly 0x1D) -- byte-identical to the const the linker also placed
+     * at PFLASH 0x80031BE4. QEMU's blank seg7 made every lookup return 0, so the
+     * firmware computed CRC=0 for every frame and REJECTED all E2E-protected messages
+     * (computed 0 != frame byte0) -> COM signal sources stayed 0xffff -> engine-health
+     * 4f6 never set -> 4041=0 -> promote oscillated -> stuck at phase 3. Seed the real
+     * table (the firmware's own, generated identically) so E2E validates faithfully.
+     * The RAM-cell test that also reads seg7 (0x7FFFB24C) is value-immaterial, so this
+     * does not perturb it.
+     */
+    {
+        uint8_t *s7 = memory_region_get_ram_ptr(&s->seg7);
+        for (int i = 0; i < 256; i++) {
+            uint8_t c = (uint8_t)i;
+            for (int b = 0; b < 8; b++) {
+                c = (c & 0x80) ? (uint8_t)((c << 1) ^ 0x1D) : (uint8_t)(c << 1);
+            }
+            s7[0x940C + i] = c;   /* 0x7FFF940C + i */
+        }
+        /* The integrity CRC32 FUN_80019358 loads a 16-entry nibble table from seg7
+         * 0x7FFF82F8 (reflected CRC32, poly 0xEDB88320 -- same poly the DFLASH coding CRC
+         * uses). Blank seg7 -> zero table -> the integrity check (FUN_8001bd76/c196) computes
+         * a wrong CRC -> the caller software-resets the ECU (~154ms, the phase-3 reset loop).
+         * Seed the firmware's own table so the integrity check passes faithfully. */
+        for (int i = 0; i < 16; i++) {
+            uint32_t c = (uint32_t)i;
+            for (int b = 0; b < 4; b++) {
+                c = (c & 1u) ? (c >> 1) ^ 0xEDB88320u : (c >> 1);
+            }
+            s7[0x82F8 + i*4 + 0] = (uint8_t)(c & 0xFF);
+            s7[0x82F8 + i*4 + 1] = (uint8_t)((c >> 8) & 0xFF);
+            s7[0x82F8 + i*4 + 2] = (uint8_t)((c >> 16) & 0xFF);
+            s7[0x82F8 + i*4 + 3] = (uint8_t)((c >> 24) & 0xFF);
+        }
+        /* DIAGNOSTIC ROOT-CAUSE TEST (env TC1797_GRPSEED): the COM active-IPDU-group word at
+         * seg7 0x7FFF9244 (= *DAT_d0001cbc) is NEVER written by the firmware in QEMU -> it
+         * stays 0 -> every COM Rx message is gated out (per-msg group-mask & 0 == 0) -> the
+         * engine-CAN messages 0x12f/0x328/0x388 (MO33/51/57) are never processed -> the COM
+         * indication cb_8009c6e2 never fires -> d00 stays 0xff -> engine-health 4f6 unset ->
+         * 4041=0 -> promote stalls -> no phase 4. Seeding it to all-groups-active CONFIRMS
+         * whether this gate is THE blocker. (A faithful fix makes the COM group-start run.) */
+        if (getenv("TC1797_GRPSEED")) {
+            s7[0x9244] = 0xFF;
+            s7[0x9245] = 0xFF;
+        }
+    }
 
     /* Peripheral/SFR space: native model (SCU clock/PLL/reset done; the rest
      * read 0 + logged as the P2 work list). Replaces the unimplemented stub. */
@@ -2407,6 +4625,45 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
                 " fPCP=%" PRIu64 " fSTM=%" PRIu64 " MHz (STM %u ns/tick)",
                 s->f_sys / 1000000, s->f_cpu / 1000000, s->f_pcp / 1000000,
                 s->f_stm / 1000000, s->stm_ns_per_tick);
+    if (getenv("TC1797_SENSORWATCH")) {
+        const char *sb = getenv("TC1797_SPROBE_BASE");
+        hwaddr base = sb ? (hwaddr)strtoul(sb, NULL, 16) : 0xD0002B00u;
+        memory_region_init_io(&g_sprobe_mr, OBJECT(s), &sprobe_ops, s,
+                              "tc1797.sprobe", sizeof(g_sprobe));
+        memory_region_add_subregion_overlap(get_system_memory(), base,
+                                             &g_sprobe_mr, 10);
+    }
+
+    /* Segment-0 OS-object region. fn_800bfaac (ERCOSEK task[1]) reads the OS-object via
+     * DAT_d00009a4 == NULL, i.e. at physical segment 0; both donor snapshots prove silicon
+     * reads seg0[9]=0x01 there (DAT_d000400c=0x01), so segment 0 is a real, firmware-written
+     * RAM region on silicon -- the firmware's own descriptor loop populates it at ph<=2 and the
+     * time-service task reads it at ph>=3. TC1797_SEG0_IO selects the slow logging-MMIO variant
+     * (diagnostic); the default TC1797_SEG0 path backs it with fast RAM so the dispatch is not
+     * starved by per-access MMIO traps. */
+    if (getenv("TC1797_SEG0")) {
+        const char *sz = getenv("TC1797_SEG0_SZ");
+        uint64_t s0sz = sz ? strtoull(sz, NULL, 0) : 0x40u;   /* default: just the OS-object */
+        if (s0sz < 0x10) s0sz = 0x10;
+        if (s0sz > sizeof(g_seg0)) s0sz = sizeof(g_seg0);
+        if (getenv("TC1797_SEG0_IO")) {
+            memory_region_init_io(&g_seg0_mr, OBJECT(s), &seg0_ops, s,
+                                  "tc1797.seg0", s0sz);
+        } else {
+            memory_region_init_ram(&g_seg0_mr, OBJECT(s), "tc1797.seg0",
+                                   s0sz, &error_fatal);
+        }
+        memory_region_add_subregion_overlap(get_system_memory(), 0x00000000u,
+                                             &g_seg0_mr, 10);
+    }
+
+    /* Pointer watch on 0xD00009A4 (see p9a4_ops). Opt-in; tiny logging window over DSPR. */
+    if (getenv("TC1797_P9A4")) {
+        memory_region_init_io(&g_p9a4_mr, OBJECT(s), &p9a4_ops, s,
+                              "tc1797.p9a4", sizeof(g_p9a4));
+        memory_region_add_subregion_overlap(get_system_memory(), 0xD00009A0u,
+                                             &g_p9a4_mr, 10);
+    }
 
     s->stm_cmp0 = 0xFFFFFFFF;      /* STM compare regs default all-ones (bridge) */
     s->stm_cmp1 = 0xFFFFFFFF;
@@ -2419,6 +4676,20 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     s->stm_cmp_deadline[0] = INT64_MAX;   /* edge-on-match: no compare armed yet */
     s->stm_cmp_deadline[1] = INT64_MAX;
     s->stm_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_stm_tick, s);
+
+    /* Diagnostic heartbeat (env TC1797_HBLOG): observe the post-~121ms freeze without gdb perturbation. */
+    if (getenv("TC1797_HBLOG")) {
+        s->hb_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_hb_tick, s);
+        timer_mod(s->hb_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 5000000);
+    }
+
+    /* Instruction-budget profiler (see tc1797_icount_prof). Opt-in; allocates the bucket array
+     * and arms the ~2us vtime sampler. */
+    if (getenv("TC1797_ICOUNT_PROF")) {
+        icprof_bkt = g_malloc0(ICPROF_NBKT * sizeof(uint32_t));
+        icprof_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_icount_prof, s);
+        timer_mod(icprof_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 2000);
+    }
 
     /* SSC (SPI) per-transfer latency: model the PCP shift time so the SSC
      * completion interrupt fires at a bounded rate (instead of storming back-to-
@@ -2441,6 +4712,7 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
      * sequence time; env TC1797_ADC_CONV_NS overrides. See tc1797_adc_conv_done. */
     s->adc_done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_adc_conv_done, s);
     memset(s->adc_done_deadline, 0, sizeof(s->adc_done_deadline));
+    s->gpta_cmp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_gpta_cmp_tick, s);
     {
         const char *e = getenv("TC1797_ADC_CONV_NS");
         s->adc_conv_ns = e ? (int64_t)strtoll(e, NULL, 0) : 50000;
@@ -2460,10 +4732,36 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
      * single-slot clear). */
     tricore_icu_ack = tc1797_icu_service_ack;
     tricore_icu_ack_ctx = s;
+    /* RFE re-arbitrate hook: OPT-IN (TC1797_RFEARB), experimental. Faithful TC1.3.1 continuous
+     * arbitration -- on interrupt return re-present the highest pending SRN against the lowered
+     * CCPN. MEASURED REDUNDANT in the current build (TC1797_RFELOG, 2026-06-13): at every RFE
+     * with SRPN-1 pending the state is ALREADY takeable (PIPN=1, HARD=1, IE=1, CCPN=0) via the
+     * existing raise_srpn->irq_bh and service_ack re-arbitrate paths, and the dispatch IS
+     * delivered (cid cycles to the idle base). So this does NOT fix the phase-3 watchdog 0x3045
+     * -- that root is the prio-9 master task (which calls the kick + drives the promote) being
+     * activated far too slowly (~42ms; schedule-table rate), NOT SRPN-1 dispatch delivery, which
+     * works. Kept as an opt-in harness; dispatch-loop hazard gated in op_helper (rfe_old_ccpn>1). */
+    if (getenv("TC1797_RFEARB")) {
+        tricore_icu_rfe = tc1797_icu_rfe;
+        tricore_icu_rfe_ctx = s;
+    }
     s->cpu_src = 0;
     s->osek_rr = 0;
     s->osek_phase4 = false;
     s->osek_tick_ns = 1000000 / ARRAY_SIZE(tc1797_osek_tick_prios);
+    /* DIAGNOSTIC (env TC1797_TICKNS): override the forced-systick inter-fire spacing.
+     * The schedule-cursor (prio-9 master/watchdog) is driven by the SRPN-8 sub-rate of
+     * this round-robin; the default 333us => SRPN-8 every ~1ms drives the cursor ~8x too
+     * slow vs the firmware's self-armed CMP0 deadlines (watchdog 0x3045 + slow debounce).
+     * Lowering this tests whether a finer cursor cadence lets the debounce complete and
+     * reach phase 4 -- confirming the cursor cadence is THE remaining blocker. */
+    {
+        const char *tn = getenv("TC1797_TICKNS");
+        if (tn) {
+            int64_t v = (int64_t)strtoll(tn, NULL, 0);
+            if (v >= 5000) { s->osek_tick_ns = v; }   /* floor 5us to avoid flooding */
+        }
+    }
     s->osek_t0_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     /* Bring-up knobs (env): the forced OSEK systick is OPT-IN (TC1797_SYSTICK=1)
      * -- with the SSC PCP-completion model the boot now reaches a STABLE phase 3
@@ -2473,12 +4771,30 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
      * to continue the phase 3 -> 4 promotion work. TC1797_SYSTICK_MINPHASE sets
      * the RTOS phase gate (default 3); TC1797_SYSTICK_FLOOR_MS the virtual-time
      * floor (default 50 ms). */
-    s->osek_enabled = (getenv("TC1797_SYSTICK") != NULL);
+    /* FAITHFUL FIX (2026-06-14): the forced OSEK systick is the QEMU model of the
+     * periodic system tick the ERCOSEK kernel needs but cannot arm itself pre-phase-4
+     * (it never programs STM CMP0 until promoted -- the chicken-and-egg). It must be
+     * ON by default: without it the phase-3 watchdog kick (FUN_800c3c1a) is starved of
+     * a consistent ~333us tick, the kick gap exceeds the 1.9ms window, cnt37 (0xD0004037)
+     * grows past 9, and FUN_800c3c68 software-resets the ECU (DTC 0x3045) every ~165ms --
+     * the persistent phase-3 reset loop. With the systick on, the boot holds phase 3
+     * (only the early coding/ADC self-test transients reset, then it stabilises) WITHOUT
+     * the TC1797_KICKCAL poke. Disable with TC1797_NO_SYSTICK for A/B. */
+    s->osek_enabled = (getenv("TC1797_NO_SYSTICK") == NULL);
     {
         const char *mp = getenv("TC1797_SYSTICK_MINPHASE");
         const char *fl = getenv("TC1797_SYSTICK_FLOOR_MS");
         s->osek_minphase = mp ? (uint8_t)strtoul(mp, NULL, 0) : 3;
         s->osek_floor_ns = (fl ? (int64_t)strtoll(fl, NULL, 0) : 50) * 1000000LL;
+    }
+    s->sample_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_sample_tick, s);
+    if (getenv("TC1797_SAMPLE")) {
+        timer_mod(s->sample_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 20000);
+    }
+    s->freeze_timer = timer_new_ns(QEMU_CLOCK_REALTIME, tc1797_freeze_dump, s);
+    if (getenv("TC1797_FREEZEDUMP")) {
+        timer_mod(s->freeze_timer,
+                  qemu_clock_get_ns(QEMU_CLOCK_REALTIME) + 800000000);
     }
     s->osek_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_osek_tick, s);
     if (s->osek_enabled) {
@@ -2609,16 +4925,25 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
         tc1797_can_selftest(tc1797_can_tx, s);
     }
 
-    /* ADC0/1/2 result-register model. Defaults to silicon reset (RESRn read 0);
-     * set TC1797_ADC_DEFAULT=<0..4095> to give every channel a plausible
-     * "sensor present" idle count so the firmware's scale path sees valid
-     * inputs once it runs conversions (the faithful alt to DSPR injection). */
+    /* ADC0/1/2 result-register model. Faithful key-on-engine-off baseline:
+     * at key-on the analog sensor supplies are energized, so every ADC channel
+     * reads a VALID quiescent mid-scale count (RESRn VF=1, RESULT=0x800), NOT the
+     * silicon-power-on 0 (which the firmware reads as the 0xffff "no-conversion"
+     * sentinel = sensor absent/faulted). With valid inputs the firmware's own
+     * read+scale+window-check path completes: sensor mirrors -> ~0x7fff (valid,
+     * != 0xffff), the per-channel diagnostic monitors debounce to OK (0x04), the
+     * status bytes clear, and the COM health message (event 0x17) + the phase-4
+     * promote chain (4f6 -> 4041 -> eb1 -> e7e) can close. This is the chip's
+     * real I/O at rest -- NOT a DSPR poke. TC1797_ADC_DEFAULT=<n> overrides the
+     * count; TC1797_ADC_OFF restores the silicon-reset-reads-0 behaviour for A/B. */
     tc1797_adc_init(&s->adc, TC1797_ADC0_BASE);
     {
         const char *d = getenv("TC1797_ADC_DEFAULT");
-        if (d) {
-            tc1797_adc_set_default(&s->adc, (int)strtol(d, NULL, 0));
+        int count = d ? (int)strtol(d, NULL, 0) : 0x800;
+        if (getenv("TC1797_ADC_OFF")) {
+            count = -1;                 /* silicon reset: no synthesized word */
         }
+        tc1797_adc_set_default(&s->adc, count);
     }
     if (getenv("TC1797_ADCTEST")) {
         tc1797_adc_selftest();
@@ -2632,9 +4957,11 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     tc1797_fadc_init(&s->fadc, TC1797_FADC_BASE);
     {
         const char *d = getenv("TC1797_FADC_DEFAULT");
-        if (d) {
-            tc1797_fadc_set_default(&s->fadc, (int)strtol(d, NULL, 0));
+        int count = d ? (int)strtol(d, NULL, 0) : 0x100;   /* quiescent knock level */
+        if (getenv("TC1797_ADC_OFF")) {
+            count = -1;
         }
+        tc1797_fadc_set_default(&s->fadc, count);
     }
     if (getenv("TC1797_FADCTEST")) {
         tc1797_fadc_selftest();
@@ -2813,6 +5140,21 @@ static void tc1797_cpu_reset(void *opaque)
     TC1797MachineState *ms = TC1797_MACHINE(opaque);
     CPUState *cs = CPU(&ms->soc.cpu);
 
+    if (getenv("TC1797_RSTLOG")) {
+        static unsigned rn;
+        /* reset-reason struct @ *0xD0018AC8: +0x14=caller retaddr, +0x18=DTC, +0x1f=reason byte */
+        uint32_t sp = 0, caller = 0; uint16_t dtc = 0; uint8_t rb = 0, ph = 0;
+        cpu_physical_memory_read(0xD0018AC8u, &sp, 4);
+        if (sp >= 0xD0000000u && sp < 0xD0020000u) {
+            cpu_physical_memory_read(sp + 0x14u, &caller, 4);
+            cpu_physical_memory_read(sp + 0x18u, &dtc, 2);
+            cpu_physical_memory_read(sp + 0x1fu, &rb, 1);
+        }
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        fprintf(stderr, "CPURESET #%u PC=0x%08x caller=0x%08x DTC=0x%04x reason=0x%02x ph=%u\n",
+                rn++, (uint32_t)ms->soc.cpu.env.PC, caller, dtc, rb, ph);
+        fflush(stderr);
+    }
     cpu_reset(cs);
     cpu_set_pc(cs, ms->boot_entry);
 
@@ -2829,6 +5171,29 @@ static void tc1797_cpu_reset(void *opaque)
         CPUTriCoreState *env = &ms->soc.cpu.env;
         env->BTV = 0xA0000100;   /* Base Trap Vector Table Pointer (TC1797.REGS reset) */
         env->ISP = 0x00000100;   /* Interrupt Stack Pointer (TC1797.REGS reset) */
+        /*
+         * OCDS / debug-active indicators. The MEVD17 firmware DISABLES its real-time
+         * task-deadline watchdog (FUN_800c3c68, DTC 0x3045) when running under an
+         * on-chip debugger: FUN_800df7c6 arms it only if !(DBGSR.DE && OSCU_OSTATE.bit0
+         * && (DAT_d0019a9d==0x55 || SWEVT[2:0]==2)). That watchdog measures task
+         * inter-dispatch latency against a sub-2ms deadline, which a non-cycle-accurate
+         * emulator (icount, not silicon cycle timing) cannot meet -- exactly the case a
+         * hardware debugger creates (breakpoints/single-step perturb timing), so the
+         * chip's own logic suppresses the false-trip. QEMU IS that debug environment
+         * (and the donor os_running DSPR was itself captured via OCDS), so present the
+         * chip as debug-attached: DBGSR.DE=1 (QEMU implements no debug events, so this
+         * has no other side effect -- see translate.c DEBUG) and SWEVT[2:0]=2. OSTATE.bit0
+         * is already set by the firmware's own OCDS counter (the ERCOSEK system counter).
+         * This is the chip's documented behaviour, not a poke of the watchdog state.
+         * Env-gated (TC1797_OCDS) while the rest of the timing cascade (DTC 0x3014
+         * FUN_800752a6, 0x3006 PCP gate) is still unresolved, so the default build and
+         * the validated UDS/CAN paths are unaffected; enabling it eliminates DTC 0x3045
+         * and lets the boot run past the deadline watchdog.
+         */
+        if (getenv("TC1797_OCDS")) {
+            env->DBGSR |= MASK_DBGSR_DE;
+            env->SWEVT = (env->SWEVT & ~7u) | 2u;
+        }
     }
 
     /*
@@ -2853,6 +5218,8 @@ static void tc1797_cpu_reset(void *opaque)
         s->stm_cmp_deadline[1] = INT64_MAX;
         s->ssc_tb[0] = 0;
         s->ssc_tb[1] = 0;
+        s->ssc_prev[0] = 0;
+        s->ssc_prev[1] = 0;
         s->ssc_src[0][0] = s->ssc_src[0][1] = 0;
         s->ssc_src[1][0] = s->ssc_src[1][1] = 0;
         /* Drop any ADC conversions left in flight from the previous boot so they
@@ -2891,14 +5258,49 @@ static void tc1797_cpu_reset(void *opaque)
             timer_mod(s->bootstrap_timer,
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 20 * 1000000LL);
         }
-        /* RSTSTAT reset-cause: cold/power-on = PORST (bit16); a firmware SW
-         * reset = the SW-reset cause (bit3) with PORST clear, so the reboot
-         * takes the warm path and skips the already-done clock-config. */
+        /* RSTSTAT reset-cause. FAITHFUL FIX (2026-06-14): on real TC1797 the PORST
+         * status bit (bit16) is STICKY (write-1-to-clear) -- a software reset sets the
+         * SW-reset cause (bit3) but does NOT clear PORST. The clock-init at 0x80018f16
+         * reads RSTSTAT[16] and, when PORST is SET, JUMPS PAST the warm clock-reconfig
+         * (the path that ends in the FUN_8001c820 / fn_80019268 "configure-then-reset"
+         * write of 0xF0000560=2). Clearing PORST on a SW reset (the old `=0x08`) made the
+         * firmware re-enter that reconfig on every warm boot -> endless reset loop at
+         * phase 3. Keep PORST asserted across the SW reset (PORST|SWRST) so the firmware
+         * sees "already powered+configured", skips the reconfig, and the boot settles. */
         if (s->sw_reset_pending) {
-            s->scu_rststat = 0x00000008;   /* SWRST */
+            s->scu_rststat = 0x00010008;   /* PORST (sticky) | SWRST */
             s->sw_reset_pending = false;
         } else {
-            s->scu_rststat = 0x00010000;   /* PORST */
+            s->scu_rststat = 0x00010000;   /* PORST (cold power-on) */
+        }
+        /* DECISIVE persistence probe: read the self-test persistence markers
+         * straight from DSPR RAM at the start of the new boot (before crt0 runs).
+         * If the no-init region 0xD0018A70+ persists across the warm reset, a76
+         * should hold 0x96 (written by selftest_80148da4's test path on the prior
+         * boot) and a8c should hold 0xFFFFFF00; if the reset wiped DSPR they read
+         * the 0xFF power-on prefill. This settles the reset-loop root cause. */
+        if (getenv("TC1797_MARKERLOG")) {
+            uint8_t *dram = memory_region_get_ram_ptr(&s->dspr);
+            if (dram) {
+                uint32_t a8c = ldl_le_p(dram + 0x18A8C);
+                /* Read the firmware crash block (preserved in DSPR) for the reset
+                 * that just fired: ptr at 0xD0018AC8, [+0x14]=caller retaddr,
+                 * [+0x18]=DTC val, [+0x1f]=reason code. Gives a clean per-reset
+                 * (DTC,caller) histogram to pinpoint each looping self-test. */
+                uint32_t p = ldl_le_p(dram + 0x18AC8);
+                uint32_t ra = 0, val = 0; uint8_t code = 0;
+                if (p >= 0xD0000000u && p < 0xD0020000u) {
+                    uint32_t off = p - 0xD0000000u;
+                    ra   = ldl_le_p(dram + off + 0x14);
+                    val  = ldl_le_p(dram + off + 0x18);
+                    code = dram[off + 0x1f];
+                }
+                info_report("tc1797: [reset#] a76=%02x a70=%02x a73=%02x rst=%08x "
+                            "| DTC code=%02x val=%04x from=%08x",
+                            dram[0x18A76], dram[0x18A70], dram[0x18A73],
+                            s->scu_rststat, code, val & 0xffff, ra);
+                (void)a8c;
+            }
         }
     }
 }

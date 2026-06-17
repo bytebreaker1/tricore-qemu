@@ -62,6 +62,22 @@ typedef struct Tc1797Gpta {
     uint64_t gt_t0_ns[TC1797_GPTA_GT_SLOTS]; /* per global-timer free-run epoch */
     uint32_t gt_base[TC1797_GPTA_GT_SLOTS];  /* GTTIMx value seeded at epoch    */
     uint8_t  gt_run[TC1797_GPTA_GT_SLOTS];   /* 1 once firmware seeded the timer */
+    /*
+     * GTC compare-match scheduling. A Global Timer Cell in compare mode fires its
+     * service request when its GTTIM reaches GTCXR. The firmware programs one by
+     * writing GTCXR (the future compare value) then arming the cell's SRC node
+     * (SRE=1, TOS, no SETR) immediately after -- e.g. the GPTA-init state machine
+     * (PCP ch29) does this to schedule the next step of its key-on/engine-off
+     * timer sequence. We pair the two adjacent writes and fire the SRC node when
+     * the compare elapses (a capture-driven node has no preceding GTCXR, so it is
+     * not scheduled and only fires on a real input edge -- faithful).
+     */
+#define TC1797_GPTA_NCMP 32
+    uint8_t  cmp_pend;                   /* per-module bit: a GTCXR (real compare) was just written */
+    uint32_t cmp_pend_target[3];         /* per-module GTCXR compare value just written */
+    int64_t  cmp_deadline[TC1797_GPTA_NCMP];  /* abs ns; 0 = slot free */
+    uint8_t  cmp_srpn[TC1797_GPTA_NCMP];
+    uint8_t  cmp_tos[TC1797_GPTA_NCMP];
     GptaRouteFn route_fn;
     void *route_opaque;
     uint32_t base;                       /* block base (relocatable per part) */
@@ -78,6 +94,11 @@ void tc1797_gpta_write(Tc1797Gpta *g, uint32_t addr, uint32_t val, uint64_t now_
  * TOS (PCP or CPU). No-op for an un-armed (SRE=0) node — faithful to silicon.
  */
 void tc1797_gpta_capture(Tc1797Gpta *g, uint32_t cell_off, uint32_t value);
+
+/* Fire any GTC compare-match SRC node whose deadline has elapsed (routing it per
+ * TOS), and return the number of compares still pending (so the SoC can keep its
+ * poll timer armed). Returns 0 when there is nothing left to fire. */
+int tc1797_gpta_compare_poll(Tc1797Gpta *g, uint64_t now_ns);
 
 void tc1797_gpta_selftest(GptaRouteFn route_fn, void *opaque);
 

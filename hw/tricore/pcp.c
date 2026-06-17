@@ -20,12 +20,21 @@
 #include "exec/memattrs.h"         /* MEMTXATTRS_UNSPECIFIED */
 #include "system/address-spaces.h" /* address_space_memory */
 #include "system/memory.h"         /* address_space_rw */
+#include "hw/core/cpu.h"           /* current_cpu, cpu_exit */
 #include "pcp.h"
 
 #define MASK32 0xFFFFFFFFu
 
 /* ── shared bus: every PCP access goes to the guest system memory, so the PCP
  * and the TriCore CPU see exactly the same bytes (no mirror). Little-endian. ── */
+static uint8_t g_pcp_srpn = 0xFF;   /* current channel SRPN, for PCPRD diagnostic */
+/* True while a PCP channel is actively executing microcode (its stores go through
+ * pcp_write -> address_space_rw -> the SoC MMIO handlers IN THIS call stack). The SSC0
+ * MSDI handler uses it to tell PCP-thread TBUF writes from CPU-thread ones, so it can
+ * drop PCP writes while the firmware drives the MSDI directly (mode-2 poll), where on
+ * silicon the PCP receive node is disabled (TOS=0). BQL serialises the two threads, so
+ * this plain flag is consistent: it is only ever true inside a PCP-thread MMIO write. */
+bool g_pcp_in_exec = false;
 static uint32_t pcp_read(hwaddr addr, unsigned size)
 {
     uint8_t b[4] = {0};
@@ -34,6 +43,17 @@ static uint32_t pcp_read(hwaddr addr, unsigned size)
     uint32_t v = 0;
     for (unsigned i = 0; i < size; i++) {
         v |= (uint32_t)b[i] << (8 * i);
+    }
+    {   /* trace reads during the channel given by TC1797_PCPRD (srpn, e.g. 0x1d/0x2b) */
+        const char *rds = getenv("TC1797_PCPRD");
+        if (rds && g_pcp_srpn == (uint8_t)strtoul(rds, NULL, 0)) {
+            static unsigned rc;
+            if (rc++ < 120) {
+                fprintf(stderr, "PCPRD[%02x] [%08x].%u = %08x\n", g_pcp_srpn,
+                        (uint32_t)(addr & MASK32), size, v);
+                fflush(stderr);
+            }
+        }
     }
     return v;
 }
@@ -46,9 +66,15 @@ static void pcp_write(hwaddr addr, unsigned size, uint32_t val)
     }
     if (getenv("TC1797_PCPWLOG")) {
         static unsigned wc;
-        if (wc++ < 400) {
-            fprintf(stderr, "PCPW: [0x%08x].%u = 0x%08x\n",
-                    (uint32_t)(addr & MASK32), size, val);
+        uint32_t a = (uint32_t)(addr & MASK32);
+        /* Flag DSPR writes (0xD0...) -- if channel 43 (0x2b) writes the MSDI req+0x10
+         * status byte (DSPR), the drain completes; if it only writes PRAM (0xF005..),
+         * req+0x10 is never cleared -> fn_80083610 never sets 0xD00040A2 -> phase-2 wedge. */
+        bool dspr = (a >= 0xD0000000u && a < 0xD0020000u)
+                  || (a >= 0xF0050E00u && a < 0xF0050F00u);  /* +ADC0 PRAM result region */
+        if (wc++ < 400 && (g_pcp_srpn == 0x2bu || dspr)) {
+            fprintf(stderr, "PCPW[srpn=%02x]: [0x%08x].%u = 0x%08x%s\n",
+                    g_pcp_srpn, a, size, val, dspr ? "  <-- DSPR" : "");
             fflush(stderr);
         }
     }
@@ -73,7 +99,15 @@ static inline void pcp_setf(PcpCore *c, int b, int v)
 static inline uint8_t pcp_dptr(PcpCore *c) { return (c->R[7] >> 8) & 0xFF; }
 static inline uint32_t pcp_pram_ea(PcpCore *c, uint32_t off6)
 {
-    return PCP_PRAM_BASE + (((uint32_t)pcp_dptr(c) << 6) + off6);
+    /* UM 10.12.6.2: "Effective PRAM Address[13:0] = <R7.DPTR> << 6 + #offset6,
+     * yielding a 14-bit WORD address (16 Kwords / 64 Kbytes)." PRAM is WORD-
+     * addressed, so the FPI byte address = PRAM_BASE + (word_address << 2).
+     * QEMU previously omitted the <<2, so every channel's LD.P/ST.P read/wrote
+     * the wrong PRAM location (off by 4x) -- e.g. the SSC0 MSDI channel read its
+     * transfer descriptor from 0xF0050233 (stale .data-init) instead of the live
+     * 0xF00508CC. The PCP self-test missed this because store+load used the same
+     * wrong address (self-consistent). */
+    return PCP_PRAM_BASE + ((((uint32_t)pcp_dptr(c) << 6) + off6) << 2);
 }
 
 static void set_logic_flags(PcpCore *c, uint32_t res)
@@ -164,6 +198,7 @@ static void pcp_restore_context(PcpCore *c, uint8_t srpn, uint32_t csa_base,
     }
     c->R[7] &= 0xFFFF;                  /* live R7 upper 16 bits read 0 */
     c->cur_srpn = srpn;
+    g_pcp_srpn = srpn;
 }
 
 static void pcp_save_context(PcpCore *c, uint8_t srpn, uint32_t csa_base,
@@ -260,12 +295,14 @@ static void pcp_step(PcpCore *c)
             return;
         }
         if (sub == 2) {                             /* exit */
+            /* UM 10.18.15: EXIT is UNCONDITIONAL. "generate an interrupt request
+             * (INT=1) if condition CONDCB is true" -- the condition gates ONLY the
+             * interrupt, NOT the exit. (QEMU previously skipped the whole exit when
+             * the condition was false, so a channel with a conditional EXIT wrongly
+             * kept executing instead of terminating.) */
             unsigned cc = hw & 0xF;
-            if (!eval_cond(cc, R[7])) {
-                return;
-            }
             c->ex_st  = (hw >> 10) & 1;
-            c->ex_int = (hw >> 9) & 1;
+            c->ex_int = ((hw >> 9) & 1) && eval_cond(cc, R[7]);
             c->ex_ep  = (hw >> 8) & 1;
             c->ex_ec  = (hw >> 7) & 1;
             if (c->ex_ec) {
@@ -276,6 +313,7 @@ static void pcp_step(PcpCore *c)
             if (c->ex_st) {
                 pcp_setf(c, F_CEN, 0);
             }
+            c->ex_r6 = R[6];     /* SR descriptor for EXIT.INT routing (UM 10.6) */
             c->exited = true;
             return;
         }
@@ -347,8 +385,8 @@ static void pcp_step(PcpCore *c)
         case 0x7: { uint32_t res = R[Rb] | R[Ra]; R[Rb] = res; set_logic_flags(c, res); break; } /* or */
         case 0x8: { uint32_t res = R[Rb] ^ R[Ra]; R[Rb] = res; set_logic_flags(c, res); break; } /* xor */
         case 0xC: { uint32_t res = R[Ra]; R[Rb] = res; set_logic_flags(c, res); break; } /* mov */
-        case 0x9: { uint32_t ea = PCP_PRAM_BASE + (((uint32_t)pcp_dptr(c) << 6) + (R[Ra] & 0x3F)); uint32_t v = pcp_read(ea, 4); R[Rb] = v; set_logic_flags(c, v); break; } /* ld.p */
-        case 0xA: { uint32_t ea = PCP_PRAM_BASE + (((uint32_t)pcp_dptr(c) << 6) + (R[Ra] & 0x3F)); pcp_write(ea, 4, R[Rb]); break; } /* st.p */
+        case 0x9: { uint32_t ea = pcp_pram_ea(c, R[Ra] & 0x3F); uint32_t v = pcp_read(ea, 4); R[Rb] = v; set_logic_flags(c, v); break; } /* ld.p (word-addressed, UM 10.12.6.2) */
+        case 0xA: { uint32_t ea = pcp_pram_ea(c, R[Ra] & 0x3F); pcp_write(ea, 4, R[Rb]); break; } /* st.p (word-addressed, UM 10.12.6.2) */
         case 0xD: { unsigned bit = R[Ra] & 0x1F; R[Rb] = (R[Rb] & ~(1u << bit)) | ((uint32_t)pcp_flag(c, F_C) << bit); break; } /* inb */
         case 0xE: { uint32_t a = R[Ra], res = (a == 0) ? 0x20 : (31 - __builtin_clz(a)); R[Rb] = res; set_logic_flags(c, res); break; } /* pri */
         default: goto illegal;
@@ -501,6 +539,7 @@ unsigned pcp_core_run_channel(PcpCore *c, uint8_t srpn, uint32_t csa_base,
     pcp_restore_context(c, srpn, csa_base, rcb, model);
     c->exited = false;
     unsigned ran = 0;
+    g_pcp_in_exec = true;
     while (ran < max_insns) {
         pcp_step(c);
         ran++;
@@ -508,6 +547,7 @@ unsigned pcp_core_run_channel(PcpCore *c, uint8_t srpn, uint32_t csa_base,
             break;
         }
     }
+    g_pcp_in_exec = false;
     pcp_save_context(c, srpn, csa_base, c->exited ? c->ex_ep : 1, model);
     if (out_exit_int) {
         *out_exit_int = c->exited && c->ex_int;
@@ -551,8 +591,26 @@ static void *pcp_thread_fn(void *arg)
         unsigned ran = pcp_core_run_channel(&e->core, srpn, e->csa_base, eff_rcb,
                                             e->context_model, e->max_insns,
                                             &exit_int);
-        if (exit_int && e->irq_fn) {
-            e->irq_fn(e->irq_opaque, srpn);     /* PCP -> CPU service request */
+        if (exit_int) {
+            /* UM 10.6: EXIT.INT raises a Service Request at the SRPN/TOS held in
+             * R6 (CPPN[31:24]|SRPN[23:16]|TOS[15:14]|CNT1[11:0]). TOS=1 -> PCP
+             * (re-enter the PICU = another channel); TOS=0 -> CPU interrupt.
+             * QEMU previously only did the CPU case at the channel's OWN srpn --
+             * the missing PCP self-request edge is how the firmware's inter-channel
+             * chains (e.g. ch26->ch15) propagate on silicon. */
+            uint32_t r6   = e->core.ex_r6;
+            unsigned tos  = (r6 >> 14) & 0x3u;
+            unsigned dsrpn = (r6 >> 16) & 0xFFu;
+            if (getenv("TC1797_PCPLOG")) {
+                fprintf(stderr, "PCPLOG: ch %u EXIT.INT r6=%08x TOS=%u dsrpn=%u\n",
+                        srpn, r6, tos, dsrpn);
+                fflush(stderr);
+            }
+            if (getenv("TC1797_PCP_SELFREQ") && tos == 1u && dsrpn != 0u) {
+                pcp_engine_trigger(e, (uint8_t)dsrpn);   /* PCP -> PCP self-request */
+            } else if (e->irq_fn) {
+                e->irq_fn(e->irq_opaque, srpn);          /* PCP -> CPU service request */
+            }
         }
         if (getenv("TC1797_PCPLOG")) {
             uint32_t flag = pcp_read(0xD000416F, 1) & 0xFF;
@@ -577,6 +635,8 @@ static void *pcp_thread_fn(void *arg)
     return NULL;
 }
 
+static void pcp_drain_bh_fn(void *opaque);
+
 void pcp_engine_init(PcpEngine *e, uint32_t csa_base, int context_model,
                      bool rcb, PcpIrqFn irq_fn, void *opaque)
 {
@@ -589,6 +649,8 @@ void pcp_engine_init(PcpEngine *e, uint32_t csa_base, int context_model,
     e->irq_opaque = opaque;
     qemu_mutex_init(&e->mutex);
     qemu_cond_init(&e->cond);
+    /* Deterministic-drain bottom-half (used by the default synchronous PCP path). */
+    e->drain_bh = qemu_bh_new(pcp_drain_bh_fn, e);
 }
 
 void pcp_engine_reset(PcpEngine *e)
@@ -627,11 +689,100 @@ void pcp_engine_stop(PcpEngine *e)
     e->started = false;
 }
 
+/* Run ONE queued channel inline (caller holds BQL). Mirrors the worker-thread
+ * body (started/rcb disposition, EXIT.INT self-request/CPU-IRQ, stats), minus the
+ * bql_lock/mutex (the synchronous caller already holds the BQL and is the only
+ * thread touching the queue). */
+static void pcp_run_one_sync(PcpEngine *e, uint8_t srpn)
+{
+    bool chan_started = (e->started_mask[srpn >> 5] >> (srpn & 31)) & 1u;
+    bool eff_rcb = e->rcb && !chan_started;
+    e->started_mask[srpn >> 5] |= 1u << (srpn & 31);
+
+    g_pcp_in_exec = true;
+    bool exit_int = false;
+    unsigned ran = pcp_core_run_channel(&e->core, srpn, e->csa_base, eff_rcb,
+                                        e->context_model, e->max_insns, &exit_int);
+    g_pcp_in_exec = false;
+
+    e->st_channels++;
+    e->st_insns += ran;
+    if (e->core.exited) { e->st_exits++; }
+    if (exit_int) {
+        e->st_irqs++;
+        uint32_t r6   = e->core.ex_r6;
+        unsigned tos  = (r6 >> 14) & 0x3u;
+        unsigned dsrpn = (r6 >> 16) & 0xFFu;
+        if (getenv("TC1797_PCP_SELFREQ") && tos == 1u && dsrpn != 0u) {
+            if (e->qcount < sizeof(e->queue)) {          /* self-request: enqueue */
+                e->queue[e->qtail] = (uint8_t)dsrpn;
+                e->qtail = (e->qtail + 1) & 0xFF;
+                e->qcount++;
+            }
+        } else if (e->irq_fn) {
+            e->irq_fn(e->irq_opaque, srpn);              /* PCP -> CPU service request */
+        }
+    }
+}
+
+/* Bottom-half: drain the whole PCP queue (BQL held in BH context). Self/SSC
+ * re-triggers enqueued during a channel run are picked up by this same loop. */
+static void pcp_drain_bh_fn(void *opaque)
+{
+    PcpEngine *e = opaque;
+    if (e->in_drain) {
+        return;
+    }
+    e->in_drain = true;
+    while (e->qcount > 0) {
+        uint8_t s = e->queue[e->qhead];
+        e->qhead = (e->qhead + 1) & 0xFF;
+        e->qcount--;
+        pcp_run_one_sync(e, s);
+    }
+    e->in_drain = false;
+}
+
 void pcp_engine_trigger(PcpEngine *e, uint8_t srpn)
 {
     if (srpn == 0) {
         return;
     }
+    /* DETERMINISM FIX (default-on; opt-out TC1797_PCP_ASYNC): run the PCP channel
+     * SYNCHRONOUSLY, inline on the calling (vCPU/timer) thread, instead of handing it
+     * to a worker thread. The worker thread is scheduled by the host OS on wall-clock
+     * time, so under -icount its channel effects (PRAM/TBUF writes, SRN raises) land at
+     * NON-DETERMINISTIC points in the vCPU's virtual timeline -- the root of the boot's
+     * run-to-run non-determinism (phase 2 vs 3) and the erratic schedule. On silicon the
+     * PCP arbitrates the shared LMB against the CPU; running it inline at the trigger
+     * (the CPU already holds the BQL during the MMIO write that set the SRN) is the
+     * icount-deterministic model. Re-entrant self/SSC triggers are queued and drained by
+     * the active loop. */
+    static int sync = -1;
+    if (sync < 0) { sync = getenv("TC1797_PCP_ASYNC") ? 0 : 1; }
+    if (sync && e->drain_bh) {
+        /* Enqueue and run via a bottom-half: the BH fires in the BQL (vCPU) thread
+         * AFTER the triggering MMIO write completes, so the PCP's own MMIO can't
+         * re-enter the region the CPU is mid-write to (QEMU blocks re-entrant IO),
+         * while staying on the vCPU's deterministic timeline (no wall-clock worker
+         * thread). The enqueue is BQL-serialised (single vCPU thread). */
+        if (e->qcount < sizeof(e->queue)) {
+            e->queue[e->qtail] = srpn;
+            e->qtail = (e->qtail + 1) & 0xFF;
+            e->qcount++;
+        }
+        qemu_bh_schedule((QEMUBH *)e->drain_bh);
+        /* Force the vCPU to leave its current TB so the drain BH fires PROMPTLY (right
+         * after the triggering instruction) instead of at the end of a long execution
+         * slice -- on silicon the PCP runs in parallel, so a many-instruction-late drain
+         * makes the firmware see stale PCP results. cpu_exit just ends the slice; the
+         * already-executed MMIO write is unaffected. */
+        if (getenv("TC1797_PCP_PROMPT") && current_cpu) {
+            cpu_exit(current_cpu);
+        }
+        return;
+    }
+    /* legacy async path (worker thread) */
     qemu_mutex_lock(&e->mutex);
     if (e->qcount < sizeof(e->queue)) {
         e->queue[e->qtail] = srpn;
@@ -652,11 +803,12 @@ void pcp_selftest(void)
      *   st.pi R3, [DPTR+0]       ; 0x54C0  (am2 op0xA, Rb3, off6 0)
      *   exit  INT=1              ; 0x1200  (am0 sub=exit, INT bit9)
      * Context (Full): 8 words at PRAM_BASE + SRPN*32; R7 = DPTR(0x10)<<8, so the
-     * store lands at PRAM_BASE + (0x10<<6) = 0xF0050400.
+     * store lands at the WORD address (0x10<<6), i.e. PRAM_BASE + ((0x10<<6)<<2)
+     * = 0xF0051000 (UM 10.12.6.2: PRAM is word-addressed).
      */
     static const uint16_t prog[3] = { 0x98D5, 0x54C0, 0x1200 };
     uint32_t ctx = PCP_PRAM_BASE + 2u * 8u * 4u;   /* SRPN 2, Full = 8 words */
-    uint32_t tgt = PCP_PRAM_BASE + (0x10u << 6);   /* = 0xF0050400 */
+    uint32_t tgt = PCP_PRAM_BASE + ((0x10u << 6) << 2);   /* word-addressed = 0xF0051000 */
 
     for (int i = 0; i < 3; i++) {
         pcp_write(PCP_CMEM_BASE + 8 + i * 2, 2, prog[i]);
@@ -702,7 +854,7 @@ void pcp_thread_selftest(void)
 {
     static const uint16_t prog[3] = { 0x98D5, 0x54C0, 0x1200 };
     uint32_t ctx = PCP_PRAM_BASE + 2u * 8u * 4u;   /* SRPN 2, Full = 8 words */
-    uint32_t tgt = PCP_PRAM_BASE + (0x10u << 6);   /* = 0xF0050400 */
+    uint32_t tgt = PCP_PRAM_BASE + ((0x10u << 6) << 2);   /* word-addressed = 0xF0051000 */
 
     for (int i = 0; i < 3; i++) {
         pcp_write(PCP_CMEM_BASE + 8 + i * 2, 2, prog[i]);

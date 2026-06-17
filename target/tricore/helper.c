@@ -107,9 +107,58 @@ static int get_physical_address(CPUTriCoreState *env, hwaddr *physical,
 {
     *physical = address & 0xFFFFFFFF;
 
-    /* Protection disabled => flat, all-permitted (unchanged fast path). */
+    /* Faithful unmapped-fetch trap: on TC1797 the low segments 0..7 (< 0x80000000) are NOT backed by
+     * memory -- an INSTRUCTION FETCH there raises a bus/fetch trap on silicon. QEMU's flat 1:1 map
+     * would instead let the CPU read the unassigned 0x0000 as NOPs and "march" through segment 0
+     * forever (the OSEK dispatcher's idle path calli's a garbage/NULL body at nextid=0 with the
+     * slot[0]=0xffffffff guard -> jumps to a low address). Deny the fetch (-> trap) so the firmware's
+     * trap handler runs cleanly instead of marching. DATA accesses are left flat (NULL data reads still
+     * read 0, as the firmware's tolerant paths expect). Applies even with protection disabled. */
+    /* The unmapped low segments 0..7 (< 0x80000000) are not backed by memory on TC1797: ANY access --
+     * fetch OR data -- raises a bus/access trap on silicon. The OSEK idle path relies on this: the
+     * dispatcher's prio-0 guard has TCB pointer 0xffffffff, and it derefs 0xffffffff+offset (= 0x18 /
+     * 0xf after 32-bit wrap, all segment 0); on silicon that read traps into the idle/trap handler.
+     * QEMU's flat 1:1 map instead returns 0, so the guard read yields 0, the idle-skip fails, and the
+     * dispatcher calli's garbage (the march / fetch-trap-reset). Deny segment 0..7 entirely so the
+     * deref traps faithfully. Gated by env TC1797_SEG0_TRAP while we validate it doesn't break tolerated
+     * NULL reads elsewhere (e.g. DAT_d00009bc=NULL); the fetch-only trap stays unconditional. */
+    {
+        static int s0 = -1;
+        if (s0 < 0) {
+            s0 = getenv("TC1797_SEG0_TRAP") ? 1 : 0;
+        }
+        if ((uint32_t)address < 0x80000000u
+            && (access_type == MMU_INST_FETCH || s0)) {
+            return TLBRET_NOMATCH;
+        }
+    }
+
+    /* TC1797 segment-15 (0xF0000000..0xFFFFFFFF) has only specific peripheral
+     * sub-ranges decoded; the very TOP word (0xFFFFFFFC..0xFFFFFFFF) is unmapped, so a
+     * CPU data access there raises a bus/access trap on silicon. The OSEK idle TCB uses
+     * task[0][0]=0xFFFFFFFF as its context sentinel and the dispatcher does
+     * task[0][1]=*(0xFFFFFFFF); on silicon that load TRAPS (so the store is suppressed and
+     * task[0][1] keeps its valid StartOS init value &idle_ctx=0xD0000970, and idle
+     * dispatches cleanly). QEMU's flat SFR stub instead RETURNS data there -> task[0][1] is
+     * corrupted to 0 -> calli 0 -> MPX reset that wipes the engine-health debounce. Deny
+     * the unmapped top word so the load faults faithfully. (Gated while validating.) */
+    {
+        static int tt = -1;
+        if (tt < 0) {
+            tt = getenv("TC1797_TOPTRAP") ? 1 : 0;
+        }
+        if (tt && access_type != MMU_INST_FETCH
+            && (uint32_t)address >= 0xFFFFFFFCu) {
+            return TLBRET_NOMATCH;
+        }
+    }
+
+    /* Protection disabled => flat, all-permitted -- EXCEPT no PAGE_EXEC for the low segments 0..7 (so a
+     * data access there does not cache a RWX page that a later fetch would hit, bypassing the fetch
+     * trap above). Data read/write stay flat unless TC1797_SEG0_TRAP denied them just above. */
     if (!(env->SYSCON & MASK_SYSCON_PRO_TEN)) {
-        *prot = PAGE_READ | PAGE_WRITE | PAGE_EXEC;
+        *prot = PAGE_READ | PAGE_WRITE
+              | (((uint32_t)address >= 0x80000000u) ? PAGE_EXEC : 0);
         return TLBRET_MATCH;
     }
 

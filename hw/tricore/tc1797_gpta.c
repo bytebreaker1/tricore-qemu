@@ -41,15 +41,22 @@ static int gpta_gttim_slot(uint32_t ip_addr)
     return -1;
 }
 
-/* Global-timer tick period in virtual ns. The GPTA bus clock that drives the
- * global timers is ~90 MHz on this part; exact rate only affects how fast the
- * count advances, not whether the firmware's timer polls progress, so it is
- * tunable (TC1797_GTTIM_NS) with a faithful default. */
+/* Global-timer (GTTIM0) tick period in virtual ns.
+ *
+ * GTTIM0 is NOT the raw GPTA bus clock -- it is that clock divided by the GPTA
+ * clock-control chain the firmware programs (FDR reload 0x80e4 = x228/1024, then
+ * CKBCTR DFA06=3 = /8) off fSYS=90 MHz, giving 2.5049 MHz = 399.22 ns/tick. The
+ * firmware's clock-supervision self-test FUN_800752a6 cross-checks the STM
+ * (TIM0, 11 ns) against GTTIM0 (0xF00018E8) every cycle: if the two diverge from
+ * the expected ~36:1 ratio it counts a fault and, after N, software-resets the
+ * ECU (DTC-0x3014). The old 11 ns default made GTTIM0 run 36x too fast, so the
+ * cross-check saw a 1:1 ratio and reset every ~400 ms. Default to the faithful
+ * 399 ns so the supervision passes exactly as on silicon (override TC1797_GTTIM_NS). */
 static inline uint32_t gpta_gttim_period_ns(void)
 {
     const char *e = getenv("TC1797_GTTIM_NS");
-    uint32_t ns = e ? (uint32_t)strtoul(e, NULL, 0) : 11u;   /* ~90 MHz */
-    return ns ? ns : 11u;
+    uint32_t ns = e ? (uint32_t)strtoul(e, NULL, 0) : 399u;  /* GTTIM0 = 2.5049 MHz */
+    return ns ? ns : 399u;
 }
 
 uint32_t tc1797_gpta_read(Tc1797Gpta *g, uint32_t addr, uint64_t now_ns)
@@ -98,6 +105,52 @@ void tc1797_gpta_write(Tc1797Gpta *g, uint32_t addr, uint32_t val, uint64_t now_
     if (idx < TC1797_GPTA_NREG) {
         g->shadow[idx] = val;
         g->written[idx] = 1;
+    }
+    /*
+     * GTC compare-match pairing (see Tc1797Gpta). A write of a real compare value
+     * to a GTCXR register marks the module "compare pending" with that target;
+     * the next PCP-routed SRC-node arm (SRE=1, TOS=1, SETR=0, SRPN!=0) in that
+     * module is the cell's request node, scheduled to fire when the module's
+     * global timer (GTTIM0) reaches the target -- the real compare-match instant,
+     * which preserves the firmware's intended fire ORDER across the chain. A
+     * value of 0 or 0xFFFF is a disable/sentinel, not a compare. A capture-driven
+     * SRC arm has no preceding GTCXR and is left to fire on a real input edge.
+     */
+    {
+        uint32_t mod = (addr - TC1797_GPTA_LO) / GPTA_MOD_STRIDE;
+        uint32_t im  = (addr - TC1797_GPTA_LO) & (GPTA_MOD_STRIDE - 1u);
+        if (mod < 3u && im >= GPTA_GTC_OFF && im < GPTA_GTC_OFF + 32u * 8u
+            && ((im - GPTA_GTC_OFF) % 8u) == 4u
+            && (val & 0x00FFFFFFu) != 0u && (val & 0xFFFFu) != 0xFFFFu) {
+            g->cmp_pend |= (uint8_t)(1u << mod);          /* GTCXR real compare value */
+            g->cmp_pend_target[mod] = val & 0x00FFFFFFu;
+        } else if (mod < 3u && im >= GPTA_SRC_TOP - 37u * 4u && im <= GPTA_SRC_TOP
+                   && (g->cmp_pend & (1u << mod))
+                   && (val & 0x1000u) && (val & 0x0400u)       /* SRE=1, TOS=1 */
+                   && !(val & 0x8000u) && (val & 0xFFu) != 0u) { /* SETR=0, SRPN!=0 */
+            g->cmp_pend &= (uint8_t)~(1u << mod);
+            int64_t deadline;
+            if (getenv("TC1797_GPTA_CMP_REL")) {          /* real GTTIM0-relative match */
+                uint32_t per = gpta_gttim_period_ns();
+                uint32_t g0  = g->gt_run[mod * 2] ?
+                    (uint32_t)((g->gt_base[mod * 2]
+                        + (now_ns - g->gt_t0_ns[mod * 2]) / per) & 0x00FFFFFFu) : 0u;
+                uint64_t ticks = (uint64_t)((g->cmp_pend_target[mod] - g0) & 0x00FFFFFFu);
+                deadline = (int64_t)now_ns + (int64_t)(ticks * (uint64_t)per);
+            } else {                                      /* fixed compare latency (default) */
+                const char *e = getenv("TC1797_GPTA_CMP_NS");
+                int64_t lat = e ? (int64_t)strtoll(e, NULL, 0) : 50000;
+                deadline = (int64_t)now_ns + (lat < 1000 ? 1000 : lat);
+            }
+            for (int i = 0; i < TC1797_GPTA_NCMP; i++) {
+                if (g->cmp_deadline[i] == 0) {
+                    g->cmp_deadline[i] = deadline;
+                    g->cmp_srpn[i] = val & 0xFFu;
+                    g->cmp_tos[i]  = (val >> 10) & 1u;
+                    break;
+                }
+            }
+        }
     }
     /* Seeding a global timer (re)starts its free-run from the written value at
      * this instant; reads thereafter advance it at the bus rate (see read). */
@@ -162,6 +215,25 @@ void tc1797_gpta_capture(Tc1797Gpta *g, uint32_t cell_off, uint32_t value)
     if (((src >> 12) & 1u) && g->route_fn) {            /* SRE armed */
         g->route_fn(g->route_opaque, src & 0xFFu, (src >> 10) & 1u);  /* TOS */
     }
+}
+
+int tc1797_gpta_compare_poll(Tc1797Gpta *g, uint64_t now_ns)
+{
+    int pending = 0;
+    for (int i = 0; i < TC1797_GPTA_NCMP; i++) {
+        if (g->cmp_deadline[i] == 0) {
+            continue;
+        }
+        if ((int64_t)now_ns >= g->cmp_deadline[i]) {
+            g->cmp_deadline[i] = 0;                 /* compare elapsed: fire the SR */
+            if (g->route_fn) {
+                g->route_fn(g->route_opaque, g->cmp_srpn[i], g->cmp_tos[i]);
+            }
+        } else {
+            pending++;
+        }
+    }
+    return pending;
 }
 
 /* ───────────────────────── opt-in self-test ─────────────────────────────── */

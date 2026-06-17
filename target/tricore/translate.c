@@ -47,13 +47,91 @@ static int tc_dbg_enabled(void)
     static int v = -1;
     if (v < 0) {
         v = (getenv("TC1797_DBG") || getenv("TC1797_DISP")
-             || getenv("TC1797_INJECT") || getenv("TC1797_HIJACK")) ? 1 : 0;
+             || getenv("TC1797_INJECT") || getenv("TC1797_HIJACK")
+             || getenv("TC1797_FATLOG") || getenv("TC1797_ARMLOG")
+             || getenv("TC1797_TASKLOG") || getenv("TC1797_MARCHLOG")
+             || getenv("TC1797_CALSEED") || getenv("TC1797_PH4FN")
+             || getenv("TC1797_COLDLOG") || getenv("TC1797_WDLOG")
+             || getenv("TC1797_KICKCAL2") || getenv("TC1797_IDLEPROF")) ? 1 : 0;
     }
     return v;
 }
 static inline bool tc_dbg_watch(uint32_t pc)
 {
-    return pc == 0x801256c8u   /* ERCOSEK scheduler `calli a15` (task-entry dispatch) */
+    {   /* TC1797_WDLOG: watch ONLY the two watchdog fns (low overhead) so the emulation
+         * stays fast enough to reach phase 3 where they run. */
+        static int wl = -1;
+        if (wl < 0) {
+            wl = getenv("TC1797_WDLOG") ? 1 : 0;
+        }
+        if (wl) {
+            uint32_t n = pc & ~0x20000000u;   /* normalise uncached seg-A alias 0xA->0x8 */
+            return n == 0x800c3c1au || n == 0x800c3c68u || n == 0x80081870u;
+        }
+    }
+    {   /* TC1797_IDLEPROF: watch the prio-1 idle-list runnable entries to find the one
+         * holding the ~2.2ms wait (the kick-delaying peripheral poll). */
+        static int ip = -1;
+        if (ip < 0) ip = getenv("TC1797_IDLEPROF") ? 1 : 0;
+        if (ip) {
+            uint32_t n = pc & ~0x20000000u;
+            return n == 0x8010d8bau || n == 0x800c3c3cu || n == 0x8033bc24u
+                || n == 0x8036bc44u || n == 0x80119a7cu || n == 0x800c0300u;
+        }
+    }
+    /* MARCH catcher (env TC1797_MARCHLOG): any PC below flash (segments 0-7) is the
+     * dispatcher's garbage-calli MARCH -- log it + the live dispatch state once. */
+    {
+        static int ml = -1;
+        if (ml < 0) {
+            ml = getenv("TC1797_MARCHLOG") ? 1 : 0;
+        }
+        if (ml && pc >= 0x1000u && pc < 0x80000000u) {
+            return true;
+        }
+    }
+    {   /* TC1797_CALSEED: seed the d6f4 calibration source right before FUN_800e0856 copies it, so the
+         * firmware reads the chip's real calibration instead of QEMU's blank-DFLASH zero (beats the
+         * periodic re-load that the STM-tick seed can't outrun). */
+        static int cs = -1;
+        if (cs < 0) {
+            cs = getenv("TC1797_CALSEED") ? 1 : 0;
+        }
+        if (cs && (pc == 0x800e0856u    /* FUN_800e0856: d6f4 config copy */
+                || pc == 0x800e006eu    /* FUN_800e006e: config validator #1 */
+                || pc == 0x800dfe42u    /* FUN_800dfe42: config validator #2 */
+                || pc == 0x8014065au    /* FUN_8014065a: reads 4f6 status byte for 4041 */
+                || pc == 0x801291fau)) {/* FUN_801291fa: 4f6 sensor compute; reset health ctr (sim event 0x17) */
+            return true;
+        }
+    }
+    return pc == 0x800002e8u   /* StartOS caller of cold-init FUN_8000123c [COLDLOG] */
+        || pc == 0x8000123cu   /* cold-init FUN_8000123c entry [COLDLOG] */
+        || pc == 0x800012d2u   /* FUN_800012d2 [COLDLOG] */
+        || pc == 0x800013ceu   /* FUN_800013ce [COLDLOG] */
+        || pc == 0x8000136au   /* FUN_8000136a [COLDLOG] */
+        || pc == 0x80001160u   /* FUN_80001160 STM CMP0 config (the target) [COLDLOG] */
+        || pc == 0x800010eau   /* FUN_800010ea (before the conditional call) [COLDLOG] */
+        || pc == 0x800fdfa4u   /* fn_800fdec0 per-node condition `calli a15` [PH4FN] */
+        || pc == 0x801256c8u   /* ERCOSEK scheduler `calli a15` (task-entry dispatch) */
+        || pc == 0x800bf97cu   /* fatal handler FUN_800bf97c entry (cat=d4 code=d5 ra=a11) */
+        || pc == 0x800f7540u   /* FUN_800f7540: arms the gate (0xD0004163=1)  [ARMLOG] */
+        || pc == 0x800f7754u   /* FUN_800f7754: ch28 arm caller             [ARMLOG] */
+        || pc == 0x800fbce4u   /* FUN_800fbce4: arm ch28 SRC 0xF01013F4     [ARMLOG] */
+        || pc == 0x800f939eu   /* FUN_800f939e: ch26 arm-gate               [ARMLOG] */
+        || pc == 0x800fbb46u   /* FUN_800fbb46: arm ch26 SRC 0xF01013EC     [ARMLOG] */
+        || pc == 0x800fbafeu   /* FUN_800fbafe: the DTC-0x3006 gate         [ARMLOG] */
+        || pc == 0x80081a0eu   /* pump-task body (calls FUN_800f76f0 gate-pump) [TASKLOG] */
+        || pc == 0x8008317au   /* ch28-task body (calls FUN_800f7754)          [TASKLOG] */
+        || pc == 0x80082492u   /* master periodic task caller_80082492         [TASKLOG] */
+        || pc == 0x80082986u   /* master-task ACTIVATOR stub (Table-B handler) [TASKLOG] */
+        || pc == 0x80083156u   /* ch28-task ACTIVATOR stub (Table-B handler)   [TASKLOG] */
+        || pc == 0x801199d4u   /* fn_801199d4 phase-gated NextScheduleTable advancer [TASKLOG] */
+        || pc == 0x80125332u   /* NextScheduleTable FUN_80125332 (table advance) [TASKLOG] */
+        || pc == 0x800f76f0u   /* FUN_800f76f0 gate-pump entry                 [TASKLOG] */
+        || pc == 0x800fbb24u   /* gate FATAL call site (inside FUN_800fbafe)   [TASKLOG] */
+        || pc == 0x800f7368u   /* gate THUNK (j 0x800fbafe), via fnptr table @0x80061f6c [TASKLOG] */
+        || pc == 0x800bb400u   /* PCP-START FUN_800bb400 (idx3 of the init-seq array)  [TASKLOG] */
         || pc == 0x800bfaacu   /* counter tick handler fn_800bfaac (counter-object inject) */
         || pc == 0x8012459au   /* OSEK dispatcher calli a4 (periodic-task hijack) */
         || pc == 0x80121cf6u   /* diag task FUN_80121cf6 (hijacked) */
@@ -62,6 +140,9 @@ static inline bool tc_dbg_watch(uint32_t pc)
         || pc == 0x80096968u   /* sensor/diag poll ch10 FUN_80096968 */
         || pc == 0x8011caeeu   /* diag-drain caller FUN_8011caee */
         || pc == 0x800dd0e8u   /* diag task FUN_800dd0e8 (session/channel log) */
+        || pc == 0x800c3c1au   /* watchdog kick FUN_800c3c1a (DAT_d00019c0 service) [WDLOG] */
+        || pc == 0x800c3c68u   /* watchdog check FUN_800c3c68 (DTC 0x3045-47)       [WDLOG] */
+        || pc == 0x8007fa92u   /* FUN_8007f9be reads DAT_d0016ed0 (kick-alarm period) [KICKCAL2] */
         || pc == 0x800dc44cu;  /* diag drain FUN_800dc44c */
 }
 
@@ -104,6 +185,16 @@ typedef struct DisasContext {
     int priv;
     uint64_t features;
     uint32_t icr_ie_mask, icr_ie_offset;
+    /*
+     * Cycle-accurate timing: extra virtual-time "ticks" this TB should consume
+     * beyond the 1-tick-per-instruction the generic translator bills. On
+     * TC1.3.1 instructions have variable cycle costs (loads, context save/
+     * restore, mul/div ...); a flat per-instruction icount makes the firmware
+     * lose the init-vs-STM-timer races it wins on silicon. We accumulate the
+     * per-instruction extra cycles here and deplete the icount budget by this
+     * amount at TB end so the virtual clock advances by cycles, not insns.
+     */
+    uint32_t extra_cycles;
 } DisasContext;
 
 static int has_feature(DisasContext *ctx, int feature)
@@ -238,11 +329,33 @@ static void generate_trap(DisasContext *ctx, int class, int tin);
 
 /* Functions for load/save to/from memory */
 
+/*
+ * TC1.3.1 data-access alignment: the core forces the effective address of a
+ * word/half/double access to the natural boundary by ignoring the low address
+ * bit(s) (the architecture leaves an unaligned EA's low bits don't-care, and the
+ * TC1797 implementation truncates them). QEMU's generic qemu_ld instead performs a
+ * literal unaligned access, which for an EA at the very top of memory (e.g. the
+ * OSEK idle-TCB sentinel read ld.w [0xFFFFFFFF]) WRAPS the 32-bit boundary and
+ * splices in segment-0 bytes, corrupting the loaded word. Mask the EA to the
+ * access size so the load matches silicon. Byte accesses are unaffected.
+ */
+static void gen_align_ea(TCGv_i32 ea, MemOp mop)
+{
+    unsigned sz = mop & MO_SIZE;          /* MO_8=0, MO_16=1, MO_32=2, MO_64=3 */
+    if (sz != MO_8) {
+        tcg_gen_andi_i32(ea, ea, ~((1u << sz) - 1u));
+    }
+}
+
 static void gen_offset_ld(DisasContext *ctx, TCGv_i32 r1, TCGv_i32 r2,
                           int16_t con, MemOp mop)
 {
     TCGv_i32 temp = tcg_temp_new_i32();
     tcg_gen_addi_i32(temp, r2, con);
+    /* TC1.3.1 force-alignment (default-on; A/B opt-out TC1797_NO_FORCEALIGN). */
+    static int fa = -1;
+    if (fa < 0) { fa = getenv("TC1797_NO_FORCEALIGN") ? 0 : 1; }
+    if (fa) { gen_align_ea(temp, mop); }
     tcg_gen_qemu_ld_i32(r1, temp, ctx->mem_idx, mop);
 }
 
@@ -8540,6 +8653,58 @@ static void tricore_tr_init_disas_context(DisasContextBase *dcbase,
         ctx->icr_ie_mask = R_ICR_IE_13_MASK;
         ctx->icr_ie_offset = R_ICR_IE_13_SHIFT;
     }
+    ctx->extra_cycles = 0;
+}
+
+/*
+ * Per-instruction EXTRA cycle cost (beyond the 1 the generic translator already
+ * bills via tb->icount). TC1.3.1 instruction timing: loads, context save/restore
+ * (call/ret/bisr/...), and mul/div take several cycles; plain ALU/move take 1.
+ * The flat env-tunable term lets the faithful CPU:STM ratio -- which is NOT an
+ * integer icount shift (fCPU 180MHz : fSTM 90MHz => ~5.55 ns/cycle, between
+ * shift=2's 4ns and shift=3's 8ns) -- be dialled in at shift=0; the per-class
+ * terms make the *shape* of init timing faithful so the firmware reaches
+ * StartScheduleTable before the OS-tick alarm, as on silicon.
+ */
+static uint32_t tricore_insn_extra_cycles(DisasContext *ctx, bool is_16bit)
+{
+    static int s_flat = -1, s_ld = -1, s_ctx = -1, s_mul = -1;
+    if (s_flat < 0) {
+        const char *e;
+        e = getenv("TC1797_INSN_EXTRA"); s_flat = e ? atoi(e) : 0;
+        e = getenv("TC1797_LD_EXTRA");   s_ld   = e ? atoi(e) : 0;
+        e = getenv("TC1797_CTX_EXTRA");  s_ctx  = e ? atoi(e) : 0;
+        e = getenv("TC1797_MUL_EXTRA");  s_mul  = e ? atoi(e) : 0;
+    }
+    uint32_t extra = s_flat;
+    uint32_t op1 = ctx->opcode & 0xff;
+    if (is_16bit) {
+        switch (op1) {
+        case OPC1_16_SC_LD_A: case OPC1_16_SLR_LD_A: case OPC1_16_SLR_LD_A_POSTINC:
+        case OPC1_16_SLRO_LD_A: case OPC1_16_SRO_LD_A: case OPC1_16_SLR_LD_BU:
+        case OPC1_16_SLR_LD_BU_POSTINC: case OPC1_16_SLRO_LD_BU: case OPC1_16_SRO_LD_BU:
+        case OPC1_16_SLR_LD_H: case OPC1_16_SLR_LD_H_POSTINC: case OPC1_16_SLRO_LD_H:
+        case OPC1_16_SRO_LD_H: case OPC1_16_SC_LD_W: case OPC1_16_SLR_LD_W:
+        case OPC1_16_SLR_LD_W_POSTINC: case OPC1_16_SLRO_LD_W: case OPC1_16_SRO_LD_W:
+            extra += s_ld; break;
+        case OPC1_16_SB_CALL: case OPC1_16_SC_BISR:
+            extra += s_ctx; break;
+        case OPC1_16_SRR_MUL:
+            extra += s_mul; break;
+        default: break;
+        }
+    } else {
+        switch (op1) {
+        case OPC1_32_BOL_LD_A_LONGOFF: case OPC1_32_BOL_LD_W_LONGOFF:
+        case OPC1_32_ABS_LD_Q:
+            extra += s_ld; break;
+        case OPC1_32_B_CALL: case OPC1_32_B_CALLA: case OPC1_32_B_FCALL:
+        case OPC1_32_B_FCALLA:
+            extra += s_ctx; break;
+        default: break;
+        }
+    }
+    return extra;
 }
 
 static void tricore_tr_tb_start(DisasContextBase *db, CPUState *cpu)
@@ -8594,6 +8759,7 @@ static void tricore_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
         decode_32Bit_opc(ctx);
     }
     ctx->base.pc_next = ctx->pc_succ_insn;
+    ctx->extra_cycles += tricore_insn_extra_cycles(ctx, is_16bit);
 
     if (ctx->base.is_jmp == DISAS_NEXT) {
         vaddr page_start;
@@ -8610,6 +8776,28 @@ static void tricore_tr_translate_insn(DisasContextBase *dcbase, CPUState *cpu)
 static void tricore_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *ctx = container_of(dcbase, DisasContext, base);
+
+    /*
+     * Cycle-accurate timing: deplete the icount budget by this TB's accumulated
+     * extra cycles (on top of the 1-per-insn the generic translator already
+     * billed at TB start), so the virtual clock advances by CYCLES not insns.
+     * Saturate at 0: the generic gen_tb_start already stored (budget - num_insns)
+     * to icount_decr.u16.low at TB entry; we subtract the extra here, and if the
+     * budget is exhausted the next TB's gen_tb_start check (count < 0) takes the
+     * pending-timer exit. tb->icount stays = num_insns so partial-execution /
+     * CF_COUNT sizing is unaffected.
+     */
+    if (ctx->extra_cycles && (tb_cflags(ctx->base.tb) & CF_USE_ICOUNT)) {
+        TCGv_i32 cnt = tcg_temp_new_i32();
+        tcg_gen_ld16u_i32(cnt, tcg_env,
+                          offsetof(CPUState, neg.icount_decr.u16.low) -
+                          sizeof(CPUState));
+        tcg_gen_subi_i32(cnt, cnt, ctx->extra_cycles);
+        tcg_gen_smax_i32(cnt, cnt, tcg_constant_i32(0));
+        tcg_gen_st16_i32(cnt, tcg_env,
+                         offsetof(CPUState, neg.icount_decr.u16.low) -
+                         sizeof(CPUState));
+    }
 
     switch (ctx->base.is_jmp) {
     case DISAS_TOO_MANY:

@@ -32,6 +32,7 @@ typedef struct PcpCore {
     uint8_t  cur_srpn;
     bool     exited;        /* set by EXIT; unwinds run_channel */
     uint8_t  ex_st, ex_int, ex_ep, ex_ec;   /* EXIT operands */
+    uint32_t ex_r6;         /* R6 at EXIT: CPPN[31:24]|SRPN[23:16]|TOS[15:14]|CNT1[11:0] */
     uint64_t insn_count;
     bool     trace;
 } PcpCore;
@@ -47,6 +48,8 @@ typedef struct PcpEngine {
     unsigned  qhead, qtail, qcount;
     bool      running;
     bool      started;
+    bool      in_drain;     /* re-entrancy guard for the synchronous inline drain */
+    void     *drain_bh;     /* QEMUBH: deterministic drain after the triggering MMIO */
 
     /* Per-channel "has been entered since the last PCP reset" bitmap (one bit
      * per SRPN). PCP_CS.RCB=1 selects the entry table (PC=2*SRPN) for a channel's

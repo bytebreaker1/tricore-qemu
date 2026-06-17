@@ -88,6 +88,15 @@ void tricore_cpu_do_interrupt(CPUState *cs);
  * next-highest pending request (faithful TC1797 ICU). Set by the SoC at realize. */
 extern void (*tricore_icu_ack)(void *ctx, uint32_t taken_srpn);
 extern void *tricore_icu_ack_ctx;
+/* Board ICU re-arbitrate hook, called when an interrupt return (RFE) LOWERS
+ * ICR.CCPN. On TC1.3.1 the ICU continuously compares the highest pending SRN
+ * against the live CCPN, so the instant CCPN drops a still-asserting lower SRN
+ * (the level-held OSEK dispatch SRPN-1, enqueued while the SRPN-7/8 STM tick
+ * held CCPN=8) is presented as PIPN and taken in the gap. helper_rfe already
+ * sets DISAS_EXIT, so the main-loop re-check (tricore_cpu_exec_interrupt) takes
+ * it. Set by the SoC at realize; NULL = no re-arbitration (legacy). */
+extern void (*tricore_icu_rfe)(void *ctx);
+extern void *tricore_icu_rfe_ctx;
 /* Deliver a TC1.3.1 range-based memory-protection trap (class 1: MPR/MPW/MPX)
  * from the softmmu tlb_fill path. NORETURN: vectors to BTV and longjmps out. */
 G_NORETURN void tricore_raise_protection_trap(CPUTriCoreState *env,

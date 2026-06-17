@@ -118,9 +118,22 @@ uint32_t tc1797_can_read(Tc1797Can *c, uint32_t addr)
              * MOSTAT-polling consumer (the diag/ISO-TP handler) never sees it. */
             {   /* DIAGNOSTIC (env TC1797_MOLOG): what does a MOSTAT read of MO84
                  * (the diag request MO) return + the rx_pending state? */
-                static int mol = -1;
+                static int mol = -1, mrl = -1;
                 if (mol < 0) {
                     mol = getenv("TC1797_MOLOG") ? 1 : 0;
+                    mrl = getenv("TC1797_MOREADLOG") ? 1 : 0;
+                }
+                /* TC1797_MOREADLOG: which MOs does the firmware's RX path actually poll?
+                 * Logs each MO's MOSTAT-read once (dedup) + rx_pending. Tells us if the COM
+                 * polls the indication MOs (33=0x12f / 51=0x328 / 57=0x388). */
+                if (mrl) {
+                    static uint8_t seen[256];
+                    if (n < 256 && !seen[n]) {
+                        seen[n] = 1;
+                        fprintf(stderr, "MOSTAT-READ MO%u rx_pending=%d (first poll)\n",
+                                n, m->rx_pending);
+                        fflush(stderr);
+                    }
                 }
                 if (mol && n == 84) {
                     static unsigned nlog, n1;
@@ -179,6 +192,14 @@ void tc1797_can_write(Tc1797Can *c, uint32_t addr, uint32_t val)
             m->dir = 0;
         }
         if (val & (1u << 3)) {                      /* RESET NEWDAT: frame consumed */
+            if (m->rx_pending && getenv("TC1797_CANACK")) {
+                static unsigned ack;
+                if (ack++ < 40) {
+                    fprintf(stderr, "CANACK firmware drained MO%d id=0x%03x (RX ISR ran)\n",
+                            n, m->id);
+                    fflush(stderr);
+                }
+            }
             m->rx_pending = false;
         }
         if (val & (1u << 24)) {                     /* SET TXRQ -> transmit */
@@ -193,6 +214,13 @@ void tc1797_can_write(Tc1797Can *c, uint32_t addr, uint32_t val)
             if (c->tx_cb) {
                 c->tx_cb(c->tx_opaque, id, data, 8);
             }
+            /* TX completes synchronously in this model. Reflect completion in the MO
+             * status word (read back at MOCTR/0x1C = MOSTAT): clear TXRQ (bit 8) and set
+             * TXPND (bit 1, "transmit pending/done") so the firmware's post-TX completion
+             * poll returns immediately instead of spinning to a ~1ms timeout -- in a
+             * scheduled task that timeout overruns the idle watchdog-kick window (DTC
+             * 0x3045 reset). On silicon the HW clears TXRQ + sets TXPND on transmit. */
+            c->regs[idx] = (c->regs[idx] & ~(1u << 8)) | (1u << 1);
         }
         break;
     default:
@@ -237,6 +265,15 @@ bool tc1797_can_rx_inject(Tc1797Can *c, uint32_t can_id,
              * and on silicon the MO data registers retain the last frame. */
             c->regs[mo_word(n, 0x10)] = ldl_le_p(m->rx_data);
             c->regs[mo_word(n, 0x14)] = ldl_le_p(m->rx_data + 4);
+            /* MOFCR DLC[31:24] = received frame length. On silicon the MultiCAN
+             * controller writes the received DLC here on RX; the firmware's MO
+             * drains (FUN_800dc44c diag poll AND the unified SRPN-29 RX ISR) read
+             * (MOFCR>>24) as the byte count to copy into the COM PDU buffer. Without
+             * it they copy 0 bytes -> injected frames are drained but their data
+             * never reaches the COM signal layer (d00/c09 stay at sentinels). */
+            c->regs[mo_word(n, 0x00)] =
+                (c->regs[mo_word(n, 0x00)] & 0x00FFFFFFu)
+                | ((uint32_t)(len & 0xFu) << 24);
             c->rx_count++;
             if (c->rx_irq_cb) {
                 c->rx_irq_cb(c->rx_irq_opaque, n);   /* pulse MO RX interrupt */

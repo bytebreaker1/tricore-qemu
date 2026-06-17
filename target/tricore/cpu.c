@@ -180,6 +180,20 @@ static bool tricore_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
             && FIELD_EX32(env->ICR, ICR, IE_13)
             && FIELD_EX32(env->ICR, ICR, PIPN) > FIELD_EX32(env->ICR, ICR, CCPN)) {
         uint32_t taken = FIELD_EX32(env->ICR, ICR, PIPN);
+        static int preempt_en = -1;
+        if (preempt_en < 0) preempt_en = getenv("TC1797_PREEMPT") ? 1 : 0;
+        if (preempt_en) {
+            uint32_t pc = env->PC & ~0x20000000u;
+            if (pc >= 0x800c0a00u && pc <= 0x800c0a40u) {
+                static int pn;
+                if (pn++ < 30) {
+                    fprintf(stderr, "PREEMPT pc=%08x srpn=%u ccpn=%u biv=%08x isr=%08x pcxi=%08x\n",
+                            pc, taken, (unsigned)FIELD_EX32(env->ICR, ICR, CCPN),
+                            env->BIV, (env->BIV & 0xffffe000u) | (taken << 5), env->PCXI);
+                    fflush(stderr);
+                }
+            }
+        }
         tricore_cpu_do_interrupt(cs);
         /*
          * Service-entry acknowledge. On TC1.3.1 the interrupt control unit
@@ -204,6 +218,9 @@ static bool tricore_cpu_exec_interrupt(CPUState *cs, int interrupt_request)
 /* Board ICU service-entry hook (set by the SoC at realize); NULL = legacy path. */
 void (*tricore_icu_ack)(void *ctx, uint32_t taken_srpn);
 void *tricore_icu_ack_ctx;
+/* Board ICU re-arbitrate-on-RFE hook (set by the SoC at realize); NULL = legacy. */
+void (*tricore_icu_rfe)(void *ctx);
+void *tricore_icu_rfe_ctx;
 
 #include "hw/core/sysemu-cpu-ops.h"
 

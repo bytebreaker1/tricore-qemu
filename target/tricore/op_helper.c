@@ -28,6 +28,373 @@
 void helper_tc_dbg(CPUTriCoreState *env, uint32_t pc)
 {
     static int n;
+    {
+        static int ip = -1;
+        if (ip < 0) { ip = getenv("TC1797_IDLEPROF") ? 1 : 0; }
+        if (ip) {
+            static unsigned long cnt[6]; static unsigned long total;
+            uint32_t nn = pc & ~0x20000000u;
+            int idx = (nn==0x8010d8bau)?0:(nn==0x800c3c3cu)?1:(nn==0x8033bc24u)?2:
+                      (nn==0x8036bc44u)?3:(nn==0x80119a7cu)?4:(nn==0x800c0300u)?5:-1;
+            if (idx >= 0) {
+                cnt[idx]++; total++;
+                if (total % 100000 == 0) {
+                    fprintf(stderr, "IDLEHIST 8010d8ba=%lu 800c3c3c(kick)=%lu 8033bc24=%lu "
+                            "8036bc44=%lu 80119a7c=%lu 800c0300=%lu\n",
+                            cnt[0],cnt[1],cnt[2],cnt[3],cnt[4],cnt[5]);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+    /* TC1797_COLDLOG: non-perturbing cold-init trace -- log each cold-init function as the firmware
+     * executes it (inline, no gdb halt). Shows how far StartOS/FUN_8000123c gets before stalling, and
+     * whether FUN_80001160 (STM CMP0 config) is ever reached. */
+    if (getenv("TC1797_COLDLOG")) {
+        const char *nm = NULL;
+        switch (pc) {
+        case 0x800002e8u: nm = "StartOS->coldinit caller 0x800002e8"; break;
+        case 0x8000123cu: nm = "FUN_8000123c (coldinit ENTRY)"; break;
+        case 0x800010eau: nm = "FUN_800010ea"; break;
+        case 0x800012d2u: nm = "FUN_800012d2"; break;
+        case 0x800013ceu: nm = "FUN_800013ce"; break;
+        case 0x8000136au: nm = "FUN_8000136a"; break;
+        case 0x80001160u: nm = "FUN_80001160 *** STM CMP0 CONFIG REACHED ***"; break;
+        default: break;
+        }
+        if (nm) {
+            static unsigned cl;
+            if (cl++ < 400) { fprintf(stderr, "COLDLOG %s\n", nm); fflush(stderr); }
+        }
+    }
+    /* TC1797_PH4FN: at the phase-driver's per-node condition-call site (fn_800fdec0 calli a15 @0x800fdfa4),
+     * log the condition-function pointer (a15) together with the current phase byte. The phase-4 node's
+     * condition fn is the direct gate for the 4->3 demote (the residual oscillation); a15 names it. */
+    if (pc == 0x800fdfa4u && getenv("TC1797_PH4FN")) {
+        uint8_t ph = 0;
+        cpu_physical_memory_read(0xD0003643u, &ph, 1);
+        static uint64_t seen[64]; static int ns;
+        uint32_t fn = env->gpr_a[15];
+        uint64_t key = ((uint64_t)ph << 32) | fn; int found = 0;
+        for (int i = 0; i < ns; i++) { if (seen[i] == key) { found = 1; break; } }
+        if (!found && ns < 64) {
+            seen[ns++] = key;
+            fprintf(stderr, "PH4FN phase=%u cond_fn=0x%08x  (d1=%u)\n", ph, fn, env->gpr_d[1]);
+            fflush(stderr);
+        }
+    }
+    /* TC1797_WDLOG: measure the software-watchdog servicing cadence. FUN_800c3c1a (kick) bumps
+     * DAT_d0004037 whenever it runs > 0x29bf STM_TIM1 ticks (1.88ms) apart; 10 bumps -> DTC 0x3045.
+     * Log STM_TIM1 + the bump counter at each kick/check so we can see the actual inter-call interval. */
+    /* TC1797_WDLOG: at the STM-tick schedule ISR FUN_80081870, dump the cursor
+     * DAT_d0012498, the dispatched callback *(cursor), and the entry period
+     * cursor[1] -- reveals the schedule sequence (which task bodies + how often). */
+    if (pc == 0x80081870u && getenv("TC1797_WDLOG")) {
+        static unsigned sn;
+        if (sn++ < 30) {
+            uint32_t cur = cpu_ldl_le_data(env, 0xD0012498u);
+            uint32_t cb = 0, per = 0;
+            if (cur >= 0xD0000000u && cur < 0xD0020000u) {
+                cb = cpu_ldl_le_data(env, cur);
+                per = cpu_ldl_le_data(env, cur + 4);
+            }
+            uint32_t t0 = cpu_ldl_le_data(env, 0xF0000210u);
+            fprintf(stderr, "SCHED n=%u cursor=%08x cb=%08x period=%u tim0=%08x\n",
+                    sn, cur, cb, per, t0);
+            fflush(stderr);
+        }
+    }
+    /* TC1797_KICKCAL2: seed DAT_d0016ed0=-1200 RIGHT BEFORE FUN_8007f9be reads it (0x8007fa92),
+     * so the kick-alarm period becomes ((-1200)+2200)*90 = 90000 = 1.0ms (<1.9ms threshold).
+     * Confirms the kick cadence is the sole DTC-0x3045 cause (the value is otherwise a missing
+     * DFLASH calibration -> 0 -> 2.2ms). */
+    if ((pc & ~0x20000000u) == 0x8007fa92u && getenv("TC1797_KICKCAL2")) {
+        int32_t off = -1200;
+        cpu_stl_le_data(env, 0xD0016ED0u, (uint32_t)off);
+        { static int kn; if (kn++ < 5) { fprintf(stderr, "KICKCAL2 hit pc=%08x set 16ed0=-1200\n", pc); fflush(stderr); } }
+    }
+    {
+    uint32_t npc = pc & ~0x20000000u;   /* normalise uncached seg-A alias 0xA->0x8 */
+    if ((npc == 0x800c3c1au || npc == 0x800c3c68u) && getenv("TC1797_WDLOG")) {
+        static unsigned n; static uint32_t prev_t1;
+        if (n < 80) {
+            uint32_t t1 = cpu_ldl_le_data(env, 0xF0000214u);   /* STM_TIM1 */
+            uint8_t cnt = cpu_ldub_data(env, 0xD0004037u);
+            uint8_t ph = cpu_ldub_data(env, 0xD0003643u);
+            uint32_t ra = env->gpr_a[11];                      /* caller (which task body) */
+            uint32_t dt1 = (npc == 0x800c3c1au) ? (t1 - prev_t1) : 0;
+            fprintf(stderr, "WDLOG %s n=%u pc=%08x ra=%08x TIM1=%08x dTIM1=%u(%s) cnt37=%u ph=%u\n",
+                    npc == 0x800c3c1au ? "KICK " : "CHECK", n, pc, ra, t1, dt1,
+                    dt1 > 0x29bf ? "BUMP" : "ok", cnt, ph);
+            fflush(stderr);
+            if (npc == 0x800c3c1au) { prev_t1 = t1; }
+            n++;
+        }
+    }
+    }
+    /* TC1797_CALSEED: keep the 4f6 sensor-status byte = 0xe7 (donor value, bits0+2) at every watched PC so
+     * FUN_8014065a's 4041=1 branch stays taken -> eb1=1 -> e7e=1 -> stable phase 4. Proves the sensor route
+     * drives os_running; the faithful fix is to model FUN_801291fa's ADC/diagnostic inputs to yield 0xe7. */
+    {
+        static int csf = -1;
+        if (csf < 0) {
+            csf = getenv("TC1797_F6FORCE") ? 1 : 0;   /* brute 4f6 force (separate env) */
+        }
+        if (csf) {
+            uint8_t f6 = 0xe7;
+            cpu_physical_memory_write(0xD00004F6u, &f6, 1);
+        }
+    }
+    /* TC1797_CALSEED: reset the health counter DAT_c0003d00 (0xC0003D00) at FUN_801291fa entry -- the
+     * faithful equivalent of the OSEK health-OK message 0x17 being delivered. Then FUN_801291fa computes
+     * 4f6 with bit0 kept (counter not saturated) instead of recomputing the brute force away. */
+    if (pc == 0x801291fau) {
+        static int ch = -1;
+        if (ch < 0) {
+            ch = getenv("TC1797_CALSEED") ? 1 : 0;
+        }
+        if (ch) {
+            uint8_t z = 0;
+            cpu_physical_memory_write(0xC0003D00u, &z, 1);   /* health ctr reset (sim OSEK msg 0x17) */
+            uint8_t st = 0x0a;                                /* engine/system state (donor value, sets 4f6 bit2) */
+            cpu_physical_memory_write(0xD0003C09u, &st, 1);
+        }
+    }
+    /* MARCH catcher (env TC1797_MARCHLOG): a PC below flash means the OSEK dispatcher calli'd a garbage
+     * task body and the CPU is marching through non-flash memory. Log the first few march PCs + a11 (the
+     * calli return-site in FUN_801255da) + the LIVE dispatch state read straight from guest RAM
+     * (nextid/curid/slot[nextid]/cpu_src) -- this is the non-perturbing instruction-level capture of the
+     * exact garbage dispatch (gdb halts make the march vanish). */
+    if (pc < 0x80000000u) {
+        static int ml = -1;
+        if (ml < 0) {
+            ml = getenv("TC1797_MARCHLOG") ? 1 : 0;
+        }
+        if (ml) {
+            static unsigned mn;
+            if (mn++ < 16) {
+                uint8_t nid = 0, cid = 0;
+                uint32_t slotbase = 0, srr = 0, slotv = 0;
+                cpu_physical_memory_read(0xD0000988u, &nid, 1);
+                cpu_physical_memory_read(0xD0000064u, &cid, 1);
+                cpu_physical_memory_read(0xD000998Cu, &slotbase, 4);
+                cpu_physical_memory_read(0xF7E0FFFCu, &srr, 4);
+                if (slotbase >= 0xd0000000u && slotbase < 0xd0020000u) {
+                    cpu_physical_memory_read(slotbase + (uint32_t)nid * 0x10u, &slotv, 4);
+                }
+                fprintf(stderr, "TCMARCH #%u pc=%08x a11=%08x nextid=%u curid=%u slot[nid]=%08x "
+                        "cpu_src=%08x(SRR=%u)\n", mn, pc, env->gpr_a[11], nid, cid, slotv, srr,
+                        (srr >> 13) & 1u);
+                fflush(stderr);
+            }
+        }
+        return;
+    }
+    /* TC1797_CALSEED: at each config reader (FUN_800e0856 d6f4 copy + FUN_800e006e/FUN_800dfe42 validators),
+     * write the chip's REAL calibration (donor DSPR via TC1797_CALFILE) into ALL config blocks first, so
+     * every reader sees valid 0x2a-magic data instead of QEMU's blank-DFLASH zeros -> validators pass, no
+     * re-init. This is the donor ECU's actual calibration (the faithful equivalent of its DFLASH being
+     * present), seeded at these exact PCs to beat the periodic re-load. */
+    /* TC1797_CALSEED: at FUN_8014065a entry, seed the 4f6 status byte (DAT_d00004f4._2_1_, 0xD00004F6) to
+     * the donor value 0xe7 (bits0+2 set) so FUN_8014065a takes the (4f6&4 && 4f6&1) branch -> 4041=1 ->
+     * eb1=1 -> e7e=1 -> phase 4, bypassing the whole calibration/340e path. This is the value the chip's
+     * FUN_80128d3c derives from healthy sensors -- the faithful fix is to model those ADC/diagnostic
+     * inputs; this seed proves the route reaches phase 4. */
+    if (pc == 0x8014065au) {
+        static int cs3 = -1;
+        if (cs3 < 0) {
+            cs3 = getenv("TC1797_F6FORCE") ? 1 : 0;   /* brute 4f6 force (separate env) */
+        }
+        if (cs3) {
+            uint8_t f6 = 0xe7;
+            cpu_physical_memory_write(0xD00004F6u, &f6, 1);
+        }
+        return;
+    }
+    if (pc == 0x800e0856u || pc == 0x800e006eu || pc == 0x800dfe42u) {
+        static int cs2 = -1;
+        static gchar *cb = NULL;
+        static gsize cl = 0;
+        static int ld = 0;
+        if (cs2 < 0) {
+            cs2 = getenv("TC1797_CALSEED") ? 1 : 0;
+        }
+        if (cs2) {
+            if (!ld) {
+                ld = 1;
+                const char *f = getenv("TC1797_CALFILE");
+                if (f && !g_file_get_contents(f, &cb, &cl, NULL)) {
+                    cb = NULL;
+                }
+            }
+            if (cb && cl >= 0x14000u) {
+                cpu_physical_memory_write(0xD0003560u, (uint8_t *)cb + 0x3560, 0x10);
+                cpu_physical_memory_write(0xD0004080u, (uint8_t *)cb + 0x4080, 0x100);
+                cpu_physical_memory_write(0xD0009880u, (uint8_t *)cb + 0x9880, 0x40);
+                cpu_physical_memory_write(0xD000D700u, (uint8_t *)cb + 0xD700, 0xA0);
+                cpu_physical_memory_write(0xD0013350u, (uint8_t *)cb + 0x13350, 0xB0);
+            }
+        }
+        return;
+    }
+    /* MARCHLOG dispatch-calli sequence: log each FUN_801255da `calli a15` (0x801256c8) target +
+     * nextid/curid/SRR, to see whether the OS tick keeps re-activating (nextid climbs back up) or the
+     * dispatch just drains tasks to nextid=0 (then marches on the slot[0] guard). Falls through. */
+    if (pc == 0x801256c8u) {
+        static int ml2 = -1;
+        if (ml2 < 0) {
+            ml2 = getenv("TC1797_MARCHLOG") ? 1 : 0;
+        }
+        if (ml2) {
+            static unsigned dn;
+            if (dn++ < 120) {
+                uint8_t nid = 0, cid = 0;
+                uint32_t srr = 0, base = 0, slot0 = 0, slotn = 0;
+                cpu_physical_memory_read(0xD0000988u, &nid, 1);
+                cpu_physical_memory_read(0xD0000064u, &cid, 1);
+                cpu_physical_memory_read(0xF7E0FFFCu, &srr, 4);
+                cpu_physical_memory_read(0xD000998Cu, &base, 4);
+                if (base >= 0xd0000000u && base < 0xd0020000u) {
+                    cpu_physical_memory_read(base, &slot0, 4);            /* slot[0] guard */
+                    cpu_physical_memory_read(base + (uint32_t)nid * 0x10u, &slotn, 4);
+                }
+                fprintf(stderr, "TCDISP #%u a15=%08x d15=%08x nextid=%u curid=%u SRR=%u slot0=%08x "
+                        "slot[nid]=%08x\n", dn, env->gpr_a[15], env->gpr_d[15], nid, cid,
+                        (srr >> 13) & 1u, slot0, slotn);
+                fflush(stderr);
+            }
+        }
+    }
+    /* Non-perturbing fatal-handler log (env TC1797_FATLOG): FUN_800bf97c(cat=d4,
+     * code=d5) is the firmware FATAL/reset handler; a11 at entry is the caller =
+     * the failing check. Captures the FREE-RUN reset-loop driver (the crash-log
+     * struct is not yet set up for the early fatals, so the SCU-reset DTCLOG path
+     * cannot see them). */
+    if (pc == 0x800bf97cu) {
+        static int fl = -1;
+        if (fl < 0) {
+            fl = getenv("TC1797_FATLOG") ? 1 : 0;
+        }
+        if (fl) {
+            static unsigned fn;
+            if (fn++ < 300) {
+                fprintf(stderr, "TCFATAL #%u cat=0x%02x code=0x%04x ra=%08x\n",
+                        fn, env->gpr_d[4] & 0xff, env->gpr_d[5] & 0xffff,
+                        env->gpr_a[11]);
+                fflush(stderr);
+            }
+        }
+        return;
+    }
+    /* Non-perturbing arming-path counters (env TC1797_ARMLOG): does FREE-RUN run
+     * the CPU code that enables ch28/ch26's ADC SRCs (FUN_800fbce4 / FUN_800fbb46)
+     * and the ch26-arm gate FUN_800f939e before the DTC-0x3006 gate (FUN_800fbafe,
+     * armed by FUN_800f7540) resets? The breakpoint-based counts read 0 because
+     * gdb halts steer the boot off the gate path -- this measures the real path. */
+    if (pc == 0x800f7540u || pc == 0x800f7754u || pc == 0x800fbce4u
+        || pc == 0x800f939eu || pc == 0x800fbb46u || pc == 0x800fbafeu) {
+        static int al = -1;
+        if (al < 0) {
+            al = getenv("TC1797_ARMLOG") ? 1 : 0;
+        }
+        if (al) {
+            static unsigned c7540, c7754, cbce4, c939e, cbb46, cbafe;
+            unsigned *cnt = (pc == 0x800f7540u) ? &c7540 :
+                            (pc == 0x800f7754u) ? &c7754 :
+                            (pc == 0x800fbce4u) ? &cbce4 :
+                            (pc == 0x800f939eu) ? &c939e :
+                            (pc == 0x800fbb46u) ? &cbb46 : &cbafe;
+            (*cnt)++;
+            if (*cnt <= 3 || (*cnt % 16) == 0) {
+                fprintf(stderr, "TCARM pc=%08x n=%u (7540=%u 7754=%u bce4=%u "
+                        "939e=%u bb46=%u bafe=%u)\n", pc, *cnt,
+                        c7540, c7754, cbce4, c939e, cbb46, cbafe);
+                fflush(stderr);
+            }
+        }
+        return;
+    }
+    /* Non-perturbing schedule-table / task-dispatch probe (env TC1797_TASKLOG):
+     * is the ERCOSEK schedule table advancing past the startup table so the
+     * periodic tasks that ENABLE ch28/ch26 (and drive the phase machine) get
+     * dispatched? Counts entries to the relevant task bodies + the table-advance
+     * (NextScheduleTable) + the phase-gated advancer fn_801199d4, and at the gate
+     * reads the phase byte 0xD0003643 and pump-enable 0xD0004163. */
+    if (pc == 0x80081a0eu || pc == 0x8008317au || pc == 0x80082492u
+        || pc == 0x80082986u || pc == 0x80083156u || pc == 0x801199d4u
+        || pc == 0x80125332u || pc == 0x800f76f0u || pc == 0x800fbafeu
+        || pc == 0x800fbb24u || pc == 0x800f7368u || pc == 0x800bb400u) {
+        static int tl = -1;
+        if (tl < 0) {
+            tl = getenv("TC1797_TASKLOG") ? 1 : 0;
+        }
+        if (tl) {
+            static unsigned c_pump, c_ch28, c_master, c_mact, c_28act,
+                            c_adv1, c_next, c_f76f0, c_gate, c_fatal, c_thunk,
+                            c_pcpstart;
+            unsigned *cnt =
+                (pc == 0x80081a0eu) ? &c_pump  :
+                (pc == 0x8008317au) ? &c_ch28  :
+                (pc == 0x80082492u) ? &c_master:
+                (pc == 0x80082986u) ? &c_mact  :
+                (pc == 0x80083156u) ? &c_28act :
+                (pc == 0x801199d4u) ? &c_adv1  :
+                (pc == 0x80125332u) ? &c_next  :
+                (pc == 0x800f76f0u) ? &c_f76f0 :
+                (pc == 0x800fbafeu) ? &c_gate  :
+                (pc == 0x800fbb24u) ? &c_fatal :
+                (pc == 0x800f7368u) ? &c_thunk : &c_pcpstart;
+            if (pc == 0x800bb400u && (c_pcpstart <= 3 || (c_pcpstart % 16) == 0)) {
+                uint32_t pcp_cs = cpu_ldl_le_data(env, 0xF0043F10u);
+                uint8_t flag = cpu_ldub_data(env, 0xD000416Fu);
+                fprintf(stderr, "TCTASK PCP-START n=%u PCP_CS(F0043F10)=0x%08x "
+                        "flag(D000416F)=0x%02x  (runs at idx3, BEFORE gate idx36)\n",
+                        c_pcpstart, pcp_cs, flag);
+            }
+            if (pc == 0x800fbb24u && (c_fatal <= 3 || (c_fatal % 16) == 0)) {
+                fprintf(stderr, "TCTASK GATE-FATAL-SITE n=%u gate_entry=%u thunk=%u "
+                        "(gate reached: thunk-path vs pump-path)\n",
+                        c_fatal + 1, c_gate, c_thunk);
+            }
+            (*cnt)++;
+            /* at the gate: read phase byte + pump-enable + the gate flag */
+            if (pc == 0x800fbafeu && (c_gate <= 3 || (c_gate % 16) == 0)) {
+                uint8_t phase = cpu_ldub_data(env, 0xD0003643u);
+                uint8_t en4163 = cpu_ldub_data(env, 0xD0004163u);
+                uint8_t flag = cpu_ldub_data(env, 0xD000416Fu);
+                fprintf(stderr, "TCTASK GATE n=%u phase(D0003643)=0x%02x "
+                        "en(D0004163)=0x%02x flag(D000416F)=0x%02x\n",
+                        c_gate, phase, en4163, flag);
+            }
+            if (pc == 0x801199d4u && (c_adv1 <= 3 || (c_adv1 % 16) == 0)) {
+                uint8_t phase = cpu_ldub_data(env, 0xD0003643u);
+                fprintf(stderr, "TCTASK ADV(fn_801199d4) n=%u phase(D0003643)=0x%02x"
+                        " (advances table only if phase==4/3/5)\n", c_adv1, phase);
+            }
+            if (pc == 0x80125332u) {
+                fprintf(stderr, "TCTASK NextScheduleTable n=%u  (TABLE ADVANCE!)\n",
+                        c_next);
+            }
+            if (pc == 0x800f76f0u && (c_f76f0 <= 6 || (c_f76f0 % 16) == 0)) {
+                uint8_t skip3c6c = cpu_ldub_data(env, 0xD0003C6Cu);
+                uint8_t en4163 = cpu_ldub_data(env, 0xD0004163u);
+                uint8_t phase = cpu_ldub_data(env, 0xD0003643u);
+                fprintf(stderr, "TCTASK PUMP(f76f0) n=%u skip(D0003C6C)=0x%02x "
+                        "en(D0004163)=0x%02x phase=0x%02x  (calls gate iff "
+                        "skip&0x40==0 && en==1)\n",
+                        c_f76f0, skip3c6c, en4163, phase);
+            }
+            if (c_pump + c_ch28 + c_master + c_mact + c_28act + c_next <= 5
+                || (((*cnt) % 64) == 0)) {
+                fprintf(stderr, "TCTASK pump=%u ch28=%u master=%u m_act=%u "
+                        "ch28_act=%u adv1=%u NEXT=%u f76f0=%u gate=%u\n",
+                        c_pump, c_ch28, c_master, c_mact, c_28act,
+                        c_adv1, c_next, c_f76f0, c_gate);
+            }
+            fflush(stderr);
+        }
+        return;
+    }
     /* Dispatch-crash diagnostic (env TC1797_DISP): the ERCOSEK scheduler enters
      * the next task via `calli a15` at 0x801256c8, where
      *   a15 = *( *(  (*0xD000998C) + nextid*0x10  + 4 ) ).
@@ -179,6 +546,18 @@ void raise_exception_sync_internal(CPUTriCoreState *env, uint32_t class, int tin
     /* in case we come from a helper-call we need to restore the PC */
     cpu_restore_state(cs, pc);
     last_pc = env->PC;
+    uint32_t trap_old_a11 = (uint32_t)env->gpr_a[11];  /* caller RA before trap rewrites it */
+    /* DIAGNOSTIC TEST (env TC1797_IDLESURVIVE): the ERCOSEK OS dispatches its idle
+     * sentinel (task 0, ctx=0xFFFFFFFF) only when FULLY idle. On silicon it never goes
+     * fully idle (the background task keeps it busy with key-on work), so the idle path
+     * is a 'never reached' sentinel whose dispatch derefs 0xFFFFFFFF -> calli 0 -> this
+     * MPX(execute@0) trap. Treat it as a benign idle spin: redirect to the real idle-loop
+     * entry 0x801257e4 (= *DAT_d0000970) instead of vectoring to the firmware reset stub.
+     * Tests whether the idle-sentinel trap is the SOLE phase-4 blocker. NOT a default fix. */
+    if (class == 1 && tin == 4 && env->PC == 0 && getenv("TC1797_IDLESURVIVE")) {
+        env->PC = 0x801257e4u;
+        cpu_loop_exit(env_cpu(env));
+    }
 
     /* Tin is loaded into d[15] */
     env->gpr_d[15] = tin;
@@ -235,6 +614,58 @@ void raise_exception_sync_internal(CPUTriCoreState *env, uint32_t class, int tin
 
     /* PCXI.PCPN = ICR.CCPN */
     pcxi_set_pcpn(env, icr_get_ccpn(env));
+    /* DIAGNOSTIC (env TC1797_TRAPLOG): identify CPU traps -- class/TIN/faulting-PC/BTV.
+     * A trap whose BTV vectors to the firmware's reset stub (0x8001c7xx) is the phase-3
+     * reset; class 4 = bus/peripheral error (unmapped access), class 2 = illegal opcode/
+     * fetch (e.g. a jump to a null pointer), class 1 = protection. */
+    if (getenv("TC1797_TRAPLOG")) {
+        static unsigned tl;
+        if (tl++ < 60) {
+            uint8_t curid = 0, nextid = 0;
+            uint32_t tbase = 0, t0c = 0, t0p = 0, spc = 0;
+            cpu_physical_memory_read(0xD0000064u, &curid, 1);  /* OSEK curid */
+            cpu_physical_memory_read(0xD0000988u, &nextid, 1); /* OSEK nextid */
+            cpu_physical_memory_read(0xD000998Cu, &tbase, 4);  /* task-table base */
+            if (tbase >= 0xC0000000u && tbase < 0xE0000000u) {
+                cpu_physical_memory_read(tbase + nextid*0x10u, &t0c, 4);    /* task[next][0]=ctx */
+                cpu_physical_memory_read(tbase + nextid*0x10u + 4, &t0p, 4);/* task[next][1] */
+                if (t0p >= 0xC0000000u && t0p < 0xE0000000u) {
+                    cpu_physical_memory_read(t0p, &spc, 4);                 /* *(task[next][1]) = saved PC */
+                }
+            }
+            fprintf(stderr, "TRAP class=%u tin=%d faultPC=0x%08x callerRA=0x%08x curid=%u "
+                    "nextid=%u | tbase=%08x t[n][0]=%08x t[n][1]=%08x *t[n][1]=%08x\n",
+                    class, tin, (uint32_t)last_pc, trap_old_a11, curid, nextid,
+                    tbase, t0c, t0p, spc);
+            /* Walk the CSA chain (PCXI->prev) and print each frame's A11 (return
+             * addr) to reveal WHO called FUN_801255da(0) -> idle dispatch. CSA EA =
+             * (PCXI.PCXS<<28)|(PCXI.PCXO<<6); upper-ctx word[0]=PCXI, word[3]=A11. */
+            uint32_t pcxi = env->PCXI;
+            fprintf(stderr, "  CSA-chain:");
+            for (int d = 0; d < 10 && (pcxi & 0xFFFFF); d++) {
+                uint32_t ea = ((pcxi & 0x000F0000u) << 12) | ((pcxi & 0x0000FFFFu) << 6);
+                uint32_t a11 = 0, prev = 0;
+                if (ea >= 0xC0000000u && ea < 0xE0000000u) {
+                    cpu_physical_memory_read(ea + 0xC, &a11, 4);
+                    cpu_physical_memory_read(ea + 0x0, &prev, 4);
+                }
+                fprintf(stderr, " [%08x]ra=%08x", ea, a11);
+                pcxi = prev;
+            }
+            /* Scheduler state: hi-coop, preemption-stack top + ptr + stack words. */
+            uint32_t hicoop = 0, premtop = 0, premptr = 0, pw0 = 0, pw1 = 0;
+            cpu_physical_memory_read(0xD0000984u, &hicoop, 4);
+            cpu_physical_memory_read(0xD000098Cu, &premtop, 4);
+            cpu_physical_memory_read(0xD00009B0u, &premptr, 4);
+            if (premptr >= 0xC0000000u && premptr < 0xE0000000u) {
+                cpu_physical_memory_read(premptr - 4, &pw0, 4);
+                cpu_physical_memory_read(premptr - 8, &pw1, 4);
+            }
+            fprintf(stderr, "\n  hicoop=%u premtop=%08x premptr=%08x pstack[-1]=%08x [-2]=%08x\n",
+                    hicoop, premtop, premptr, pw0, pw1);
+            fflush(stderr);
+        }
+    }
     /* Update PC using the trap vector table */
     env->PC = env->BTV | (class << 5);
 
@@ -2949,8 +3380,28 @@ void helper_rfe(CPUTriCoreState *env)
     /* ICR.IE = PCXI.PIE; */
     icr_set_ie(env, pcxi_get_pie(env));
 
+    /* Capture the CCPN we are returning FROM (the ISR level), before the restore. */
+    uint32_t rfe_old_ccpn = FIELD_EX32(env->ICR, ICR, CCPN);
     /* ICR.CCPN = PCXI.PCPN; */
     icr_set_ccpn(env, pcxi_get_pcpn(env));
+
+    /* The return just LOWERED CCPN to the pre-interrupt level. Faithful TC1.3.1
+     * ICU: re-arbitrate so the highest still-asserting SRN is presented as PIPN
+     * against the new CCPN -- the level-held OSEK dispatch SRPN-1, pending the
+     * whole STM tick ISR, then satisfies PIPN>CCPN and is taken in the idle gap
+     * by the DISAS_EXIT re-check this RFE forces. SAFE to write env->ICR here:
+     * helper_rfe is declared without TCG_CALL_NO_WG, so TCG syncs cpu_ICR to env
+     * before the call and reloads it after -- the arbiter's PIPN write sticks,
+     * like the icr_set_ccpn/icr_set_ie writes already in this helper.
+     * GATE rfe_old_ccpn > 1: only re-present when returning from a HIGHER-priority
+     * ISR (e.g. the SRPN-7/8 STM tick at CCPN 7/8), NOT from the SRPN-1 dispatcher
+     * itself (CCPN 1). SRPN-1 is continuously pending (the firmware holds its SRR),
+     * so re-arbitrating after the dispatcher's OWN rfe would re-present + re-take it
+     * immediately -> infinite dispatch loop wedging the OS. Without the gate the
+     * dispatcher runs ~once/115ms (only on a full nest unwind) -> watchdog 0x3045. */
+    if (tricore_icu_rfe && rfe_old_ccpn > 1) {
+        tricore_icu_rfe(tricore_icu_rfe_ctx);
+    }
 
     /*EA = {PCXI.PCXS, 6'b0, PCXI.PCXO, 6'b0};*/
     ea = (pcxi_get_pcxs(env) << 28) |

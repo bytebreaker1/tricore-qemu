@@ -17,8 +17,16 @@ void tc1797_adc_init(Tc1797Adc *a, uint32_t base0)
 {
     memset(a, 0, sizeof(*a));
     a->base0 = base0;
+    /* Unmodelled channels: the silicon ADC always returns a CONVERSION RESULT
+     * (a real voltage count), never "no result". With no analog model QEMU
+     * returned VF=0/0 -> the firmware's ADC monitor (PCP ch 0x1d) sees no valid
+     * result and the 0xD000416F init-done byte never reaches 1. TC1797_ADC_NOMINAL
+     * supplies a default mid-scale count for every channel so each conversion
+     * yields a VALID result -- the minimal faithful stand-in for the analog engine. */
+    const char *nom = getenv("TC1797_ADC_NOMINAL");
+    int nomv = nom ? (int)strtol(nom, NULL, 0) : -1;
     for (int ki = 0; ki < TC1797_ADC_NKERN; ki++) {
-        a->k[ki].default_count = -1;
+        a->k[ki].default_count = nomv;
         a->k[ki].shadow[ADC_GLOBCTR >> 2] = 0x000000FFu;  /* GLOBCTR power-on reset (DAVE TC1797.REGS) */
         for (int n = 0; n < TC1797_ADC_NRES; n++) {
             a->k[ki].input[n] = -1;
@@ -69,6 +77,17 @@ uint32_t tc1797_adc_read(Tc1797Adc *a, uint32_t addr)
     AdcKernel *k = &a->k[ki];
     off &= ~0x3u;
 
+    if (getenv("TC1797_ADCRD")) {
+        static unsigned arc;
+        if (arc++ < 300) {
+            const char *what = (off >= RESR_BASE && off < RESR_BASE + TC1797_ADC_NRES*4) ? "RESR"
+                             : (off >= RESRD_BASE && off < RESRD_BASE + TC1797_ADC_NRES*4) ? "RESRD"
+                             : (off == ADC_STATUS) ? "GLOBSTR" : (off == ADC_GLOBCTR) ? "GLOBCTR" : "other";
+            fprintf(stderr, "ADCRD k%d off=%03x (%s)\n", ki, off, what);
+            fflush(stderr);
+        }
+    }
+
     if (off >= RESR_BASE && off < RESR_BASE + TC1797_ADC_NRES * 4) {
         int n = (off - RESR_BASE) >> 2;
         uint32_t w = resr_word(k, n);
@@ -101,6 +120,16 @@ void tc1797_adc_write(Tc1797Adc *a, uint32_t addr, uint32_t val)
     uint32_t off;
     int ki = adc_decode(addr, &off);
     if (ki >= 0) {
+        if (getenv("TC1797_ADCWR")) {
+            static unsigned awc;
+            if (awc++ < 400) {
+                const char *what = (off == 0x030) ? "GLOBCTR" : (off == 0x038) ? "GLOBSTR"
+                                 : (off >= 0x180 && off < 0x180 + 16*4) ? "RESR"
+                                 : (off >= 0x1C0 && off < 0x1C0 + 16*4) ? "RESRD" : "reg";
+                fprintf(stderr, "ADCWR k%d off=%03x val=%08x (%s)\n", ki, off & ~0x3u, val, what);
+                fflush(stderr);
+            }
+        }
         a->k[ki].shadow[(off & ~0x3u) >> 2] = val;
     }
 }
