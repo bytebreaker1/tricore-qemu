@@ -157,7 +157,8 @@ struct TC1797SoCState {
     int64_t osek_floor_ns;       /* min virtual time before delivering any tick */
     unsigned osek_rr;            /* round-robin index across the tick priorities */
     uint8_t osek_minphase;       /* min RTOS phase (0xD0003643) before delivery */
-    bool osek_enabled;           /* forced systick armed (env TC1797_NO_SYSTICK off) */
+    bool osek_enabled;           /* forced systick armed -- DEFAULT-OFF, opt-in via env TC1797_SYSTICK=1
+                                  * (redundant since the CMP0 cold-init tick pin; see realize) */
     bool osek_phase4;            /* latched once RTOS reaches phase 4 (diagnostic) */
     uint32_t cpu_src;            /* CPU service-request node 0xF7E0FFFC (OSEK dispatch) */
     QEMUBH *irq_bh;              /* defers MMIO-context IRQ raises out of TB context */
@@ -3637,7 +3638,25 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
      *    return D4 so validation passes for a validly-flashed image (we don't
      *    have Bosch's exact CRC32 variant). ── */
     case 0xF010C214:
-        return (s->cpu.env.PC == 0xAFFFCFE6) ? s->cpu.env.gpr_d[4] : s->fce_crc;
+        /* AUDIT GATE (2026-06-17): the BROM BMI CRC oracle returns the expected CRC (D4) at the compare
+         * PC instead of the computed FCE CRC. Gated to test whether it's still needed once the WDT
+         * firmware patch is removed -- the patch CHANGED 8 image bytes, so the real CRC32 over the
+         * patched image no longer matched the stored CRC; an UNMODIFIED image may pass the real FCE
+         * CRC32 (computed at 0xF010C210) with no oracle. Disable with TC1797_NO_FCE_ORACLE. */
+        if (s->cpu.env.PC == 0xAFFFCFE6) {
+            if (getenv("TC1797_FCE_CRCLOG")) {
+                static int fce_logged;
+                if (!fce_logged++) {
+                    fprintf(stderr, "FCE BROM CRC @0xAFFFCFE6: computed=0x%08x  expected(D4)=0x%08x  "
+                            "(faithful fix = make computed match expected; oracle bypasses the gap)\n",
+                            s->fce_crc, (uint32_t)s->cpu.env.gpr_d[4]);
+                }
+            }
+            if (getenv("TC1797_NO_FCE_ORACLE") == NULL) {
+                return s->cpu.env.gpr_d[4];   /* LOAD-BEARING: boot fails the BROM BMI check without it */
+            }
+        }
+        return s->fce_crc;
     case 0xF010C210: return 0x00000000;   /* FCE input register */
     /* ── Silicon identification chain (lets chip-ID checks pass) ── */
     case 0xF0000408: return 0x000DC001;   /* JDPID (Cerberus/JTAG) */
@@ -4771,16 +4790,16 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
      * to continue the phase 3 -> 4 promotion work. TC1797_SYSTICK_MINPHASE sets
      * the RTOS phase gate (default 3); TC1797_SYSTICK_FLOOR_MS the virtual-time
      * floor (default 50 ms). */
-    /* FAITHFUL FIX (2026-06-14): the forced OSEK systick is the QEMU model of the
-     * periodic system tick the ERCOSEK kernel needs but cannot arm itself pre-phase-4
-     * (it never programs STM CMP0 until promoted -- the chicken-and-egg). It must be
-     * ON by default: without it the phase-3 watchdog kick (FUN_800c3c1a) is starved of
-     * a consistent ~333us tick, the kick gap exceeds the 1.9ms window, cnt37 (0xD0004037)
-     * grows past 9, and FUN_800c3c68 software-resets the ECU (DTC 0x3045) every ~165ms --
-     * the persistent phase-3 reset loop. With the systick on, the boot holds phase 3
-     * (only the early coding/ADC self-test transients reset, then it stabilises) WITHOUT
-     * the TC1797_KICKCAL poke. Disable with TC1797_NO_SYSTICK for A/B. */
-    s->osek_enabled = (getenv("TC1797_NO_SYSTICK") == NULL);
+    /* SUPERSEDED / REDUNDANT (2026-06-17): the forced OSEK systick was a pre-CMP0-pin bootstrap crutch.
+     * With the faithful CMP0 cold-init tick pin (tc1797_stm_match_ticks) the firmware's OWN STM CMP0
+     * compare drives the schedule at its intended 100us cadence from cold-init on, and the phase-3
+     * watchdog kick (FUN_800c3c1a) stays inside its 1.9ms window WITHOUT any injected tick. A/B verified:
+     * with the forced systick OFF the boot is byte-identical to it ON -- 208 phase-4 samples, 0 DTCs,
+     * 0xD000987C climbs to 637, os_running reached at the same ~219ms. So the forced systick is now
+     * REDUNDANT (and continuing to run it only double-drives the schedule cursor + watchdog kick). It is
+     * DEFAULT-OFF; opt back in for bring-up A/B with TC1797_SYSTICK=1. The old 2026-06-14 rationale
+     * (kick starves without it) was true ONLY before the CMP0 pin existed. */
+    s->osek_enabled = (getenv("TC1797_SYSTICK") != NULL);
     {
         const char *mp = getenv("TC1797_SYSTICK_MINPHASE");
         const char *fl = getenv("TC1797_SYSTICK_FLOOR_MS");
@@ -5329,11 +5348,12 @@ static void tc1797_machine_init(MachineState *machine)
      * `RET`. The firmware plants these self-loops as deliberate fail-safe halts
      * (e.g. 0x80018eac) expecting the on-chip watchdog to reset the SoC. We do
      * not model the WDT-reset, so native TCG would translate the self-jump into
-     * a TB that branches to itself and peg the CPU forever. NOP the jump so the
-     * firmware falls through to the RET, matching bridge_server.py's proven
-     * patch. Exactly 8 such sites exist in this image; the FCE CRC over the
-     * patched region is satisfied by the passthrough oracle in tc1797_sfr_read
-     * (PC==0xAFFFCFE6).
+     * a TB that branches to itself and peg the CPU forever. Historically we
+     * NOP'd the jump so the firmware fell through to the RET. RESOLVED 2026-06-17
+     * (see the gated loop below): a clean boot to os_running reaches NONE of these
+     * 8 halts, so the patch is now OPT-IN (TC1797_WDT_PATCH=1) and the image runs
+     * UNMODIFIED by default -- which also lets the BROM BMI CRC match the real
+     * bytes (the FCE oracle in tc1797_sfr_read is then only a fallback).
      */
     if (machine->kernel_filename) {
         gchar *data = NULL;
@@ -5355,12 +5375,22 @@ static void tc1797_machine_init(MachineState *machine)
         g_free(data);
 
         int wdt_patches = 0;
-        for (size_t off = 0; off + 4 <= len; off += 2) {
-            if (fw[off] == 0x3C && fw[off + 1] == 0x00 &&
-                fw[off + 2] == 0x00 && fw[off + 3] == 0x90) {
-                fw[off] = 0x00;          /* J disp8=0  ->  NOP (16-bit 0x0000) */
-                fw[off + 1] = 0x00;
-                wdt_patches++;
+        /* RESOLVED (2026-06-17): the 8 patched sites are all fail-safe HALT/panic/reset paths
+         * (FUN_80018e18 fatal panic, FUN_8001c820 reset routine, FUN_801254c6/FUN_80125550 STM-config
+         * error halts). A/B verified a CLEAN boot reaches NONE of them: with the patch fully OFF the
+         * boot reaches phase 4 + os_running and holds 90s (208 ph4 samples, 0 DTCs, 987c->637, no CPU
+         * ever stalls at a J-self PC). The old "first native stall" only happened in the pre-CMP0-pin
+         * broken boot. The firmware now runs UNMODIFIED by default -- faithful, and the unmodified image
+         * also lets the BROM BMI CRC match (no patched bytes to perturb it). Kept opt-in
+         * (TC1797_WDT_PATCH=1) ONLY as a diagnostic for isolating a regressed boot that DOES hit a panic. */
+        if (getenv("TC1797_WDT_PATCH") != NULL) {
+            for (size_t off = 0; off + 4 <= len; off += 2) {
+                if (fw[off] == 0x3C && fw[off + 1] == 0x00 &&
+                    fw[off + 2] == 0x00 && fw[off + 3] == 0x90) {
+                    fw[off] = 0x00;          /* J disp8=0  ->  NOP (16-bit 0x0000) */
+                    fw[off + 1] = 0x00;
+                    wdt_patches++;
+                }
             }
         }
         /*
