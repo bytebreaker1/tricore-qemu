@@ -234,6 +234,26 @@ bool tc1797_can_rx_inject(Tc1797Can *c, uint32_t can_id,
     if (len > 8) {
         len = 8;
     }
+    /* DIAGNOSTIC (env TC1797_MODUMP): one-shot dump of the full configured message-object
+     * map so we can enumerate every CAN ID the DME RECEIVES (dir=RX) vs transmits (dir=TX) --
+     * the foundation of the KOEO bus target list. Triggered on the first injected frame. */
+    if (getenv("TC1797_MODUMP")) {
+        static int dumped;
+        if (!dumped++) {
+            int nrx = 0, ntx = 0;
+            for (int n = 0; n < TC1797_CAN_NMO; n++) {
+                Tc1797CanMO *m = &c->mo[n];
+                if (!m->configured) {
+                    continue;
+                }
+                fprintf(stderr, "MODUMP MO%-3d id=0x%03x mask=0x%03x dir=%s\n",
+                        n, m->id, m->mask, m->dir ? "TX" : "RX");
+                if (m->dir) { ntx++; } else { nrx++; }
+            }
+            fprintf(stderr, "MODUMP total: %d RX, %d TX configured MOs\n", nrx, ntx);
+            fflush(stderr);
+        }
+    }
     static int mol = -1;
     if (mol < 0) {
         mol = getenv("TC1797_MOLOG") ? 1 : 0;
