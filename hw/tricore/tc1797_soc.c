@@ -74,6 +74,7 @@ struct TC1797SoCState {
     /*< public >*/
     TriCoreCPU cpu;
     MemoryRegion pflash_c, pflash_u;
+    MemoryRegion modvec;             /* env TC1797_MODVEC: overlay on the diag/module vector @0x800627d0 to log who reads it */
     MemoryRegion brom_c, brom_u;
     MemoryRegion dspr, pspr;
     MemoryRegion sfr;          /* peripheral/SFR space (native model below) */
@@ -264,12 +265,50 @@ struct TC1797SoCState {
  * bridge_server.py's STM model. The CMP0/CMP1 compare-match interrupt is not
  * wired yet (returns no-pending); that lands with the STM->IR->CPU path.
  */
+/* STM-FREEZE (env TC1797_STM_FREEZE): give the OSEK schedule ISR (FUN_80081870) a
+ * STABLE STM TIM0 for the duration of its do-while, as on silicon where the
+ * free-running counter advances only a few us-worth of ticks during the short ISR.
+ * Under -icount the ISR's own retired instructions inflate QEMU_CLOCK_VIRTUAL (=TIM0),
+ * so the firmware re-arms CMP0 behind the live counter and the schedule deadline runs
+ * 4-7x ahead of TIM0 (the phase-4 cadence root, see EMU_TIMING_DIAGNOSIS.md). We
+ * snapshot TIM0 at the ISR's first TIM read and hold it until the firmware re-arms CMP0
+ * forward (ISR exit) -> the do-while converges against a stable counter -> the faithful
+ * crutch-free OSEK tick (no 100us CMP0 pin, no overdue self-fire). */
+static int               g_stm_freeze_en = -1;   /* env cache: TC1797_STM_FREEZE */
+static bool              g_stm_freeze;            /* currently holding the snapshot */
+static uint64_t          g_stm_freeze_snap;       /* the held 56-bit counter value */
+static uint8_t           g_stm_phase;             /* cached boot phase (0xD0003643) */
+static uint8_t           g_stm_sched_prio;        /* CCPN of the schedule ISR (CMP0 SRPN) */
+static CPUTriCoreState  *g_stm_cpu_env;           /* for live CCPN reads in count56 */
+
 static uint64_t tc1797_stm_count56(uint32_t ns_per_tick)
 {
-    uint64_t ns = (uint64_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    /* 56-bit free-running counter at f_stm (ns_per_tick = 1e9 / f_stm;
-     * = 10 at the 100 MHz default, reproducing the former hardcoded /10). */
-    return (ns / ns_per_tick) & 0x00FFFFFFFFFFFFFFULL;
+    uint64_t live = ((uint64_t)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) / ns_per_tick)
+                    & 0x00FFFFFFFFFFFFFFULL;
+    /* STM-FREEZE (env TC1797_STM_FREEZE): on silicon the free-running STM advances only a
+     * few us-worth of ticks during the short schedule ISR; under -icount the ISR's own
+     * retired instructions inflate VIRTUAL time (=TIM0), so the firmware re-arms CMP0
+     * behind the live counter and the deadline runs 4-7x ahead (the phase-4 cadence root).
+     * Fix: while the CPU is executing the schedule ISR (CCPN == its SRPN) at phase>=4,
+     * hold TIM0 at the value sampled on ISR entry. CCPN-scoped = robust: it spans the ISR
+     * AND its callees (ActivateTask, the thunks all run at the ISR's priority) and releases
+     * exactly when the ISR returns -- no fragile read/write delimiter, no TIM0 stall. */
+    if (g_stm_freeze_en > 0 && g_stm_cpu_env && g_stm_sched_prio
+        && g_stm_phase >= 4 && g_stm_phase < 0x40
+        && (g_stm_cpu_env->ICR & 0xFFu) == g_stm_sched_prio) {
+        if (!g_stm_freeze) {
+            g_stm_freeze = true;
+            g_stm_freeze_snap = live;
+        }
+        /* SAFETY: never hold longer than ~2.2ms of ticks (a real ISR is a few us). */
+        if (((live - g_stm_freeze_snap) & 0x00FFFFFFFFFFFFFFULL) > 200000ull) {
+            return live;
+        }
+        return g_stm_freeze_snap;
+    }
+    g_stm_freeze = false;
+    /* 56-bit free-running counter at f_stm (ns_per_tick = 1e9 / f_stm). */
+    return live;
 }
 
 /*
@@ -379,6 +418,16 @@ static uint64_t tc1797_stm_match_ticks(TC1797SoCState *s, int ch, uint64_t tim_n
      * window, exactly as on silicon -- no 47s wrap, no storm. */
     static uint64_t last_fwd[2] = { 0, 0 };
     bool overdue = (delta > (period >> 1));
+    if ((ch & 1) && getenv("TC1797_CMP1LOG")) {
+        static unsigned c1; static uint64_t maxd;
+        if (delta && !overdue && delta > maxd) { maxd = delta; }
+        if (c1++ < 3000) {
+            fprintf(stderr, "CMP1 delta=%llu overdue=%d last_fwd=%llu maxfwd=%llu period=%llu\n",
+                    (unsigned long long)delta, overdue, (unsigned long long)last_fwd[1],
+                    (unsigned long long)maxd, (unsigned long long)period);
+            fflush(stderr);
+        }
+    }
     /* CMP1 (the OSEK alarm timer, cold-init CMP1 = TIM0 + 90000 = 1 ms) is intentionally NOT pinned: it
      * must fire at the firmware's NEAR-alarm rate (the alarm queue FUN_801250e8 re-arms it sub-1 ms), so
      * pinning it to its 1 ms cold-init period STARVES the dispatch and the boot holds at phase 3 (verified
@@ -399,7 +448,17 @@ static uint64_t tc1797_stm_match_ticks(TC1797SoCState *s, int ch, uint64_t tim_n
      * the faithful 100us cadence, the dispatch runs, the debounce reaches 60 -> phase 4 -> os_running,
      * and the watchdog kick stays inside its 1.9ms window. CMP1 (the 1ms alarm timer) is left to its own
      * model -- pinning it to 1ms breaks the dispatch (it must fire at the firmware's near-alarm rate). */
-    if (!getenv("TC1797_NO_OSEKTICK")) {
+    if (g_stm_freeze_en < 0) {
+        g_stm_freeze_en = getenv("TC1797_STM_FREEZE") ? 1 : 0;
+    }
+    /* FAITHFUL DEFAULT (2026-06-21): the 100us CMP0 pin was a crutch for the shift=2 icount
+     * read->write inflation (CPU ~2x too fast vs the STM). With the correct CPU:STM ratio
+     * (-icount shift=4) the firmware's own accumulated deadline tracks TIM0 1:1 (measured
+     * ratio 1.0, stable phase 4, cursor cycling) with NO pin -- exactly as silicon. The pin
+     * is now OPT-IN (TC1797_OSEKTICK_PIN) for the legacy shift=2 path only. See
+     * EMU_TIMING_DIAGNOSIS.md / tc1797_schedule_cadence_root. */
+    bool freeze_active = (g_stm_freeze_en == 1 && g_stm_phase >= 4 && g_stm_phase < 0x40);
+    if (getenv("TC1797_OSEKTICK_PIN") && !freeze_active) {
         uint64_t pin = (ch & 1) ? 0u : 9000u;            /* CMP0 = 100us OSEK tick; CMP1 unpinned */
         const char *pe = (ch & 1) ? getenv("TC1797_OSEKTICK1") : getenv("TC1797_OSEKTICK0");
         if (pe) {
@@ -415,6 +474,19 @@ static uint64_t tc1797_stm_match_ticks(TC1797SoCState *s, int ch, uint64_t tim_n
     if (delta != 0 && !overdue) {
         last_fwd[ch & 1] = delta;          /* a normal forward arm: learn the cadence */
         return delta;
+    }
+    /* FAITHFUL overdue CMP1 (env TC1797_CMP1_FAITHFUL, default-off). Requires TC1797_SRC_FIX too (else the
+     * schedule, mis-routed to CMP1, dies). Measured (TC1797_CMPWR signed delta): every
+     * firmware CMP1 arm is FORWARD while the alarm is active; CMP1 fires once at its deadline (~128ms,
+     * phase3->4) and then the firmware STOPS re-arming it (no next alarm) -- the value just goes stale.
+     * On silicon a windowed-equality compare left behind the counter does NOT re-fire until the window
+     * wraps (~47s for the 32-bit MSIZE=31 compare) -- it stays SILENT until re-armed forward. The old
+     * last_fwd path instead re-fired the stale alarm every ~60us (SRPN7 flood) = the os_running churn.
+     * Return the real windowed period so an overdue/stale CMP1 stays silent (faithful), while forward
+     * arms still fire on time. CMP0 is untouched: it is pinned to 100us above, which absorbs the single
+     * 1.2ms phase3->4 schedule gap (CMP0 has only ~5 overdue arms ever, all at that gap). */
+    if ((ch & 1) && !getenv("TC1797_CMP1_FLOOD")) {  /* DEFAULT-ON: pairs with the faithful SRC map */
+        return delta ? delta : period;     /* silent until the firmware re-arms CMP1 forward */
     }
     if (last_fwd[ch & 1] >= 64) {
         return last_fwd[ch & 1];           /* overdue/exact: reuse the firmware's own period */
@@ -441,6 +513,29 @@ static void tc1797_stm_arm(TC1797SoCState *s)
     for (int ch = 0; ch < 2; ch++) {
         if (!tc1797_stm_cmp_enabled(s, ch)) {
             s->stm_cmp_deadline[ch] = INT64_MAX;
+            continue;
+        }
+        /* PENDING-FIRE PRESERVATION (2026-06-21): this arm runs on EVERY CMP write,
+         * including the schedule ISR's frequent CMP0 re-arms. If the OTHER channel (the
+         * alarm, CMP1) was armed FORWARD and TIM0 has since crossed its deadline -- an
+         * icount jump during the ISR, impossible on silicon where TIM0 hits every value --
+         * that deadline is now <= now = a match still owed. Re-computing it here would find
+         * it "overdue", silence it, and CANCEL the alarm fire, so the alarm-expiry ISR never
+         * runs -> CMP1 is never re-armed -> the periodic OSEK alarms (COM/MSDI/d00
+         * re-activation) die. Keep a crossed-but-undelivered deadline so tc1797_stm_tick
+         * still delivers it (the timer fires immediately for best <= now). */
+        /* The alarm-fix (preserve a crossed CMP1 so the pending alarm fires + re-arms) is
+         * CORRECT -- it makes CMP1 fire (was 0 fires) -- but it EXPOSES a downstream reset:
+         * the now-firing alarm activates the COM/MSDI tasks, which reset-loop on the unfilled
+         * MSDI bank2 (separate thread tc1797_msdi_model). Env-gated OFF so the default stays
+         * STABLE at phase 4 until the MSDI fill lands; TC1797_ALARM_FIX=1 to combine them. */
+        static int g_alarm_fix = -1;
+        if (g_alarm_fix < 0) { g_alarm_fix = getenv("TC1797_ALARM_FIX") ? 1 : 0; }
+        if (ch == 1 && g_alarm_fix && s->stm_cmp_deadline[ch] != INT64_MAX
+            && s->stm_cmp_deadline[ch] <= now) {           /* alarm (CMP1) only */
+            if (s->stm_cmp_deadline[ch] < best) {
+                best = s->stm_cmp_deadline[ch];
+            }
             continue;
         }
         int64_t when = now + (int64_t)(tc1797_stm_match_ticks(s, ch, tim_now)
@@ -1253,6 +1348,28 @@ static void tc1797_stm_tick(void *opaque)
             s->stm_isrr |= 2u; s->stm_icr |= 0x20u;       /* CMP1 request + CMP1IR */
             g_icprof_cmp1_fires++;
         }
+        /* BOOT-TIMELINE diag (env TC1797_TICKTL): when does CMP0 fire vs stop, and when does the CMP1
+         * flood onset relative to the boot phases? Logs EVERY CMP0 fire (rare) + the cumulative CMP1
+         * count once per virtual-ms (the flood rate). Reveals if the backlog forms at a discrete event
+         * (counter jump) or gradually. Default-off; no effect on the boot. */
+        if (getenv("TC1797_TICKTL")) {
+            static uint64_t last_ms = (uint64_t)-1;
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            uint64_t ms = (uint64_t)(now / 1000000);
+            uint32_t cmp_reg = ch ? s->stm_cmp1 : s->stm_cmp0;
+            uint32_t tim_lo = (uint32_t)tc1797_stm_count56(s->stm_ns_per_tick);
+            if (ch == 0) {
+                fprintf(stderr, "TICKTL CMP0-FIRE #%u t=%llums ph=%u cmp0=%08x tim=%08x\n",
+                        g_icprof_cmp0_fires, (unsigned long long)ms, ph, cmp_reg, tim_lo);
+                fflush(stderr);
+            } else if (ms != last_ms) {
+                fprintf(stderr, "TICKTL t=%llums ph=%u cmp0f=%u cmp1f=%u cmp1=%08x tim=%08x\n",
+                        (unsigned long long)ms, ph, g_icprof_cmp0_fires, g_icprof_cmp1_fires,
+                        cmp_reg, tim_lo);
+                fflush(stderr);
+                last_ms = ms;
+            }
+        }
         if (getenv("TC1797_FIRERATE")) {
             static int64_t lastf[2]; static uint32_t prevcmp[2]; static unsigned frn;
             uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
@@ -1272,6 +1389,16 @@ static void tc1797_stm_tick(void *opaque)
         if (srpn) {
             tc1797_icu_set(s, srpn);
             raised = true;
+        }
+        if (g_stm_freeze_en < 0) {
+            g_stm_freeze_en = getenv("TC1797_STM_FREEZE") ? 1 : 0;
+        }
+        if (ch == 0 && g_stm_freeze_en) {
+            /* env-gated: keep the default path untouched. Cache the schedule ISR's CCPN
+             * (its SRPN), the boot phase, and the CPU env for the CCPN-scoped freeze. */
+            cpu_physical_memory_read(0xD0003643u, &g_stm_phase, 1);
+            g_stm_sched_prio = (uint8_t)(s->stm_src0 & 0xFFu);
+            g_stm_cpu_env = &s->cpu.env;
         }
         if (getenv("TC1797_STMLOG")) {
             static unsigned firen;
@@ -1634,7 +1761,7 @@ static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
     }
     if (addr >= 0xF0000210 && addr <= 0xF000022C) {
         /* TC1797 UM 11.x: TIMk = bits[k*4+31 : k*4] (k=0..6); +0x2C = CAP =
-         * bits[63:32] of the 56-bit counter. */
+         * bits[63:32] of the 56-bit counter. (Freeze is CCPN-scoped inside count56.) */
         uint64_t v56 = tc1797_stm_count56(s->stm_ns_per_tick);
         unsigned idx = (addr - 0xF0000210u) >> 2;
         if (idx <= 6) {
@@ -1660,10 +1787,25 @@ static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
              | ((s->stm_isrr & 1u) << 1)
              | (((s->stm_isrr >> 1) & 1u) << 5);
     case 0xF0000240: return s->stm_isrr;         /* ISRR: pending bits (tuned baseline) */
-    case 0xF00002F8:                             /* SRC0 node (SRPN/SRE/TOS + SRR) */
-        return (s->stm_src0 & ~0x2000u) | ((s->stm_isrr & 1u) << 13);
-    case 0xF00002FC:                             /* SRC1 node */
+    case 0xF00002F8:                             /* STM SRC node @0xF8 (DAvE: SRC1/CMP1) */
+    case 0xF00002FC: {                           /* STM SRC node @0xFC (DAvE: SRC0/CMP0) */
+        /* FIDELITY FIX (env TC1797_SRC_FIX, default-off -- see below): DAvE/UM ground truth
+         * is SRC0(CMP0)=0xF00002FC,
+         * SRC1(CMP1)=0xF00002F8. The legacy model had these SWAPPED, which routed CMP0 to CMP1's SRPN
+         * and vice-versa: the firmware's SCHEDULE compare (CMP0, SRPN7) was driven by the model's CMP1
+         * (the overdue 60us FLOOD) and the alarm (CMP1, SRPN8) by CMP0's clean 100us pin -- the direct
+         * cause of the os_running churn. Faithful: 0xFC->src0/CMP0 (isrr bit0), 0xF8->src1/CMP1 (isrr
+         * bit1). stm_src0 stays CMP0's node so the tick routing (CMP0->stm_src0) and cmp_enabled hold. */
+        static int sfix = -1;
+        /* FAITHFUL DAvE map DEFAULT-ON (verified-correct SRC0=0xFC/SRC1=0xF8). Legacy swap via
+         * TC1797_SRC_LEGACY. Hunting the compensating bug that costs ~1 extra reset under the faithful map. */
+        if (sfix < 0) { sfix = getenv("TC1797_SRC_LEGACY") ? 0 : 1; }
+        bool use_src0 = sfix ? (addr == 0xF00002FCu) : (addr == 0xF00002F8u);
+        if (use_src0) {
+            return (s->stm_src0 & ~0x2000u) | ((s->stm_isrr & 1u) << 13);
+        }
         return (s->stm_src1 & ~0x2000u) | (((s->stm_isrr >> 1) & 1u) << 13);
+    }
     default:         return (uint32_t)tc1797_stm_count56(s->stm_ns_per_tick);
     }
 }
@@ -1705,10 +1847,38 @@ static void tc1797_stm_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
             }
         }
         s->stm_cmp0 = val;
+        if (getenv("TC1797_CMPWR")) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            uint32_t tim = (uint32_t)tc1797_stm_count56(s->stm_ns_per_tick);
+            int32_t sdelta = (int32_t)(val - tim);    /* >0 forward (silicon-OK), <0 overdue (artifact) */
+            static unsigned fwd0, ovd0, tot0; static int32_t maxovd0;
+            tot0++;
+            if (sdelta >= 0) { fwd0++; } else { ovd0++; if (-sdelta > maxovd0) maxovd0 = -sdelta; }
+            if (tot0 <= 30 || (tot0 % 2000) == 0) {
+                fprintf(stderr, "CMPWR0 #%u t=%lldms ph=%u cmp=%08x tim=%08x sdelta=%d [fwd=%u ovd=%u maxovd=%d]\n",
+                        tot0, (long long)(now / 1000000), ph, val, tim, sdelta, fwd0, ovd0, maxovd0);
+                fflush(stderr);
+            }
+        }
         tc1797_stm_arm(s);
         break;
     case 0xF0000234:                            /* CMP1 */
         s->stm_cmp1 = val;
+        if (getenv("TC1797_CMPWR")) {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+            uint32_t tim = (uint32_t)tc1797_stm_count56(s->stm_ns_per_tick);
+            int32_t sdelta = (int32_t)(val - tim);    /* >0 forward (silicon-OK), <0 overdue (artifact) */
+            static unsigned fwd1, ovd1, tot1; static int32_t maxovd1;
+            tot1++;
+            if (sdelta >= 0) { fwd1++; } else { ovd1++; if (-sdelta > maxovd1) maxovd1 = -sdelta; }
+            if (tot1 <= 30 || (tot1 % 2000) == 0) {
+                fprintf(stderr, "CMPWR1 #%u t=%lldms ph=%u cmp=%08x tim=%08x sdelta=%d [fwd=%u ovd=%u maxovd=%d]\n",
+                        tot1, (long long)(now / 1000000), ph, val, tim, sdelta, fwd1, ovd1, maxovd1);
+                fflush(stderr);
+            }
+        }
         tc1797_stm_arm(s);
         break;
     case 0xF0000238:                            /* CMCON: compare window/enable */
@@ -1732,28 +1902,33 @@ static void tc1797_stm_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
             tc1797_stm_ack(s);
         }
         break;
-    case 0xF00002F8:                            /* SRC0 node: SRPN/SRE/TOS + SETR/CLRR */
-        if (val & 0x4000u) {                    /* CLRR: ack the CMP0 request */
-            s->stm_isrr &= ~1u;
-            s->stm_icr &= ~2u;
-            if (s->stm_isrr == 0) {
-                tc1797_stm_ack(s);
+    case 0xF00002F8:                            /* STM SRC node @0xF8 (DAvE: SRC1/CMP1) */
+    case 0xF00002FC: {                          /* STM SRC node @0xFC (DAvE: SRC0/CMP0) */
+        /* FIDELITY FIX (env TC1797_SRC_FIX): see the read handler. Faithful map: 0xFC=SRC0/CMP0,
+         * 0xF8=SRC1/CMP1; legacy = swapped. CLRR acks the compare that OWNS this node. */
+        static int sfix = -1;
+        /* FAITHFUL DAvE map DEFAULT-ON (verified-correct SRC0=0xFC/SRC1=0xF8). Legacy swap via
+         * TC1797_SRC_LEGACY. Hunting the compensating bug that costs ~1 extra reset under the faithful map. */
+        if (sfix < 0) { sfix = getenv("TC1797_SRC_LEGACY") ? 0 : 1; }
+        bool is_src0 = sfix ? (addr == 0xF00002FCu) : (addr == 0xF00002F8u);
+        if (is_src0) {
+            if (val & 0x4000u) {                /* CLRR: ack the CMP0 request */
+                s->stm_isrr &= ~1u;
+                s->stm_icr &= ~2u;
+                if (s->stm_isrr == 0) { tc1797_stm_ack(s); }
             }
+            s->stm_src0 = val & 0x00001FFFu;    /* keep SRPN/TOS/SRE config bits */
+        } else {
+            if (val & 0x4000u) {                /* CLRR: ack the CMP1 request */
+                s->stm_isrr &= ~2u;
+                s->stm_icr &= ~0x20u;
+                if (s->stm_isrr == 0) { tc1797_stm_ack(s); }
+            }
+            s->stm_src1 = val & 0x00001FFFu;    /* keep SRPN/TOS/SRE config bits */
         }
-        s->stm_src0 = val & 0x00001FFFu;        /* keep SRPN/TOS/SRE config bits */
         tc1797_stm_arm(s);                      /* enabling SRE arms the tick */
         break;
-    case 0xF00002FC:                            /* SRC1 node */
-        if (val & 0x4000u) {                    /* CLRR: ack the CMP1 request */
-            s->stm_isrr &= ~2u;
-            s->stm_icr &= ~0x20u;
-            if (s->stm_isrr == 0) {
-                tc1797_stm_ack(s);
-            }
-        }
-        s->stm_src1 = val & 0x00001FFFu;        /* keep SRPN/TOS/SRE config bits */
-        tc1797_stm_arm(s);                      /* enabling CMP1's SRE arms the tick */
-        break;
+    }
     default: break;                             /* TIM/CAP read-only; rest ignored */
     }
 }
@@ -4661,6 +4836,46 @@ static void tc1797_icount_prof(void *opaque)
     timer_mod(icprof_timer, now + 2000);         /* ~2us = ~500 instr at shift=2 */
 }
 
+/* DIAG (env TC1797_MODVEC): the diag/module dispatch vector @0x800627d0 (function ptrs into the
+ * 0x803xxxxx diag modules + the MSDI driver 0x800a35b8 @entry 10) is walked by a dispatcher whose
+ * base-load is opaque to static RE (zero refs, no instruction loads it, no data pointer). This
+ * read-overlay returns the REAL flash value (via pflash_c host ptr -- no recursion) and logs the
+ * reader's PC + return-address (gpr_a[11]) -> reveals WHO/WHEN the dispatcher reads the vector
+ * (esp. the MSDI entry 0x800627f8), the one runtime signal that can crack the dispatch root. */
+static uint64_t tc1797_modvec_read(void *opaque, hwaddr off, unsigned size)
+{
+    TC1797SoCState *s = opaque;
+    uint8_t *fp = memory_region_get_ram_ptr(&s->pflash_c);
+    uint32_t flash_off = 0x627d0u + (uint32_t)off;       /* same flash bytes for cached+uncached */
+    uint32_t v = 0;
+    if (fp) {
+        memcpy(&v, fp + flash_off, 4);
+    }
+    {
+        uint32_t a  = 0x800627d0u + (uint32_t)off;
+        uint32_t pc = (uint32_t)s->cpu.env.PC & ~0x20000000u;
+        uint32_t ra = (uint32_t)s->cpu.env.gpr_a[11] & ~0x20000000u;
+        static unsigned n;
+        if (n++ < 400) {
+            fprintf(stderr, "MODVEC rd @%08x=%08x PC=%08x RA=%08x%s\n",
+                    a, v, pc, ra, (a == 0x800627f8u) ? "  <<< MSDI ENTRY" : "");
+            fflush(stderr);
+        }
+    }
+    return (size >= 4) ? v : (v & ((1u << (size * 8)) - 1u));
+}
+static void tc1797_modvec_write(void *opaque, hwaddr off, uint64_t val, unsigned size)
+{
+    /* the vector is flash (read-only); swallow writes (none expected) */
+}
+static const MemoryRegionOps tc1797_modvec_ops = {
+    .read = tc1797_modvec_read,
+    .write = tc1797_modvec_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1,
+    .valid.max_access_size = 4,
+};
+
 static void tc1797_soc_realize(DeviceState *dev, Error **errp)
 {
     TC1797SoCState *s = TC1797_SOC(dev);
@@ -4679,6 +4894,13 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
 
     make_ram(&s->pflash_c, "tc1797.pflash", TC1797_PFLASH_BASE, TC1797_PFLASH_SIZE);
     make_alias(&s->pflash_u, "tc1797.pflash.u", &s->pflash_c, TC1797_PFLASH_UBASE);
+    if (getenv("TC1797_MODVEC")) {
+        /* read-overlay the diag/module vector @0x800627d0 (higher priority than pflash) to log who
+         * reads it -- returns the real flash value, so the firmware is unaffected. */
+        memory_region_init_io(&s->modvec, OBJECT(s), &tc1797_modvec_ops, s,
+                              "tc1797.modvec", 0x100);
+        memory_region_add_subregion_overlap(get_system_memory(), 0x800627d0u, &s->modvec, 10);
+    }
     make_ram(&s->brom_c, "tc1797.brom", TC1797_BROM_BASE, TC1797_BROM_SIZE);
     make_alias(&s->brom_u, "tc1797.brom.u", &s->brom_c, TC1797_BROM_UBASE);
     make_ram(&s->dspr, "tc1797.dspr", TC1797_DSPR_BASE, TC1797_DSPR_SIZE);
