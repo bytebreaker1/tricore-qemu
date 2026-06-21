@@ -152,6 +152,28 @@ uint32_t tc1797_can_read(Tc1797Can *c, uint32_t addr)
         }
         return c->regs[idx];
     }
+    /* DIAGNOSTIC (env TC1797_GREGLOG): every GLOBAL (non-MO) CAN register the firmware reads,
+     * deduped per offset. The SRPN-29 RX ISR uses these (MSID/MSPND interrupt-pending-index
+     * registers, node status) to find WHICH MO is pending; this shows the mechanism + whether
+     * QEMU serves a live value or a stale 0 (the candidate COM-dispatch gap). */
+    {
+        static int gl = -1;
+        if (gl < 0) {
+            gl = getenv("TC1797_GREGLOG") ? 1 : 0;
+        }
+        if (gl) {
+            unsigned goff = addr - TC1797_CAN_BASE;
+            if (goff < 0x1000) {
+                static uint8_t gseen[0x400];
+                unsigned gi = goff >> 2;
+                if (gi < 0x400 && !gseen[gi]) {
+                    gseen[gi] = 1;
+                    fprintf(stderr, "GREGRD off=0x%03x val=0x%08x\n", goff, c->regs[idx]);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
     return (idx < TC1797_CAN_NREGS) ? c->regs[idx] : 0;
 }
 
@@ -193,11 +215,14 @@ void tc1797_can_write(Tc1797Can *c, uint32_t addr, uint32_t val)
         }
         if (val & (1u << 3)) {                      /* RESET NEWDAT: frame consumed */
             if (m->rx_pending && getenv("TC1797_CANACK")) {
-                static unsigned ack;
-                if (ack++ < 40) {
-                    fprintf(stderr, "CANACK firmware drained MO%d id=0x%03x (RX ISR ran)\n",
-                            n, m->id);
-                    fflush(stderr);
+                static uint16_t ackcnt[256];           /* per-MO drain count (distinct MOs) */
+                if (n < 256) {
+                    ackcnt[n]++;
+                    if (ackcnt[n] <= 3) {
+                        fprintf(stderr, "CANACK drained MO%d id=0x%03x (count=%u)\n",
+                                n, m->id, ackcnt[n]);
+                        fflush(stderr);
+                    }
                 }
             }
             m->rx_pending = false;
@@ -240,17 +265,31 @@ bool tc1797_can_rx_inject(Tc1797Can *c, uint32_t can_id,
     if (getenv("TC1797_MODUMP")) {
         static int dumped;
         if (!dumped++) {
-            int nrx = 0, ntx = 0;
+            int nrx = 0, ntx = 0, ndeliver = 0;
             for (int n = 0; n < TC1797_CAN_NMO; n++) {
                 Tc1797CanMO *m = &c->mo[n];
                 if (!m->configured) {
                     continue;
                 }
-                fprintf(stderr, "MODUMP MO%-3d id=0x%03x mask=0x%03x dir=%s\n",
-                        n, m->id, m->mask, m->dir ? "TX" : "RX");
-                if (m->dir) { ntx++; } else { nrx++; }
+                if (m->dir) {
+                    ntx++;
+                    fprintf(stderr, "MODUMP MO%-3d id=0x%03x mask=0x%03x dir=TX\n", n, m->id, m->mask);
+                    continue;
+                }
+                nrx++;
+                /* RX: resolve the MO's RX-interrupt node + that node's SRC -> does it deliver? */
+                uint32_t moipr = c->regs[mo_word(n, 0x08)];
+                unsigned node = (moipr >> 8) & 0x1Fu;
+                uint32_t src = tc1797_can_read(c, TC1797_CAN_BASE + 0xC0u + (node & 0xFu) * 4u);
+                unsigned srpn = src & 0xFFu, sre = (src >> 12) & 1u, tos = (src >> 10) & 1u;
+                bool deliver = sre && !tos;
+                if (deliver) { ndeliver++; }
+                fprintf(stderr, "MODUMP MO%-3d id=0x%03x mask=0x%03x dir=RX node=%2u SRC=0x%08x "
+                        "srpn=0x%02x sre=%u tos=%u %s\n",
+                        n, m->id, m->mask, node, src, srpn, sre, tos, deliver ? "DELIVERS" : "no-irq");
             }
-            fprintf(stderr, "MODUMP total: %d RX, %d TX configured MOs\n", nrx, ntx);
+            fprintf(stderr, "MODUMP total: %d RX (%d deliver an IRQ), %d TX configured MOs\n",
+                    nrx, ndeliver, ntx);
             fflush(stderr);
         }
     }

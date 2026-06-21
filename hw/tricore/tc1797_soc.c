@@ -206,6 +206,37 @@ struct TC1797SoCState {
     QEMUTimer *bootstrap_timer;  /* coding-marker bootstrap (env TC1797_BOOTSTRAP) */
     bool bootstrap_enabled;      /* seed the coding marker so the boot stabilises */
     bool bootstrap_done;         /* one-shot info log latch */
+    /* Engine model (env TC1797_ENGINE): faithful 60-2 crank + cam trigger-wheel generator. Fires
+     * GPTA LTCA2 captures (crank cell 2 / cam cell 3 -> SRPN 19 -> PCP ch19 engine-position math)
+     * at the tooth rate for a commanded RPM, plus a closed-loop VANOS cam-phaser plant that reads
+     * the DME's own cam-solenoid command and slews the cam phase, so the cam-sensor feedback
+     * reflects the DME output (emulating the physical VANOS loop). */
+    QEMUTimer *engine_timer;
+    bool     eng_enabled;
+    double   eng_rpm;            /* commanded crankshaft speed (RPM) */
+    unsigned eng_tooth;          /* 0..59 position on the 60-2 trigger wheel */
+    uint64_t eng_rev;            /* crank revolution counter (cam runs at half = 2 crank revs) */
+    int64_t  eng_t0_ns;          /* fallback GTTIM epoch if firmware hasn't seeded GTTIM0 */
+    double   cam_phase_deg[4];   /* VANOS actual phase: [0]=B1in [1]=B1exh [2]=B2in [3]=B2exh */
+    /* Per-cylinder crank-signal variance (misfire / rough-running / jitter simulation). The 720deg
+     * 4-stroke cycle has 6 combustion segments (120deg each); segment k belongs to firing-order[k].
+     * A modifier scales that cylinder's segment tooth-period: >1 = slow (no/weak combustion torque =
+     * misfire), random jitter = rough running, per-cycle miss probability = intermittent misfire. */
+    uint8_t  eng_firing[6];      /* firing order (cylinder #); default S55 I6 = 1-5-3-6-2-4 */
+    double   cyl_scale[6];       /* per-cyl steady segment-period scale (1=normal, >1=misfire) */
+    double   cyl_jitter[6];      /* per-cyl +/- random tooth-period jitter fraction (0..) */
+    double   cyl_miss_prob[6];   /* per-cyl per-720-cycle random-misfire probability (0..1) */
+    uint8_t  cyl_miss_now[6];    /* per-cycle latch: this cyl is misfiring this cycle */
+    uint64_t eng_rng;            /* xorshift64 PRNG for jitter/misfire (non-deterministic input) */
+    /* Closed-loop VANOS plant. The DME commands the cam-phaser oil-control solenoid via the L9959
+     * SPI driver on SSC1 (16-bit frames: high byte = register, low byte = data/duty); the physical
+     * phaser slews the cam, and the cam-position sensor (NW, GPTA cap cell 3) feeds the angle back.
+     * We capture the L9959 config, model the phaser as a 1st-order lag (duty -> target advance), and
+     * fire the cam capture at (crank reference + cam phase) so the sensor reflects the DME command. */
+    uint8_t  l9959_reg[256];     /* SSC1 captured config: reg(high byte) -> data(low byte) */
+    unsigned vanos_reg;          /* L9959 register holding the intake-VANOS duty (TC1797_VANOS_REG) */
+    double   vanos_max_deg;      /* full duty -> this much cam advance, crank deg (TC1797_VANOS_MAX) */
+    double   vanos_tau_s;        /* phaser hydraulic time constant, s (TC1797_VANOS_TAU) */
 };
 
 /*
@@ -1571,6 +1602,36 @@ static uint64_t tc1797_stm_read(TC1797SoCState *s, uint32_t addr)
             }
         }
     }
+    /* DIAGNOSTIC (env TC1797_COMPC): does the high-level COM raster actually execute at
+     * os_running? Logs (deduped, with count) every COM-layer PC that reads STM TIM0 -- the
+     * de-mux state machine FUN_8009fc6c + the d00/signal chain all read 0xF0000210. If these
+     * PCs never appear, the COM RxIndication/signal layer isn't running (the d00=0xff root). */
+    {
+        static int compc_en = -1;
+        if (compc_en < 0) { compc_en = getenv("TC1797_COMPC") ? 1 : 0; }
+        if (compc_en && addr == 0xF0000210u) {
+            uint32_t pc = (uint32_t)s->cpu.env.PC & ~0x20000000u;
+            int com = (pc >= 0x8009c000u && pc < 0x800a0000u)     /* FUN_8009c686/cb/fb42/fc6c/df9c */
+                   || (pc >= 0x800fe000u && pc < 0x80102000u)     /* FUN_800ff434/4ea/eee + range-drivers */
+                   || (pc >= 0x80120000u && pc < 0x8012a000u)     /* FUN_80129444/801291fa d00 chain */
+                   || (pc >= 0x80359000u && pc < 0x8035a000u);    /* FUN_80359a30 (0x388 demux) */
+            if (com) {
+                static uint32_t cp[128]; static unsigned long cc[128]; static unsigned cn;
+                unsigned i;
+                for (i = 0; i < cn; i++) { if (cp[i] == pc) break; }
+                if (i == cn && cn < 128) { cp[cn++] = pc; fprintf(stderr, "COMPC new %08x\n", pc); fflush(stderr); }
+                if (i < 128) { cc[i]++; }
+                static unsigned long tot;
+                if (++tot % 20000 == 0) {
+                    fprintf(stderr, "--- COMPC summary (tot=%lu, distinct=%u) ---\n", tot, cn);
+                    for (unsigned k = 0; k < cn; k++) {
+                        fprintf(stderr, "COMPC pc=%08x cnt=%lu\n", cp[k], cc[k]);
+                    }
+                    fflush(stderr);
+                }
+            }
+        }
+    }
     if (addr >= 0xF0000210 && addr <= 0xF000022C) {
         /* TC1797 UM 11.x: TIMk = bits[k*4+31 : k*4] (k=0..6); +0x2C = CAP =
          * bits[63:32] of the 56-bit counter. */
@@ -1990,6 +2051,15 @@ static void tc1797_gpta_route(void *opaque, uint8_t srpn, bool to_pcp)
     if (srpn == 0) {
         return;
     }
+    if (srpn == 19u) {       /* crank/cam engine-position node: confirm captures reach PCP ch19 */
+        static int erl = -1; static unsigned ec;
+        if (erl < 0) { erl = getenv("TC1797_ENGINELOG") ? 1 : 0; }
+        if (erl && (ec++ % 58u) == 0u && ec < 58u * 4000u) {
+            fprintf(stderr, "ENGROUTE srpn=19 to_pcp=%d pcp_en=%d n=%u\n",
+                    to_pcp, s->pcp_enabled, ec);
+            fflush(stderr);
+        }
+    }
     if (to_pcp) {
         if (s->pcp_enabled) {
             pcp_engine_trigger(&s->pcp, srpn);
@@ -1997,6 +2067,137 @@ static void tc1797_gpta_route(void *opaque, uint8_t srpn, bool to_pcp)
     } else {
         tc1797_raise_srpn(s, srpn);
     }
+}
+
+/*
+ * Engine trigger-wheel generator (env TC1797_ENGINE). Models the 60-2 crankshaft sensor wheel and
+ * the camshaft sensor as GPTA LTCA2 capture inputs -- exactly the path the firmware's PCP channel-19
+ * engine-position math consumes. Each timer tick advances one 60th of a crank revolution: a present
+ * tooth latches the live GTTIM0 value into the crank cell's LTCXR and pulses SRPN 19 to PCP ch19;
+ * the 2-tooth gap (positions 58-59) is skipped so the firmware sees the 3x-period reference and
+ * finds TDC. The cam cell fires once per cam revolution (every 2 crank revs), later offset by the
+ * live VANOS phase (closed loop). Commanded RPM = env TC1797_ENGINE_RPM (default 800 idle).
+ */
+static uint32_t tc1797_engine_gttim0(TC1797SoCState *s, int64_t now)
+{
+    /* The crank LTCXR latches GPTA0 GTTIM0 (slot 0). Use the firmware-seeded timer if running so the
+     * captured tooth timestamps share the firmware's clock frame; else our own 399 ns rate. */
+    if (s->gpta.gt_run[0]) {
+        return (uint32_t)((s->gpta.gt_base[0]
+                + (uint32_t)((now - (int64_t)s->gpta.gt_t0_ns[0]) / 399)) & 0x00FFFFFFu);
+    }
+    return (uint32_t)(((now - s->eng_t0_ns) / 399) & 0x00FFFFFFu);
+}
+
+/* xorshift64 -> [0,1). Models physical combustion/sensor noise; intentionally non-deterministic
+ * (the crank wheel is an external input, not part of the icount-deterministic guest execution). */
+static inline double tc1797_engine_rand(TC1797SoCState *s)
+{
+    uint64_t x = s->eng_rng ? s->eng_rng : 0x9E3779B97F4A7C15ull;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    s->eng_rng = x;
+    return (double)(x >> 11) * (1.0 / 9007199254740992.0);   /* / 2^53 -> [0,1) */
+}
+
+static void tc1797_engine_tick(void *opaque)
+{
+    TC1797SoCState *s = opaque;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    double rpm = s->eng_rpm;
+    if (rpm < 1.0) {                          /* stalled: idle re-check */
+        timer_mod(s->engine_timer, now + 5000000);
+        return;
+    }
+    /* 60 wheel positions per crank revolution -> position period = 1e9 / rpm ns
+     * (rpm rev/min => rpm/60 rev/s => x60 positions => rpm positions/s). */
+    int64_t tooth_ns = (int64_t)(1.0e9 / rpm);
+    if (tooth_ns < 1000) {
+        tooth_ns = 1000;                      /* clamp absurd RPM */
+    }
+
+    /* Per-cylinder crank variance: locate the 720deg-cycle combustion segment (6 of 120deg each)
+     * and apply that cylinder's modifier (steady scale + random jitter + random misfire) to this
+     * tooth's period. A slow segment = weak/absent combustion torque -- exactly the crank-speed
+     * signature the DME's misfire detector looks for. */
+    unsigned cyc_pos = ((unsigned)(s->eng_rev & 1u)) * 60u + s->eng_tooth;  /* 0..119 over 720deg */
+    unsigned seg = (cyc_pos / 20u) % 6u;
+    unsigned ci  = (s->eng_firing[seg] >= 1u && s->eng_firing[seg] <= 6u)
+                   ? (unsigned)(s->eng_firing[seg] - 1u) : 0u;
+    if ((cyc_pos % 20u) == 0u) {              /* segment start: roll this cylinder's random misfire */
+        s->cyl_miss_now[ci] = (tc1797_engine_rand(s) < s->cyl_miss_prob[ci]) ? 1u : 0u;
+    }
+    double scale = s->cyl_scale[ci] > 0.0 ? s->cyl_scale[ci] : 1.0;
+    if (s->cyl_miss_now[ci]) {
+        scale *= 1.30;                        /* a missed combustion this cycle: ~30% slower segment */
+    }
+    if (s->cyl_jitter[ci] > 0.0) {
+        scale *= 1.0 + (tc1797_engine_rand(s) * 2.0 - 1.0) * s->cyl_jitter[ci];
+    }
+    if (scale < 0.1) {
+        scale = 0.1;
+    }
+    tooth_ns = (int64_t)((double)tooth_ns * scale);
+
+    uint32_t gttim = tc1797_engine_gttim0(s, now);
+    bool present = (s->eng_tooth < 58);       /* 60-2: positions 58,59 are the missing-tooth gap */
+    if (present) {
+        tc1797_gpta_capture(&s->gpta,
+            GPTA_LTCA2_OFF + GPTA_LTC_OFF + GPTA_CRANK_CELL * 8u + 4u, gttim);
+    }
+    /* Closed-loop VANOS: slew the modelled cam phase toward the DME's commanded duty (read back from
+     * the L9959 register the DME wrote over SSC1), then fire the cam-position-sensor capture at
+     * (crank reference + cam phase). The DME measures the cam-vs-crank offset = the phase, compares
+     * to its target, and adjusts the duty -- closing the loop through this plant. One pulse / cam rev
+     * (= 2 crank revs). */
+    {
+        double duty   = (double)s->l9959_reg[s->vanos_reg & 0xFFu] / 255.0;     /* 0..1 */
+        double target = duty * s->vanos_max_deg;                               /* crank-deg advance */
+        double dt     = (double)tooth_ns / 1.0e9;
+        double a      = dt / (s->vanos_tau_s + dt);                            /* 1st-order hydraulic lag */
+        s->cam_phase_deg[0] += (target - s->cam_phase_deg[0]) * a;
+        int cam_pos = (int)(s->cam_phase_deg[0] / 6.0);                        /* 6 deg per wheel position */
+        cam_pos %= 120;
+        if (cam_pos < 0) {
+            cam_pos += 120;
+        }
+        if ((int)cyc_pos == cam_pos) {
+            tc1797_gpta_capture(&s->gpta,
+                GPTA_LTCA2_OFF + GPTA_LTC_OFF + GPTA_CAM_CELL * 8u + 4u, gttim);
+            static int vl = -1; static unsigned vc;
+            if (vl < 0) {
+                vl = getenv("TC1797_ENGINELOG") ? 1 : 0;
+            }
+            if (vl && vc++ < 2000) {
+                fprintf(stderr, "VANOS duty=%.2f (reg0x%02x=%u) target=%.1f cam_phase=%.1fdeg pos=%d\n",
+                        duty, s->vanos_reg & 0xFFu, s->l9959_reg[s->vanos_reg & 0xFFu],
+                        target, s->cam_phase_deg[0], cam_pos);
+                fflush(stderr);
+            }
+        }
+    }
+
+    {
+        static int elog = -1; static unsigned el;
+        if (elog < 0) {
+            elog = getenv("TC1797_ENGINELOG") ? 1 : 0;
+        }
+        /* Log once per combustion segment (mid-segment) so per-cylinder variance is visible. */
+        if (elog && (cyc_pos % 20u) == 10u && el++ < 6u * 2000u) {
+            fprintf(stderr, "ENG rpm=%.0f rev=%llu seg=%u cyl=%u scale=%.3f miss=%u gttim=0x%06x\n",
+                    rpm, (unsigned long long)s->eng_rev, seg, ci + 1u, scale,
+                    s->cyl_miss_now[ci], gttim);
+            fflush(stderr);
+        }
+    }
+
+    if (++s->eng_tooth >= 60u) {
+        s->eng_tooth = 0;
+        s->eng_rev++;
+    }
+    timer_mod(s->engine_timer, now + tooth_ns);
 }
 
 /*
@@ -3102,6 +3303,20 @@ static void tc1797_ssc_write(TC1797SoCState *s, int unit, uint32_t off,
         }
         s->ssc_prev[unit] = s->ssc_tb[unit];  /* MSDI replies to the prior command */
         s->ssc_tb[unit] = val;               /* TB: latch for loopback */
+        if (unit == 1) {
+            /* SSC1 = TLE7183F + L9959 drivers (throttle/VANOS/wastegate). Capture the L9959 reg->data
+             * config (16-bit frame: high byte = register, low byte = data/duty) so the VANOS plant
+             * can read the DME's cam-solenoid command. */
+            s->l9959_reg[(val >> 8) & 0xFFu] = (uint8_t)(val & 0xFFu);
+            if (getenv("TC1797_SSC1LOG")) {
+                static unsigned s1;
+                if (s1++ < 4000) {
+                    fprintf(stderr, "SSC1TX tb=0x%08x pc=%08x\n",
+                            val, (uint32_t)s->cpu.env.PC & ~0x20000000u);
+                    fflush(stderr);
+                }
+            }
+        }
         /* UM 18/19: writing TBUF moves it to the transmit shift register (TSRC/+0xF4
          * fires, polled), which shifts out (TX) and shifts in (RX, loopback). When the
          * frame is fully received it is moved to RBUF and the RECEIVE interrupt RSRC
@@ -4318,6 +4533,55 @@ static const MemoryRegionOps p9a4_ops = {
 };
 static MemoryRegion g_p9a4_mr;
 
+/* ── Engine live-control MMIO (env TC1797_ENGINE): a tunnel-writable control block at 0xF7E00000 so
+ * the host can change RPM, per-cylinder misfire/jitter, and VANOS params on the fly (not just per-boot
+ * env). All u32 slots; per-cylinder values are x100 fixed-point (140 = 1.40). It is OUTSIDE the
+ * firmware's address map (a custom hole) so it cannot perturb the guest -- pure host-side control. */
+#define TC1797_ENGCTL_BASE 0xF7E00000u
+static uint64_t engctl_read(void *opaque, hwaddr addr, unsigned size)
+{
+    TC1797SoCState *s = opaque;
+    switch (addr) {
+    case 0x00: return (uint32_t)s->eng_rpm;
+    case 0x04: return s->vanos_reg & 0xFFu;
+    case 0x08: return (uint32_t)s->vanos_max_deg;
+    case 0x0C: return (uint32_t)(s->vanos_tau_s * 1000.0);
+    case 0x60: return (uint32_t)(s->cam_phase_deg[0] * 10.0);     /* live cam phase x10 (read-only) */
+    case 0x64: return s->l9959_reg[s->vanos_reg & 0xFFu];         /* live duty byte the DME wrote */
+    default:
+        if (addr >= 0x10 && addr < 0x28) { return (uint32_t)(s->cyl_scale[(addr - 0x10) / 4] * 100.0); }
+        if (addr >= 0x28 && addr < 0x40) { return (uint32_t)(s->cyl_jitter[(addr - 0x28) / 4] * 100.0); }
+        if (addr >= 0x40 && addr < 0x58) { return (uint32_t)(s->cyl_miss_prob[(addr - 0x40) / 4] * 100.0); }
+        return 0;
+    }
+}
+static void engctl_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
+{
+    TC1797SoCState *s = opaque;
+    uint32_t v = (uint32_t)val;
+    switch (addr) {
+    case 0x00: if (v <= 20000u) { s->eng_rpm = (double)v; } break;            /* RPM (live) */
+    case 0x04: s->vanos_reg = v & 0xFFu; break;                              /* VANOS duty register */
+    case 0x08: if (v && v <= 720u) { s->vanos_max_deg = (double)v; } break;   /* full-duty advance deg */
+    case 0x0C: if (v >= 1u && v <= 60000u) { s->vanos_tau_s = (double)v / 1000.0; } break; /* tau ms */
+    default:
+        if (addr >= 0x10 && addr < 0x28 && (addr & 3u) == 0u) {
+            s->cyl_scale[(addr - 0x10) / 4] = (double)(v & 0xFFFFu) / 100.0;
+        } else if (addr >= 0x28 && addr < 0x40 && (addr & 3u) == 0u) {
+            s->cyl_jitter[(addr - 0x28) / 4] = (double)(v & 0xFFFFu) / 100.0;
+        } else if (addr >= 0x40 && addr < 0x58 && (addr & 3u) == 0u) {
+            s->cyl_miss_prob[(addr - 0x40) / 4] = (double)(v & 0xFFFFu) / 100.0;
+        }
+        break;
+    }
+}
+static const MemoryRegionOps engctl_ops = {
+    .read = engctl_read, .write = engctl_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.min_access_size = 1, .valid.max_access_size = 4,
+};
+static MemoryRegion g_engctl_mr;
+
 /* DIAGNOSTIC (env TC1797_ICOUNT_PROF): fine instruction-budget profiler. Samples the guest PC every
  * ~2us of virtual time (~500 instructions at shift=2 -- far finer than PCHIST's STM-tick sampling),
  * buckets it by 256-byte PFLASH window, and snapshots the per-bucket counts between consecutive
@@ -4732,6 +4996,75 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
     s->adc_done_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_adc_conv_done, s);
     memset(s->adc_done_deadline, 0, sizeof(s->adc_done_deadline));
     s->gpta_cmp_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_gpta_cmp_tick, s);
+    /* Engine trigger-wheel generator (env TC1797_ENGINE; RPM via TC1797_ENGINE_RPM). Starts after
+     * the firmware reaches os_running (~229 ms) and has armed the LTCA2 crank/cam SRC nodes. */
+    s->eng_enabled = (getenv("TC1797_ENGINE") != NULL);
+    if (s->eng_enabled) {
+        const char *r = getenv("TC1797_ENGINE_RPM");
+        s->eng_rpm = r ? strtod(r, NULL) : 800.0;
+        s->eng_tooth = 0;
+        s->eng_rev = 0;
+        s->eng_t0_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        static const uint8_t s55_firing[6] = {1, 5, 3, 6, 2, 4};   /* S55 I6 firing order */
+        for (unsigned i = 0; i < 6; i++) {
+            s->eng_firing[i] = s55_firing[i];
+            s->cyl_scale[i] = 1.0;
+            s->cyl_jitter[i] = 0.0;
+            s->cyl_miss_prob[i] = 0.0;
+            s->cyl_miss_now[i] = 0;
+        }
+        s->eng_rng = 0x9E3779B97F4A7C15ull ^ (uint64_t)(s->eng_t0_ns + 0x1234567);
+        /* Per-cylinder crank variance: TC1797_ENGINE_MODS="cyl:key=val,...;cyl:..." (cyl 1-6; keys
+         * scale|jitter|miss). E.g. "3:scale=1.3" = steady cyl-3 misfire; "5:miss=0.1,jitter=0.02". */
+        const char *mods = getenv("TC1797_ENGINE_MODS");
+        if (mods) {
+            gchar **segs = g_strsplit(mods, ";", -1);
+            for (int si = 0; segs && segs[si]; si++) {
+                gchar **kc = g_strsplit(segs[si], ":", 2);
+                if (kc[0] && kc[1]) {
+                    int cyl = atoi(kc[0]);
+                    if (cyl >= 1 && cyl <= 6) {
+                        int ci = cyl - 1;
+                        gchar **pairs = g_strsplit(kc[1], ",", -1);
+                        for (int pi = 0; pairs && pairs[pi]; pi++) {
+                            gchar **kv = g_strsplit(pairs[pi], "=", 2);
+                            if (kv[0] && kv[1]) {
+                                double v = strtod(kv[1], NULL);
+                                if (!strcmp(kv[0], "scale")) { s->cyl_scale[ci] = v; }
+                                else if (!strcmp(kv[0], "jitter")) { s->cyl_jitter[ci] = v; }
+                                else if (!strcmp(kv[0], "miss")) { s->cyl_miss_prob[ci] = v; }
+                            }
+                            g_strfreev(kv);
+                        }
+                        g_strfreev(pairs);
+                        info_report("tc1797: ENGINE cyl%d mods scale=%.3f jitter=%.3f miss=%.3f",
+                                    cyl, s->cyl_scale[ci], s->cyl_jitter[ci], s->cyl_miss_prob[ci]);
+                    }
+                }
+                g_strfreev(kc);
+            }
+            g_strfreev(segs);
+        }
+        /* Closed-loop VANOS plant config. vanos_reg = the L9959 SPI register carrying the cam-solenoid
+         * duty (default 0x21 = the observed varying SSC1 frame; calibrate via TC1797_VANOS_REG). */
+        const char *vr = getenv("TC1797_VANOS_REG");
+        const char *vm = getenv("TC1797_VANOS_MAX");
+        const char *vt = getenv("TC1797_VANOS_TAU");
+        s->vanos_reg = vr ? (unsigned)strtoul(vr, NULL, 0) : 0x21u;
+        s->vanos_max_deg = vm ? strtod(vm, NULL) : 50.0;   /* full duty -> 50 deg crank cam advance */
+        s->vanos_tau_s = vt ? strtod(vt, NULL) : 0.10;     /* ~100 ms phaser hydraulic time constant */
+        s->cam_phase_deg[0] = 0.0;
+        s->engine_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tc1797_engine_tick, s);
+        const char *sm = getenv("TC1797_ENGINE_START_MS");
+        int64_t start_ms = sm ? strtoll(sm, NULL, 0) : 240;       /* just after phase 4 (~229 ms) */
+        timer_mod(s->engine_timer, s->eng_t0_ns + start_ms * 1000000LL);
+        /* Live host control over the mem tunnel: RPM, per-cylinder misfire/jitter, VANOS params. */
+        memory_region_init_io(&g_engctl_mr, OBJECT(s), &engctl_ops, s, "tc1797.engctl", 0x100);
+        memory_region_add_subregion_overlap(get_system_memory(), TC1797_ENGCTL_BASE,
+                                            &g_engctl_mr, 20);   /* overlay above the SFR background */
+        info_report("tc1797: ENGINE model ON, %.0f RPM (60-2 crank + cam -> SRPN 19 -> PCP ch19); "
+                    "live control @0x%08x", s->eng_rpm, TC1797_ENGCTL_BASE);
+    }
     {
         const char *e = getenv("TC1797_ADC_CONV_NS");
         s->adc_conv_ns = e ? (int64_t)strtoll(e, NULL, 0) : 50000;
