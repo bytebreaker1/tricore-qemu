@@ -52,7 +52,9 @@ static int tc_dbg_enabled(void)
              || getenv("TC1797_TASKLOG") || getenv("TC1797_MARCHLOG")
              || getenv("TC1797_CALSEED") || getenv("TC1797_PH4FN")
              || getenv("TC1797_COLDLOG") || getenv("TC1797_WDLOG")
-             || getenv("TC1797_KICKCAL2") || getenv("TC1797_IDLEPROF")) ? 1 : 0;
+             || getenv("TC1797_KICKCAL2") || getenv("TC1797_IDLEPROF")
+             || getenv("TC1797_MSDILOG2") || getenv("TC1797_MONTRACE")
+             || getenv("TC1797_MSDI_BYPASS")) ? 1 : 0;
     }
     return v;
 }
@@ -77,6 +79,67 @@ static inline bool tc_dbg_watch(uint32_t pc)
             uint32_t n = pc & ~0x20000000u;
             return n == 0x8010d8bau || n == 0x800c3c3cu || n == 0x8033bc24u
                 || n == 0x8036bc44u || n == 0x80119a7cu || n == 0x800c0300u;
+        }
+    }
+    {   /* TC1797_MSDI_BYPASS (default OFF, USER-REQUESTED TEMPORARY CRUTCH -- NOT FAITHFUL):
+         * force the MSDI bank-check FUN_8008034a to report success so the firmware advances
+         * its own bank sequence (fills bank2/3, b6->2) and the error counters never trip the
+         * 0x302c/d/e/f resets. Lets the boot stay stable WITH the alarm running (STM_CROSSING)
+         * while the faithful SC900685 init model remains open. Single watched PC = the ret. */
+        static int mb = -1;
+        if (mb < 0) { mb = getenv("TC1797_MSDI_BYPASS") ? 1 : 0; }
+        if (mb && (pc & ~0x20000000u) == 0x800803deu) {
+            return true;
+        }
+    }
+    {   /* TC1797_MSDILOG2: trace the MSDI cycler control flow to find why bank2 never
+         * fills (b6 stuck at 1). Watch the cycler, step1/2/3 entries, the MSDI init and
+         * the drain-mode setter -- low cardinality, only fires when these run. */
+        static int m2 = -1;
+        if (m2 < 0) { m2 = getenv("TC1797_MSDILOG2") ? 1 : 0; }
+        if (m2) {
+            uint32_t n = pc & ~0x20000000u;
+            return n == 0x800e0764u || n == 0x800e06d8u || n == 0x800e06a4u
+                || n == 0x800e070eu || n == 0x800df5c2u || n == 0x800c09ccu
+                || n == 0x800e09ceu || n == 0x800a57f2u || n == 0x800a5954u
+                || n == 0x8008034au   /* the bank d4d-CHECK (what bank/value it sees) */
+                || n == 0x8008008au   /* the bank2 READ (step3) -- ever reached? */
+                || n == 0x80080074u   /* the bank1-error RE-READ (the loop) */
+                || n == 0x800c466cu   /* StartOS MSDI-worker dispatcher */
+                || n == 0x800a5e1au   /* the worker (gated on DAT_d0019748) */
+                || n == 0x800a58deu   /* bank-read caller (gated DAT_d00196d0<300) */
+                || n == 0x80081840u   /* the OSEK schedule cursor dispatcher */
+                || n == 0x800d3bb0u   /* the cycler's schedule entry (frozen?) */
+                || n == 0x80115964u   /* worker-dispatch wrapper (calls FUN_800c466c) */
+                || n == 0x80115bb4u   /* FUN_80115bb4: sole caller, gated DAT_d0003642==3 */
+                || n == 0x80115d82u   /* the gated FUN_800c466c() call site */
+                || n == 0x800fdfa4u   /* phase driver fn_800fdec0 indirect action-call (calli a15) */
+                || n == 0x800fbabcu   /* ADC: 416f init writer #1 (=0) + 0xF0001Fxx config */
+                || n == 0x800fbbe2u   /* ADC: 416f init writer #2 (=0) */
+                || n == 0x800fbafeu   /* ADC: the 0x3006 gate (reads 416f, wants ==1) */
+                || n == 0x800f76f0u   /* ADC: the orchestrator (calls the gate) */
+                || n == 0x8007fadcu   /* MSDI sequencer: state machine + d4a/ready gate */
+                || n == 0x800801b4u   /* MSDI: bank-read-complete -> sets DAT_d0000055=1 */
+                || n == 0x8007fc38u || n == 0x8007fc62u || n == 0x8007fcb2u   /* per-state d53 checks: */
+                || n == 0x8007fd9au || n == 0x8007fe48u || n == 0x8007ff54u   /* st1/2/3/5/7/9/13 */
+                || n == 0x8008007au
+                || n == 0x8007fc8cu  /* state2: seqState <- 3 (the advance) */
+                || n == 0x8007fc94u  /* state2: jne d2,0 -> revert to 2 (the gate) */
+                || n == 0x8007fcecu  /* state2: the revert target (seqState <- 2) */
+                || n == 0x80111d00u  /* SSC driver handshake (advances DAT_d000cdf4) */
+                || n == 0x80111d44u  /* the SSC channel-state write */
+                || n == 0x8011a800u; /* SSC transfer engine -- which buffer, which mode? */
+        }
+    }
+    {   /* TC1797_MONTRACE: the MSDI monitor's bank-sequencer lives in the 0x8007fxxx block;
+         * bank2 (step3 FUN_800e070e) never runs. Watch the whole region's first-execution map
+         * to see which paths the runtime control flow actually reaches and where it diverges
+         * from the bank2 read/select call sites. (Undecoded by Ghidra, but it still executes.) */
+        static int mt = -1;
+        if (mt < 0) { mt = getenv("TC1797_MONTRACE") ? 1 : 0; }
+        if (mt) {
+            uint32_t n = pc & ~0x20000000u;
+            return (n >= 0x8007f900u && n < 0x80080200u);
         }
     }
     /* MARCH catcher (env TC1797_MARCHLOG): any PC below flash (segments 0-7) is the
