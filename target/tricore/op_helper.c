@@ -28,6 +28,28 @@
 void helper_tc_dbg(CPUTriCoreState *env, uint32_t pc)
 {
     static int n;
+    /* TC1797_MSDI_BYPASS (USER-REQUESTED TEMPORARY CRUTCH, default OFF -- NOT FAITHFUL).
+     * At the return of the MSDI bank-check FUN_8008034a (ret @0x800803de): force the return
+     * value d2=0 ("bank OK") so the monitor advances its own bank sequence (reads bank2/3 via
+     * step3, b6->2 like the donor) instead of looping on bank1, and clamp the four MSDI error
+     * counters to 0 so the shutdown monitor FUN_8008026e never trips 0x302c/0x302d/0x302e/0x302f.
+     * This bypasses the unmodelled SC900685 init transient so the boot stays stable WITH the
+     * STM crossing fix (alarm running). The faithful SC900685 init model remains the open item. */
+    if ((pc & ~0x20000000u) == 0x800803deu) {
+        static int mb = -1;
+        if (mb < 0) { mb = getenv("TC1797_MSDI_BYPASS") ? 1 : 0; }
+        if (mb) {
+            env->gpr_d[2] = 0;                       /* FUN_8008034a returns "bank OK" */
+            cpu_stb_data(env, 0xD000004Du, 0);       /* d4d  (d4d>1  -> 0x302f) */
+            cpu_stb_data(env, 0xD000004Cu, 0);       /* d4c  (d4c!=0 -> 0x302e) */
+            cpu_stb_data(env, 0xD000004Eu, 0);       /* d4e  (d4e>5  -> 0x302d) */
+            cpu_stb_data(env, 0xD0000048u, 0);       /* d48  (d48>5  -> 0x302c) */
+            cpu_stb_data(env, 0xD0000049u, 0);       /* d48.hi byte, kept clear too */
+            static unsigned bn;
+            if (bn++ < 3) { fprintf(stderr, "MSDI_BYPASS: FUN_8008034a forced OK, counters cleared\n"); fflush(stderr); }
+            return;
+        }
+    }
     {
         static int ip = -1;
         if (ip < 0) { ip = getenv("TC1797_IDLEPROF") ? 1 : 0; }
@@ -131,6 +153,245 @@ void helper_tc_dbg(CPUTriCoreState *env, uint32_t pc)
             n++;
         }
     }
+    }
+    /* TC1797_MONTRACE: log the first execution of each PC in the MSDI monitor block
+     * (0x8007f900..0x80080200), so the runtime control flow through the (Ghidra-undecoded)
+     * bank-sequencer is visible -- which call sites it reaches, where it branches away from
+     * the bank2 read (FUN_800803f6 @~0x8007fc7a) / select (FUN_8008040c @~0x8007fc76). */
+    if (getenv("TC1797_MONTRACE")) {
+        uint32_t npc = pc & ~0x20000000u;
+        if (npc >= 0x8007f900u && npc < 0x80080200u) {
+            static uint8_t seen[0x900];          /* one bit-ish per 2 bytes of the region */
+            static unsigned distinct;
+            uint32_t idx = (npc - 0x8007f900u);
+            if (idx < sizeof seen && !seen[idx]) {
+                seen[idx] = 1;
+                if (distinct++ < 600) {
+                    uint8_t ph = cpu_ldub_data(env, 0xD0003643u);
+                    fprintf(stderr, "MONTRACE pc=%08x ra=%08x ph=%u\n",
+                            npc, env->gpr_a[11] & ~0x20000000u, ph);
+                    fflush(stderr);
+                }
+            }
+        }
+    }
+    /* TC1797_MSDILOG2: trace the MSDI cycler to find why bank2 (b6->2) never runs. */
+    if (getenv("TC1797_MSDILOG2")) {
+        uint32_t npc = pc & ~0x20000000u;
+        static unsigned mc;
+        if (npc == 0x800e0764u) {                 /* cycler entry: dump full state */
+            static unsigned cn;
+            if (cn++ < 60) {
+                uint8_t c9 = cpu_ldub_data(env, 0xD00040C9u);
+                uint8_t c8 = cpu_ldub_data(env, 0xD00040C8u);
+                uint8_t b6 = cpu_ldub_data(env, 0xD00040B6u);
+                uint8_t s1 = cpu_ldub_data(env, 0xD00040C5u);   /* bank1 status */
+                uint16_t bk1 = cpu_lduw_le_data(env, 0xD00133E4u); /* block[1] */
+                uint8_t head = cpu_ldub_data(env, 0xD0011AACu);
+                uint8_t tail = cpu_ldub_data(env, 0xD0011AADu);
+                uint8_t drain = cpu_ldub_data(env, 0xD0011AB0u);
+                uint8_t cap = cpu_ldub_data(env, 0x80056060u);
+                fprintf(stderr, "MSDIC cyc c9=%u c8=%u b6=%u stat1=%u blk1=%04x q[h=%u t=%u cap=%u drain=%u]\n",
+                        c9, c8, b6, s1, bk1, head, tail, cap, drain);
+                fflush(stderr);
+            }
+        } else if (npc == 0x800e06d8u) {          /* step1 entry */
+            if (mc++ < 4000) {
+                uint8_t s1 = cpu_ldub_data(env, 0xD00040C5u);
+                static unsigned k; if (k++ < 30) { fprintf(stderr, "MSDIC step1 stat1=%u\n", s1); fflush(stderr); }
+            }
+        } else if (npc == 0x800e06a4u) {          /* step2 chan-select */
+            fprintf(stderr, "MSDIC STEP2-chansel param(d4)=%08x\n", env->gpr_d[4]); fflush(stderr);
+        } else if (npc == 0x800e070eu) {          /* step3 bank2 runner -- the smoking gun */
+            fprintf(stderr, "MSDIC *** STEP3-BANK2-RUN ***\n"); fflush(stderr);
+        } else if (npc == 0x800df5c2u) {
+            static unsigned k; if (k++ < 8) { fprintf(stderr, "MSDIC MSDI-INIT FUN_800df5c2\n"); fflush(stderr); }
+        } else if (npc == 0x800c09ccu) {
+            static unsigned k; if (k++ < 8) { fprintf(stderr, "MSDIC MODE2-SET FUN_800c09cc\n"); fflush(stderr); }
+        } else if (npc == 0x800e09ceu) {
+            static unsigned k; if (k++ < 8) { fprintf(stderr, "MSDIC CMD-BUILD FUN_800e09ce\n"); fflush(stderr); }
+        } else if (npc == 0x800a57f2u) {
+            static unsigned k; if (k++ < 8) { fprintf(stderr, "MSDIC TASK-A FUN_800a57f2\n"); fflush(stderr); }
+        } else if (npc == 0x800a5954u) {
+            static unsigned k; if (k++ < 8) { fprintf(stderr, "MSDIC TASK-B FUN_800a5954\n"); fflush(stderr); }
+        } else if (npc == 0x800c466cu) {            /* StartOS MSDI-worker dispatcher */
+            static unsigned k; if (k++ < 8) {
+                uint32_t wp = cpu_ldl_le_data(env, 0xD0019A28u);  /* worker fn ptr */
+                fprintf(stderr, "CHAIN c466c DISPATCH worker_ptr=%08x\n", wp); fflush(stderr);
+            }
+        } else if (npc == 0x800a5e1au) {            /* the worker (gated DAT_d0019748) */
+            static unsigned k; if (k++ < 8) {
+                uint8_t f = cpu_ldub_data(env, 0xD0019748u);
+                uint8_t f3f = cpu_ldub_data(env, 0xD001973Fu);
+                fprintf(stderr, "CHAIN a5e1a WORKER flags=%02x (g1:&2==0?%d) 73f=%02x\n",
+                        f, (f & 2) == 0, f3f); fflush(stderr);
+            }
+        } else if (npc == 0x800a58deu) {            /* bank-read caller (gated cnt<300) */
+            static unsigned k; if (k++ < 12) {
+                uint16_t cnt = cpu_lduw_le_data(env, 0xD00196D0u);
+                fprintf(stderr, "CHAIN a58de BANKRD-CALLER cnt=%u (gate cnt<300?%d) arg0=%d\n",
+                        cnt, cnt < 300, env->gpr_d[4]); fflush(stderr);
+            }
+        } else if (npc == 0x80081840u) {            /* OSEK schedule cursor dispatcher */
+            static unsigned k; if ((k++ & 0x3FFFu) == 0) { fprintf(stderr, "SCHED dispatcher FUN_80081840 hit#%u\n", k); fflush(stderr); }
+        } else if (npc == 0x800d3bb0u) {            /* the cycler's schedule entry */
+            static unsigned k; fprintf(stderr, "SCHED *** CYCLER-ENTRY FUN_800d3bb0 RAN (#%u) ***\n", ++k); fflush(stderr);
+        } else if (npc == 0x80115964u) {            /* worker-dispatch wrapper */
+            static unsigned k; fprintf(stderr, "SCHED worker-wrapper FUN_80115964 ran (#%u)\n", ++k); fflush(stderr);
+        } else if (npc == 0x8007fadcu) {            /* MSDI sequencer: log state + ready + counters */
+            static unsigned k;
+            if (k++ < 120) {
+                uint8_t st = cpu_ldub_data(env, 0xD0003FC3u);   /* state machine */
+                uint8_t rdy = cpu_ldub_data(env, 0xD0000055u);  /* bank-read-complete ready flag */
+                uint8_t d53 = cpu_ldub_data(env, 0xD0000053u);  /* the transition field (prev validate) */
+                uint8_t d4d = cpu_ldub_data(env, 0xD000004Du);
+                uint8_t b6  = cpu_ldub_data(env, 0xD00040B6u);
+                uint8_t ssc0 = cpu_ldub_data(env, 0xD000CDF4u);  /* SSC ch0 state machine */
+                uint8_t qh = cpu_ldub_data(env, 0xD000CE0Au);    /* queue head idx */
+                uint8_t qt = cpu_ldub_data(env, 0xD000CE0Bu);    /* queue tail idx */
+                fprintf(stderr, "SEQ state=%u ready=%u d53=%u d4d=%u b6=%u | ssc0=%u q[h=%u t=%u]\n",
+                        st, rdy, d53, d4d, b6, ssc0, qh, qt); fflush(stderr);
+            }
+        } else if (npc == 0x800801b4u) {            /* bank-read-complete -> ready=1 */
+            static unsigned k; if (k++ < 30) { fprintf(stderr, "SEQ *** bank-read-COMPLETE (ready=1) ***\n"); fflush(stderr); }
+        } else if (npc == 0x8007fc8cu || npc == 0x8007fc94u || npc == 0x8007fcecu) {  /* state2 advance/revert */
+            static unsigned k; if (k++ < 60) {
+                const char *w = npc==0x8007fc8cu ? "ADVANCE->3" : npc==0x8007fc94u ? "GATE jne d2" : "REVERT->2";
+                fprintf(stderr, "ST2 %-12s d2=%u d0=%u | d18a8=%08x d18ac=%08x\n",
+                        w, env->gpr_d[2], env->gpr_d[0],
+                        cpu_ldl_le_data(env, 0xD00018A8u), cpu_ldl_le_data(env, 0xD00018ACu)); fflush(stderr);
+            }
+        } else if (npc == 0x8007fc38u || npc == 0x8007fc62u || npc == 0x8007fcb2u ||
+                   npc == 0x8007fd9au || npc == 0x8007fe48u || npc == 0x8007ff54u || npc == 0x8008007au) {
+            static unsigned k;
+            if (k++ < 80) {
+                int stnum = npc==0x8007fc38u?1: npc==0x8007fc62u?2: npc==0x8007fcb2u?3:
+                            npc==0x8007fd9au?5: npc==0x8007fe48u?7: npc==0x8007ff54u?9: 13;
+                uint8_t d53 = cpu_ldub_data(env, 0xD0000053u);
+                uint8_t b6  = cpu_ldub_data(env, 0xD00040B6u);
+                fprintf(stderr, "DCHK state%-2d b6=%u d53=%u\n", stnum, b6, d53); fflush(stderr);
+            }
+        } else if (npc == 0x80111d00u) {            /* SSC driver handshake */
+            static unsigned k; if (k++ < 12) {
+                uint8_t cdf4 = cpu_ldub_data(env, 0xD000CDF4u);
+                /* dump the handshake cmd + data buffers (buf24=0xdf chan, buf28=<4 chan) */
+                uint16_t cmd24 = cpu_lduw_le_data(env, 0xD000DFECu);
+                uint16_t cmd28 = cpu_lduw_le_data(env, 0xD000DFEEu);
+                uint16_t da24  = cpu_lduw_le_data(env, 0xD00037C0u);
+                uint16_t db28  = cpu_lduw_le_data(env, 0xD00037BAu);
+                fprintf(stderr, "SSCDRV cdf4=%u | cmd24=%04x cmd28=%04x | dataA(@37c0)=%04x dataB(@37ba)=%04x\n",
+                        cdf4, cmd24, cmd28, da24, db28); fflush(stderr);
+            }
+        } else if (npc == 0x80111d44u && getenv("TC1797_CDF4LOG")) {  /* SSC channel-state (cdf4) write */
+            static unsigned k; static uint8_t prev = 99;
+            uint8_t nv = env->gpr_d[15] & 0xFFu;
+            if (k++ < 400 && nv != prev) {           /* log cdf4 transitions */
+                fprintf(stderr, "CDF4 %u -> %u\n", prev, nv); fflush(stderr);
+            }
+            prev = nv;
+        } else if (npc == 0x800bf154u || npc == 0x800bf164u) {  /* FUN_800bf104 sub-check results */
+            static unsigned k; if (k++ < 40) {
+                const char *w = npc == 0x800bf154u ? "bVar2 SSC-xfer(FUN_80112dce)"
+                                                   : "bVar3 reg0xb(FUN_800dece8)";
+                fprintf(stderr, "BF104 %-30s = 0x%02x\n", w, env->gpr_d[2] & 0xFFu); fflush(stderr);
+            }
+        } else if ((npc == 0x800bf1a2u || npc == 0x800bf1aau) && getenv("TC1797_BANKLOG")) {  /* FUN_800bf19e state-3 sub-checks */
+            static unsigned k; if (k++ < 60) {
+                const char *w = npc == 0x800bf1a2u ? "iVar1 SSC-health(FUN_80112e52)"
+                                                   : "iVar2 reg6(FUN_800ded70)";
+                fprintf(stderr, "BF19E %-30s = 0x%02x\n", w, env->gpr_d[2] & 0xFFu); fflush(stderr);
+            }
+        } else if (npc == 0x800a5920u && getenv("TC1797_BANKLOG")) {  /* per-bank E2E validation result */
+            static unsigned k; if (k++ < 80) {
+                fprintf(stderr, "BANKVAL FUN_800a57f2 = 0x%02x  (0=ok) | d0019990=%08x d0019994=%08x\n",
+                        env->gpr_d[2] & 0xFFu, env->gpr_d[5], env->gpr_d[6]); fflush(stderr);
+            }
+        } else if (npc == 0x800a58deu && getenv("TC1797_BANKLOG")) {  /* per-bank validator entry */
+            static unsigned k; if (k++ < 80) {
+                fprintf(stderr, "BANKDE entry param2(d5)=%u counter-region\n", env->gpr_d[5]); fflush(stderr);
+            }
+        } else if (npc == 0x800a57f2u && getenv("TC1797_BANKLOG")) {  /* E2E validator entry */
+            static unsigned k; if (k++ < 80) {
+                fprintf(stderr, "BANK57F2 entry: p1(d4)=%u p2(d5)=%08x p3(d6)=%08x\n",
+                        env->gpr_d[4], env->gpr_d[5], env->gpr_d[6]); fflush(stderr);
+            }
+        } else if (npc == 0x8011630eu) {            /* FUN_8011630e: SSC descriptor enqueue */
+            uint32_t p1 = env->gpr_d[4], p2 = env->gpr_d[5];
+            uint8_t mode = cpu_ldub_data(env, 0xD00042ABu);
+            if (mode == 1u && p2 == 0xbu) {         /* the failing reg-0xb gate, ring mode */
+                static unsigned k; if (k++ < 20) {
+                    uint16_t off = cpu_lduw_le_data(env, 0x80054B50u + p1 * 0x14u);
+                    uint32_t desc = 0xD000CE60u + (p2 + off) * 0x20u;
+                    uint32_t dw = cpu_ldl_le_data(env, desc);
+                    uint32_t pi = cpu_ldl_le_data(env, 0x80054B44u + p1 * 0x14u);
+                    uint32_t pj = cpu_ldl_le_data(env, 0x80054B48u + p1 * 0x14u);
+                    uint32_t head = pi ? cpu_ldl_le_data(env, pi) : 0;
+                    uint32_t tail = pj ? cpu_ldl_le_data(env, pj) : 0;
+                    fprintf(stderr, "SSC630e-m1 ch=%u reg=%u desc=%08x busy=%u | headp=%08x tailp=%08x "
+                            "head=%u tail=%u fill=%u %s\n", p1, p2, dw, dw & 1u, pi, pj, head, tail,
+                            (tail - head) & 0xFFFFFFFFu,
+                            ((tail - head) & 0xFFFFFFFFu) >= 0x20u ? "RING-FULL" : ""); fflush(stderr);
+                }
+            }
+        } else if (npc == 0x8011a800u) {            /* SSC transfer engine: which buffer + mode */
+            uint32_t buf = env->gpr_a[4];           /* param_1 = descriptor addr (pointer -> a4) */
+            uint32_t nb = buf & ~0x20000000u;
+            if (nb >= 0x80054490u && nb <= 0x80054540u) {     /* the HANDSHAKE descriptors */
+                static unsigned k; if (k++ < 20) {
+                    uint8_t mode = cpu_ldub_data(env, 0xD000402Fu);
+                    fprintf(stderr, "XFER *** handshake-buf desc=%08x mode=%u (ring1 REACHED a800!) ***\n", nb, mode);
+                    fflush(stderr);
+                }
+            } else {
+                static unsigned long bankc; bankc++;
+                if ((bankc & 0xFFFu) == 1) { fprintf(stderr, "XFER bank/other desc=%08x (traffic ~%lu)\n", nb, bankc); fflush(stderr); }
+            }
+        } else if (npc == 0x80115bb4u) {            /* sole caller of FUN_800c466c, gated on DAT_d0003642==3 */
+            static unsigned k;
+            uint8_t p642 = cpu_ldub_data(env, 0xD0003642u);
+            uint8_t p643 = cpu_ldub_data(env, 0xD0003643u);
+            fprintf(stderr, "GATE FUN_80115bb4 ENTRY #%u | DAT_d0003642=%u (need 3) DAT_d0003643(phase)=%u\n",
+                    ++k, p642, p643); fflush(stderr);
+        } else if (npc == 0x80115d82u) {            /* the gated dispatch actually taken */
+            fprintf(stderr, "GATE *** FUN_800c466c() DISPATCH TAKEN (DAT_d0003642 was 3) ***\n"); fflush(stderr);
+        } else if (npc == 0x800fbabcu || npc == 0x800fbbe2u || npc == 0x800fbafeu || npc == 0x800f76f0u) {
+            static unsigned k;
+            if (k++ < 60) {
+                uint8_t a16f = cpu_ldub_data(env, 0xD000416Fu);
+                uint8_t g938 = cpu_ldub_data(env, 0xD0000938u);
+                const char *nm = npc == 0x800fbabcu ? "INIT1(416f=0)" :
+                                 npc == 0x800fbbe2u ? "INIT2(416f=0)" :
+                                 npc == 0x800fbafeu ? "GATE-0x3006   " : "ORCH";
+                fprintf(stderr, "ADCLOG %s 416f=%u d938=%u\n", nm, a16f, g938); fflush(stderr);
+            }
+        } else if (npc == 0x800fdfa4u) {            /* phase driver indirect action-call: a15=fn, a13=&d642[level] */
+            uint32_t a15 = env->gpr_a[15];          /* the check/action fn being called */
+            uint32_t a13 = env->gpr_a[13];          /* &DAT_d0003642 + level */
+            uint32_t level = a13 - 0xD0003642u;
+            uint8_t  phase = cpu_ldub_data(env, a13);
+            if (level <= 3) {                        /* sane levels only */
+                static unsigned k; if (k++ < 200)
+                    fprintf(stderr, "PHASEDRV calli fn=%08x level=%u phase=%u\n",
+                            a15 & ~1u, level, phase); fflush(stderr);
+            }
+        } else if (npc == 0x8008034au) {            /* d4d bank check: which bank + value */
+            static unsigned k;
+            if (k++ < 40) {
+                uint8_t b6 = cpu_ldub_data(env, 0xD00040B6u);
+                uint16_t bk1 = cpu_lduw_le_data(env, 0xD00133E8u); /* bank1 block[3] */
+                uint16_t bk2 = cpu_lduw_le_data(env, 0xD0013368u); /* bank2 block[6] */
+                uint16_t bk3 = cpu_lduw_le_data(env, 0xD0013396u); /* bank3 block[2] */
+                uint8_t d4d = cpu_ldub_data(env, 0xD000004Du);
+                uint32_t param = env->gpr_d[4];                 /* param_1 (the expected) */
+                fprintf(stderr, "MON CHECK b6=%u d4d=%u param=0x%x | bk1[3]=%04x bk2[6]=%04x bk3[2]=%04x\n",
+                        b6, d4d, param, bk1, bk2, bk3);
+                fflush(stderr);
+            }
+        } else if (npc == 0x8008008au) {
+            fprintf(stderr, "MON *** BANK2-READ (step3) REACHED ***\n"); fflush(stderr);
+        } else if (npc == 0x80080074u) {
+            static unsigned k; if (k++ < 8) { fprintf(stderr, "MON bank1-error RE-READ (loop)\n"); fflush(stderr); }
+        }
     }
     /* TC1797_CALSEED: keep the 4f6 sensor-status byte = 0xe7 (donor value, bits0+2) at every watched PC so
      * FUN_8014065a's 4041=1 branch stays taken -> eb1=1 -> e7e=1 -> stable phase 4. Proves the sensor route

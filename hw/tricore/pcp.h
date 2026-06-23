@@ -88,6 +88,13 @@ void pcp_engine_reset(PcpEngine *e);
 /* CPU -> PCP: request channel `srpn` (1..255). Async; returns immediately. */
 void pcp_engine_trigger(PcpEngine *e, uint8_t srpn);
 
+/* Drain the pending PCP channel queue SYNCHRONOUSLY on the caller thread (BQL must
+ * be held). For peripheral completions raised from a timer callback (no vCPU mid-
+ * instruction), where the firmware polls the PCP's result a few instructions later
+ * on the same virtual-time tick -- e.g. the ADC end-of-conversion -> PCP ch 0x1d ->
+ * 0xD000416F -> DTC-0x3006 gate. Re-entry-guarded; a no-op if already draining. */
+void pcp_engine_drain(PcpEngine *e);
+
 /* Run one channel inline on the caller thread (unit tests / single-thread).
  * Returns the instruction count; *out_exit_int reports EXIT.INT if non-NULL.
  * The caller must hold the BQL if the channel can touch MMIO. */

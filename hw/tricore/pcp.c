@@ -78,8 +78,20 @@ static void pcp_write(hwaddr addr, unsigned size, uint32_t val)
             fflush(stderr);
         }
     }
+    if (getenv("TC1797_RINGLOG")) {
+        uint32_t a = (uint32_t)(addr & MASK32);
+        if (a == 0xF0050F00u || (a >= 0xD000D1A0u && a < 0xD000D1A4u)
+            || a == 0xF0050098u) {
+            fprintf(stderr, "RINGW[PCP srpn=%02x]: [0x%08x].%u = 0x%08x %s\n",
+                    g_pcp_srpn, a, size, val,
+                    a == 0xF0050F00u ? "(ring HEAD)" :
+                    a == 0xF0050098u ? "(ch28 FPI BASE @+0x26)" : "(reg-0xb DESCRIPTOR)");
+            fflush(stderr);
+        }
+    }
     if ((addr & MASK32) == 0xD000416Fu && getenv("TC1797_PCPLOG")) {
-        fprintf(stderr, "PCPFLAG: 0xD000416F <- phase 0x%02x\n", val & 0xFF);
+        fprintf(stderr, "PCPFLAG: 0xD000416F <- phase 0x%02x  (srpn=0x%02x)\n",
+                val & 0xFF, g_pcp_srpn);
         fflush(stderr);
     }
     address_space_rw(&address_space_memory, addr & MASK32,
@@ -189,6 +201,15 @@ static void pcp_restore_context(PcpCore *c, uint8_t srpn, uint32_t csa_base,
             }
         }
     }
+    /* MSC0 ring-drain channel (SRPN 0x28) context fix (env TC1797_MSC_CTX): the firmware
+     * pre-initialises ch29's CSA DPTR (0x0e) but leaves ch0x28's CSA R7 = 0 (DPTR=0), so
+     * the drain reads PRAM at DPTR=0 (ch4's region, garbage) instead of the MSC0 ring.
+     * The correct DPTR is 0x0f (PRAM base 0xF0050F00 = the ring), per the firmware's own
+     * config table @0x80054B50 (high byte 0x0F). Set it so the drain addresses the ring. */
+    if (srpn == 0x28u && ((c->R[7] >> 8) & 0xFFu) == 0) {
+        static int en = -1; if (en < 0) en = getenv("TC1797_MSC_CTX_OFF") ? 0 : 1;
+        if (en) { c->R[7] = (c->R[7] & ~0xFF00u) | 0x0F00u; }
+    }
     if (getenv("TC1797_PCPLOG")) {
         fprintf(stderr, "PCPCTX: srpn=%u rcb=%d model=%d base=0x%08x "
                 "words=[%08x %08x %08x %08x %08x %08x %08x %08x] pc=0x%x\n",
@@ -277,7 +298,7 @@ static void pcp_step(PcpCore *c)
         const char *tcsr = getenv("TC1797_PCPTRACE");
         if (tcsr && c->cur_srpn == (uint8_t)strtoul(tcsr, NULL, 0)) {
             static unsigned tc;
-            if (tc++ < 400) {
+            if (tc++ < 12000) {
                 fprintf(stderr, "PCPT[%02x] pc=0x%04x hw=%04x hw2=%04x am=%u Rb=%u "
                         "Ra=%u | R0=%08x R1=%08x R2=%08x R3=%08x R4=%08x R5=%08x "
                         "R6=%08x R7=%08x\n", c->cur_srpn, (uint32_t)(c->pc - len_hw),
@@ -315,6 +336,18 @@ static void pcp_step(PcpCore *c)
             }
             c->ex_r6 = R[6];     /* SR descriptor for EXIT.INT routing (UM 10.6) */
             c->exited = true;
+            {
+                const char *tcsr = getenv("TC1797_PCPTRACE");
+                bool all = getenv("TC1797_PCPEXITALL") != NULL;
+                if (all || (tcsr && c->cur_srpn == (uint8_t)strtoul(tcsr, NULL, 0))) {
+                    fprintf(stderr, "  >>> EXIT srpn=%02x pc=0x%04x cc=%x int=%d st=%d ec=%d | "
+                            "R6=%08x -> SR-target dsrpn=0x%02x tos=%u%s\n",
+                            c->cur_srpn, (uint32_t)(c->pc - len_hw), cc, c->ex_int, c->ex_st,
+                            c->ex_ec, R[6], (R[6] >> 16) & 0xFF, (R[6] >> 14) & 3,
+                            (c->ex_int && ((R[6] >> 16) & 0xFF)) ? "  <== TRIGGERS" : "");
+                    fflush(stderr);
+                }
+            }
             return;
         }
         /* copy (sub==1) / bcopy (sub==3) */
@@ -339,7 +372,17 @@ static void pcp_step(PcpCore *c)
         uint32_t ea = R[Ra];
         switch (op0912) {
         case 0x9: { uint32_t v = pcp_read(ea, sz); R[Rb] = v; set_logic_flags(c, v); break; } /* ld.f */
-        case 0xA: pcp_write(ea, sz, R[Rb] & (sz == 4 ? MASK32 : ((1u << (sz * 8)) - 1))); break; /* st.f */
+        case 0xA: {                                                                            /* st.f */
+            static int mst = -1; if (mst < 0) mst = getenv("TC1797_MSCST") ? 1 : 0;
+            if (mst && (c->cur_srpn == 0x28 || c->cur_srpn == 0x2a)) {
+                fprintf(stderr, "CH%02xST pc=0x%04x hw=%04x Ra=%u Rb=%u @%08x = %08x | "
+                        "R0=%08x R4=%08x R5=%08x R6=%08x R7=%08x\n",
+                        c->cur_srpn, (uint32_t)(c->pc - len_hw), hw, Ra, Rb, ea,
+                        R[Rb] & (sz == 4 ? MASK32 : ((1u << (sz * 8)) - 1)),
+                        R[0], R[4], R[5], R[6], R[7]); fflush(stderr);
+            }
+            pcp_write(ea, sz, R[Rb] & (sz == 4 ? MASK32 : ((1u << (sz * 8)) - 1))); break;
+        }
         case 0x0: { uint32_t b = pcp_read(ea, sz), a = R[Rb], res = a + b; R[Rb] = res; set_add_flags(c, a, b, res); break; } /* add.f */
         case 0x1: { uint32_t b = pcp_read(ea, sz), a = R[Rb], res = a - b; set_sub_flags(c, a, b, res); R[Rb] = res; break; } /* sub.f */
         case 0x2: { uint32_t b = pcp_read(ea, sz), a = R[Rb]; set_sub_flags(c, a, b, a - b); break; } /* comp.f */
@@ -420,7 +463,7 @@ static void pcp_step(PcpCore *c)
         unsigned sz = b9 ? 4 : (b5 ? 2 : 1);
         unsigned imm5 = hw & 0x1F;
         switch (op1012) {
-        case 0x5: { uint32_t res = pcp_read(R[Rb], sz) + imm5; R[Rb] = res; set_logic_flags(c, res); break; } /* ld.if */
+        case 0x5: { R[0] = pcp_read(R[Rb] + imm5, sz); set_logic_flags(c, R[0]); break; } /* ld.if: R0 = zero_ext(FPI[R[b]+imm5]) (UM 10.18.19); the address reg R[b] is PRESERVED -- the old impl overwrote it (corrupting e.g. the MSDI descriptor pointer in ch0x28's retire) and added imm5 to the value instead of the address */
         case 0x6: pcp_write(R[Rb] + imm5, sz, R[0] & (sz == 4 ? MASK32 : ((1u << (sz * 8)) - 1))); break;     /* st.if */
         case 0x3: { uint32_t ea = R[Rb]; uint32_t v = (pcp_read(ea, sz) | (1u << imm5)) & (sz == 4 ? MASK32 : ((1u << (sz * 8)) - 1)); pcp_write(ea, sz, v); break; } /* set.f */
         case 0x4: { uint32_t ea = R[Rb]; uint32_t v = (pcp_read(ea, sz) & ~(1u << imm5)) & (sz == 4 ? MASK32 : ((1u << (sz * 8)) - 1)); pcp_write(ea, sz, v); break; } /* clr.f */
@@ -734,19 +777,53 @@ static void pcp_drain_bh_fn(void *opaque)
         return;
     }
     e->in_drain = true;
+    /* PRIORITY arbitration (env TC1797_PCP_PRIO): silicon's PICU runs the HIGHEST-SRPN
+     * pending channel first; on its EXIT the next-highest runs, so the LOWEST-priority
+     * channel completes LAST. The plain FIFO drain instead completes them in trigger
+     * order, which lands a multi-channel chain (e.g. the ADC DTC-0x3006 phase machine
+     * ch26/ch29/ch15 -> 0xD000416F) on the wrong final phase. Pick the max-SRPN entry
+     * each round; remove it in O(1) by moving the head element into its slot. */
+    static int prio = -1;
+    if (prio < 0) { prio = getenv("TC1797_PCP_PRIO") ? 1 : 0; }
     while (e->qcount > 0) {
-        uint8_t s = e->queue[e->qhead];
-        e->qhead = (e->qhead + 1) & 0xFF;
+        uint8_t s;
+        if (prio) {
+            unsigned besti = e->qhead;
+            uint8_t best = e->queue[e->qhead];
+            unsigned idx = (e->qhead + 1) & 0xFF;
+            for (unsigned i = 1; i < e->qcount; i++, idx = (idx + 1) & 0xFF) {
+                if (e->queue[idx] > best) { best = e->queue[idx]; besti = idx; }
+            }
+            s = e->queue[besti];
+            e->queue[besti] = e->queue[e->qhead];   /* fill the gap with the head */
+            e->qhead = (e->qhead + 1) & 0xFF;
+        } else {
+            s = e->queue[e->qhead];
+            e->qhead = (e->qhead + 1) & 0xFF;
+        }
         e->qcount--;
         pcp_run_one_sync(e, s);
     }
     e->in_drain = false;
 }
 
+void pcp_engine_drain(PcpEngine *e)
+{
+    /* Run whatever is already queued, inline, right now (BQL held by the caller).
+     * pcp_drain_bh_fn is re-entry guarded, so this composes with a pending BH:
+     * the later BH finds the queue empty and no-ops. */
+    pcp_drain_bh_fn(e);
+}
+
 void pcp_engine_trigger(PcpEngine *e, uint8_t srpn)
 {
     if (srpn == 0) {
         return;
+    }
+    if (getenv("TC1797_TRIGLOG")) {
+        static unsigned tg; if (tg++ < 200) {
+            fprintf(stderr, "TRIG ch %u (0x%02x)\n", srpn, srpn); fflush(stderr);
+        }
     }
     /* DETERMINISM FIX (default-on; opt-out TC1797_PCP_ASYNC): run the PCP channel
      * SYNCHRONOUSLY, inline on the calling (vCPU/timer) thread, instead of handing it
