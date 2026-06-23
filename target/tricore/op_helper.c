@@ -282,9 +282,56 @@ void helper_tc_dbg(CPUTriCoreState *env, uint32_t pc)
                 fprintf(stderr, "SSCDRV cdf4=%u | cmd24=%04x cmd28=%04x | dataA(@37c0)=%04x dataB(@37ba)=%04x\n",
                         cdf4, cmd24, cmd28, da24, db28); fflush(stderr);
             }
-        } else if (npc == 0x80111d44u) {            /* SSC channel-state write (value in d15) */
-            static unsigned k; if (k++ < 12) {
-                fprintf(stderr, "SSCDRV state-write d15=%u\n", env->gpr_d[15]); fflush(stderr);
+        } else if (npc == 0x80111d44u && getenv("TC1797_CDF4LOG")) {  /* SSC channel-state (cdf4) write */
+            static unsigned k; static uint8_t prev = 99;
+            uint8_t nv = env->gpr_d[15] & 0xFFu;
+            if (k++ < 400 && nv != prev) {           /* log cdf4 transitions */
+                fprintf(stderr, "CDF4 %u -> %u\n", prev, nv); fflush(stderr);
+            }
+            prev = nv;
+        } else if (npc == 0x800bf154u || npc == 0x800bf164u) {  /* FUN_800bf104 sub-check results */
+            static unsigned k; if (k++ < 40) {
+                const char *w = npc == 0x800bf154u ? "bVar2 SSC-xfer(FUN_80112dce)"
+                                                   : "bVar3 reg0xb(FUN_800dece8)";
+                fprintf(stderr, "BF104 %-30s = 0x%02x\n", w, env->gpr_d[2] & 0xFFu); fflush(stderr);
+            }
+        } else if ((npc == 0x800bf1a2u || npc == 0x800bf1aau) && getenv("TC1797_BANKLOG")) {  /* FUN_800bf19e state-3 sub-checks */
+            static unsigned k; if (k++ < 60) {
+                const char *w = npc == 0x800bf1a2u ? "iVar1 SSC-health(FUN_80112e52)"
+                                                   : "iVar2 reg6(FUN_800ded70)";
+                fprintf(stderr, "BF19E %-30s = 0x%02x\n", w, env->gpr_d[2] & 0xFFu); fflush(stderr);
+            }
+        } else if (npc == 0x800a5920u && getenv("TC1797_BANKLOG")) {  /* per-bank E2E validation result */
+            static unsigned k; if (k++ < 80) {
+                fprintf(stderr, "BANKVAL FUN_800a57f2 = 0x%02x  (0=ok) | d0019990=%08x d0019994=%08x\n",
+                        env->gpr_d[2] & 0xFFu, env->gpr_d[5], env->gpr_d[6]); fflush(stderr);
+            }
+        } else if (npc == 0x800a58deu && getenv("TC1797_BANKLOG")) {  /* per-bank validator entry */
+            static unsigned k; if (k++ < 80) {
+                fprintf(stderr, "BANKDE entry param2(d5)=%u counter-region\n", env->gpr_d[5]); fflush(stderr);
+            }
+        } else if (npc == 0x800a57f2u && getenv("TC1797_BANKLOG")) {  /* E2E validator entry */
+            static unsigned k; if (k++ < 80) {
+                fprintf(stderr, "BANK57F2 entry: p1(d4)=%u p2(d5)=%08x p3(d6)=%08x\n",
+                        env->gpr_d[4], env->gpr_d[5], env->gpr_d[6]); fflush(stderr);
+            }
+        } else if (npc == 0x8011630eu) {            /* FUN_8011630e: SSC descriptor enqueue */
+            uint32_t p1 = env->gpr_d[4], p2 = env->gpr_d[5];
+            uint8_t mode = cpu_ldub_data(env, 0xD00042ABu);
+            if (mode == 1u && p2 == 0xbu) {         /* the failing reg-0xb gate, ring mode */
+                static unsigned k; if (k++ < 20) {
+                    uint16_t off = cpu_lduw_le_data(env, 0x80054B50u + p1 * 0x14u);
+                    uint32_t desc = 0xD000CE60u + (p2 + off) * 0x20u;
+                    uint32_t dw = cpu_ldl_le_data(env, desc);
+                    uint32_t pi = cpu_ldl_le_data(env, 0x80054B44u + p1 * 0x14u);
+                    uint32_t pj = cpu_ldl_le_data(env, 0x80054B48u + p1 * 0x14u);
+                    uint32_t head = pi ? cpu_ldl_le_data(env, pi) : 0;
+                    uint32_t tail = pj ? cpu_ldl_le_data(env, pj) : 0;
+                    fprintf(stderr, "SSC630e-m1 ch=%u reg=%u desc=%08x busy=%u | headp=%08x tailp=%08x "
+                            "head=%u tail=%u fill=%u %s\n", p1, p2, dw, dw & 1u, pi, pj, head, tail,
+                            (tail - head) & 0xFFFFFFFFu,
+                            ((tail - head) & 0xFFFFFFFFu) >= 0x20u ? "RING-FULL" : ""); fflush(stderr);
+                }
             }
         } else if (npc == 0x8011a800u) {            /* SSC transfer engine: which buffer + mode */
             uint32_t buf = env->gpr_a[4];           /* param_1 = descriptor addr (pointer -> a4) */

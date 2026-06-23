@@ -136,6 +136,11 @@ struct TC1797SoCState {
                                   * read-back-config SPI behaviour; the per-channel fa/7a/7a values flow from the
                                   * firmware's own 0x28 writes (channels are brought up sequentially). */
     uint32_t ssc_src[2][2];      /* SSC0/1 service-request nodes [unit][0]=+0xF8 (xfer), [1]=+0xFC (queue) */
+    uint32_t msc_src[2][2];      /* MSC0/1 SRC0/SRC1 @0xF00008FC/F8 (SRPN0x28): the MSDI ring-completion IRQ */
+    uint32_t msc_isr[2];         /* MSC0/1 Interrupt Status Reg @+0x44: DEDI[0]/DECI[1]/DTFI[2]/URDI[3] */
+    uint32_t msc_ud[2][4];       /* MSC0/1 Upstream Data Regs @+0x30..3C: DATA[7:0], V[16], P[17], LABF[20:19] */
+    uint8_t  msc_rx_idx[2];      /* MSC0/1 SC900685 upstream frame index (LABF slot 0..3, advances per reply) */
+    uint16_t msdi_d53ctr;        /* SC900685 free-running scan counter -> reg-0xEA d53 token (firmware polls to sync) */
     uint32_t adc_src[TC1797_ADC_NKERN][16]; /* ADC0/1/2 kernel SRNs (top of each 0x400 kernel, off>=0x3C0): firmware pulses SETR to trigger PCP/CPU completion (e.g. ADC0 SRC@0x3F0 -> PCP ch 0x1d -> sets 0xD000416F, DTC 0x3006 gate) */
     QEMUTimer *ssc_done_timer[2];/* SPI transfer-latency: defer completion SRN raise */
     int64_t ssc_xfer_ns;         /* modelled per-transfer time (env TC1797_SSC_XFER_NS) */
@@ -556,7 +561,7 @@ static void tc1797_stm_arm(TC1797SoCState *s)
          * drop-the-edge behaviour, which keeps the (frozen-but-stable) phase-4 boot. */
         static int g_crossing = -1;
         if (g_crossing < 0) {
-            g_crossing = getenv("TC1797_STM_CROSSING") ? 1 : 0;
+            g_crossing = getenv("TC1797_STM_CROSSING_OFF") ? 0 : 1;  /* faithful, default ON */
         }
         if (g_crossing && s->stm_cmp_deadline[ch] != INT64_MAX
             && s->stm_cmp_deadline[ch] <= now) {
@@ -2855,6 +2860,14 @@ static void tc1797_src_node_write(TC1797SoCState *s, uint32_t *node,
         if (s->pcp_enabled) {
             pcp_engine_trigger(&s->pcp, *node & 0xFFu);
         }
+        /* MSC ring-completion node: SRR auto-clears on PCP service entry (silicon HW), so
+         * the MSDI driver sees the request serviced and re-SETRs the node per ring frame.
+         * Without this it sees a permanently-set SRR, re-arms the node (writes 0x4428,
+         * SRE=0) and the completion stops delivering after one frame -> ring stalls.
+         * Scoped to the MSC SRC region so SSC/ADC PCP nodes are unaffected. */
+        if ((addr & 0xFFFFFF00u) == 0xF0000800u || (addr & 0xFFFFFF00u) == 0xF0000900u) {
+            *node &= ~(1u << 13);
+        }
         return;
     }
     {                                     /* TOS=0: CPU interrupt */
@@ -3379,7 +3392,7 @@ static uint64_t tc1797_ssc_read(TC1797SoCState *s, int unit, uint32_t off)
              */
             {
                 static int st = -1;
-                if (st < 0) { st = getenv("TC1797_MSDI_STATEFUL") ? 1 : 0; }
+                if (st < 0) { st = getenv("TC1797_MSDI_STATEFUL_OFF") ? 0 : 1; }  /* faithful, default ON */
                 if (st) {
                     /* The MSDI monitor FUN_8007fadc walks 3 banks (b6=1/2/3) selected by d4 (channel A,
                      * bank1) / f0 (channel B, bank2). For EACH active bank the per-state validator
@@ -3396,18 +3409,50 @@ static uint64_t tc1797_ssc_read(TC1797SoCState *s, int unit, uint32_t off)
                     else if (reg == 0xF0) { s->msdi_chan = 1; }                 /* channel-B select (bank2); rep stays sw[f0]=0x2aff (block[4]&0xc0==0xc0) */
                     else if (reg == 0xEA) {                                     /* d53 source (block[iVar3]) for the active bank */
                         if (msdi_ready != 1) {
-                            uint8_t d53v = (s->msdi_synca == 0) ? 3u : 5u;      /* 3 once (state1), then >=5 */
-                            rep = 0x2A00u | ((uint32_t)d53v << 4);              /* 0x2a30 or 0x2a50 */
+                            uint8_t d53v;
+                            if (getenv("TC1797_D53WALK")) {   /* MEASUREMENT hack: state-keyed walk to observe the command stream */
+                                uint8_t ss = 0; cpu_physical_memory_read(0xD0003FC3u, &ss, 1);
+                                if (ss >= 13) d53v = 0;
+                                else if (ss == 3) d53v = 4;
+                                else if (ss == 7 || ss == 9) d53v = 3;
+                                else if (ss >= 4) d53v = 5;
+                                else d53v = (s->msdi_synca == 0) ? 3u : 5u;
+                            } else if (!getenv("TC1797_D53CYCLE_OFF")) {       /* default-on faithful model */
+                                /* The d53 source is per-channel. The MSDI monitor selects channel B
+                                 * (reg 0xF0 -> msdi_chan=1) before each reg-0xEA read and wants the device's
+                                 * free-running scan counter; the SSC channel-0 (channel A) bring-up reads
+                                 * reg-0xEA with channel A selected and wants the stable announce value.
+                                 * Returning one value to both conflates them and breaks the bring-up. */
+                                if (s->msdi_chan == 1) d53v = (uint8_t)(s->msdi_d53ctr & 7u);
+                                else                   d53v = (s->msdi_synca == 0) ? 3u : 5u;
+                            } else {
+                                d53v = (s->msdi_synca == 0) ? 3u : 5u;         /* legacy: 3 once, then 5 (stalls @state2) */
+                            }
+                            rep = 0x2A00u | ((uint32_t)d53v << 4);
                         } else {
                             rep = (s->msdi_chan == 0) ? 0x2A13u : 0x2A1Bu;      /* donor steady bank1[2]/bank2[5] */
                         }
                     } else if (reg == 0xE8) {                                   /* the bank gate (block[iVar6]&0x3f==1) */
                         if (msdi_ready != 1) {
                             s->msdi_synca++;
+                            if (!getenv("TC1797_D53CYCLE_OFF") && s->msdi_chan == 1) { /* advance scan counter per channel-B bank-read cycle */
+                                s->msdi_d53ctr++;
+                            }
                             rep = 0x2A01u;                                      /* &0x3f==1 -> FUN_8008034a passes (both banks) */
                         } else {
                             rep = 0x2A2Fu;                                      /* donor steady switch state */
                         }
+                    } else if (reg == 0xDE && !getenv("TC1797_D53CYCLE_OFF")) {
+                        /* reg 0xDE = channel-0 device-status frame (RX[0]=0xD00037D2). FUN_80112488
+                         * returns its bit7 as d0003fc5: the monitor's state-4 advances (->5) only on
+                         * d0003fc5==1, and state-10 advances (->13) only on d0003fc5==0. So bit7 is the
+                         * device's "not yet synced" flag: the SC900685 holds it set until the host has
+                         * clocked through its initial bank scan (the channel-B scan counter), then
+                         * clears it. Calibration: state-4 compute @ctr=10 (bit7=1), state-10 compute
+                         * @ctr=19 (bit7=0); sync completes mid-walk, so threshold ~18. */
+                        unsigned thr = 18u;
+                        if (getenv("TC1797_DET")) thr = (unsigned)atoi(getenv("TC1797_DET"));
+                        rep = (s->msdi_d53ctr < thr) ? 0x2AFFu : 0x2A00u;
                     }
                 }
             }
@@ -3434,10 +3479,14 @@ static uint64_t tc1797_ssc_read(TC1797SoCState *s, int unit, uint32_t off)
             if (getenv("TC1797_MSDITRACE")) {
                 extern bool g_pcp_in_exec;
                 uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
-                if (ph == 3) {
-                    fprintf(stderr, "MSDI R reg=%02x -> %04x pc=%08x pcp=%u\n",
-                            reg, rep,
-                            (uint32_t)s->cpu.env.PC & ~0x20000000u, g_pcp_in_exec ? 1 : 0);
+                static unsigned mt;
+                /* log only the state-machine-relevant regs: channel selects (D4/F0), bank gate (E8),
+                 * d53 source (EA) -- to see which device-visible command separates the states. */
+                uint8_t seqs = 0; cpu_physical_memory_read(0xD0003FC3u, &seqs, 1);
+                if (ph >= 3 && mt < 4000 &&
+                    (reg == 0xD4 || reg == 0xF0 || reg == 0xE8 || reg == 0xEA || reg == 0xDE)) {
+                    mt++;
+                    fprintf(stderr, "MSDI#%u seq=%d ch=%d reg=%02x -> %04x\n", mt, seqs, s->msdi_chan, reg, rep);
                     fflush(stderr);
                 }
             }
@@ -3644,8 +3693,19 @@ static void tc1797_adc_conv_done(void *opaque)
             s->adc_done_deadline[ki][idx] = 0;   /* consume this completion */
             uint32_t *node = &s->adc_src[ki][idx];
             uint32_t addr = tc1797_adc_node_addr(ki, idx);
+            uint8_t a16f_pre = 0;
+            bool trc = getenv("TC1797_ADCDONE") && (*node & 0xFFu) == 0x1Du;
+            if (trc) { cpu_physical_memory_read(0xD000416Fu, &a16f_pre, 1); }
             /* Re-drive the armed node (keep SRPN/SRE/TOS) with SETR=1. */
             tc1797_src_node_write(s, node, (*node & 0x00001FFFu) | 0x8000u, addr);
+            if (trc) {
+                static unsigned k; if (k++ < 30) {
+                    uint8_t a16f_post = 0; cpu_physical_memory_read(0xD000416Fu, &a16f_post, 1);
+                    fprintf(stderr, "ADCDONE ch1d t=%lld 416f %u->%u (PCP %s)\n",
+                            (long long)now, a16f_pre, a16f_post,
+                            a16f_pre == a16f_post ? "DEFERRED" : "SYNC"); fflush(stderr);
+                }
+            }
             /*
              * Continuous conversion (TC1797 UM ch.23: an ADC kernel runs its
              * programmed request source as a repeating SCAN -- a result-event
@@ -3663,6 +3723,33 @@ static void tc1797_adc_conv_done(void *opaque)
                 && ((*node >> 12) & 1u) && ((*node >> 10) & 1u)) {  /* SRE && TOS */
                 s->adc_done_deadline[ki][idx] = now + s->adc_conv_ns;
             }
+        }
+    }
+    /* The result-event nodes above raised their TOS=1 PCP channels, but
+     * pcp_engine_trigger only ENQUEUES + schedules a bottom-half (which fires at
+     * the end of the execution slice). This is a TIMER callback: no vCPU is mid-
+     * instruction, and the firmware polls the PCP's result (e.g. 0xD000416F for the
+     * ADC ch 0x1d -> DTC-0x3006 gate) only a handful of instructions later on the
+     * SAME virtual-time tick. The deferred BH lands AFTER that poll, so the gate
+     * reads the stale value and reset-loops. Drain the queue inline now so the
+     * end-of-conversion PCP result is visible before the firmware reads it --
+     * faithful to silicon, where the PCP runs in parallel and the result is ready
+     * by the poll. (BQL held here; re-entry guarded.)
+     *
+     * Env-gated (TC1797_ADC_SYNC_PCP) for now: it correctly removes the deferred-PCP
+     * latency, but the DTC-0x3006 gate FUN_800fbafe needs MORE -- 0xD000416F is a PCP
+     * phase machine (cycles 0->2->5->1; the gate wants phase 1) that the firmware polls
+     * one cycle too early, because on silicon the ADC FREE-RUNS from its kernel enable
+     * and has already driven a full cycle by the first poll. Modelling that free-run
+     * (so the phase machine reaches 1 before the gate, without the fast-rate re-arm
+     * busy-loop) is the open part; until then the default build is unchanged. */
+    if (getenv("TC1797_ADC_SYNC_PCP")) {
+        pcp_engine_drain(&s->pcp);
+    }
+    if (getenv("TC1797_ADCDONE")) {
+        static unsigned dk; if (dk++ < 40) {
+            uint8_t a = 0; cpu_physical_memory_read(0xD000416Fu, &a, 1);
+            fprintf(stderr, "ADCDONE post-drain 416f=%u\n", a); fflush(stderr);
         }
     }
     tc1797_adc_rearm(s);
@@ -4238,8 +4325,28 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
     case 0xF00005E0: return 0x00004000;   /* clock-ready: bit 14 set */
     case 0xF00005F0: return s->wdt_con0;  /* WDT_CON0 (ENDINIT shadow) */
     case 0xF00005F4: return s->wdt_con1;  /* WDT_CON1 shadow */
-    /* ── MSC0/MSC1 status: command/data ready (bit 0) ── */
-    case 0xF0000844: case 0xF0000944: return 0x00000001;
+    /* ── MSC0/MSC1 Interrupt Status Register (+0x44): DEDI[0]/DECI[1]/DTFI[2]/URDI[3] ── */
+    case 0xF0000844: case 0xF0000944: {
+        static int mr = -1; if (mr < 0) { mr = getenv("TC1797_MSC_IRQ_OFF") ? 0 : 1; }
+        /* DEDI[0] (downstream data done) is reported always-set: the downstream shift is
+         * modelled with zero latency, and the mode-0 driver SPINS on it before sending the
+         * next frame. URDI[3] (upstream receive) + the rest come from the modelled state. */
+        if (mr) { return 0x00000001u | s->msc_isr[(addr >> 8) & 1]; }
+        return 0x00000001;
+    }
+    /* ── MSC0/MSC1 Service-Request nodes (SRC0 +0xFC / SRC1 +0xF8): faithful read-back so
+     * the driver's RMW SETR pulses keep the right SRPN/SRE (see the write path). ── */
+    case 0xF00008FC: case 0xF00008F8: case 0xF00009FC: case 0xF00009F8:
+    case 0xF00008FD: case 0xF00008F9: case 0xF00009FD: case 0xF00009F9: {
+        static int msc_irq_r = -1;
+        if (msc_irq_r < 0) { msc_irq_r = getenv("TC1797_MSC_IRQ_OFF") ? 0 : 1; }
+        if (msc_irq_r) {
+            int u = (addr >> 8) & 1;
+            int n = (addr & 0x4u) ? 0 : 1;     /* +0xFC -> SRC0, +0xF8 -> SRC1 */
+            return s->msc_src[u][n] >> ((addr & 0x3u) * 8);   /* byte/word read-back */
+        }
+        return s->sfr_shadow[(addr - 0xF0000000u) >> 2];
+    }
     /*
      * ── MSC0/MSC1 downstream status (+0x30): bit16 = transmission complete ──
      * The MSC actuator handler (FUN_8011630e, callers in the 0x800dd.. output
@@ -4254,7 +4361,27 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
      * advances the STM toward the premature OSEK tick and under icount stalls the
      * phase-0 init outright -- neither is how the part behaves. */
     case 0xF0000830: case 0xF0000930:
-        return s->sfr_shadow[(addr - 0xF0000000u) >> 2] | 0x00010000u;
+    case 0xF0000834: case 0xF0000838: case 0xF000083C:
+    case 0xF0000934: case 0xF0000938: case 0xF000093C: {
+        /* MSC0/1 Upstream Data Register x (+0x30..3C): DATA[7:0], V[16], P[17], LABF[20:19].
+         * V is set by HW when the SC900685's upstream reply lands (modelled on the DC write).
+         * The ring-drain PCP channel reads UDx (V) to process + clear the descriptor. */
+        static int mr = -1; if (mr < 0) { mr = getenv("TC1797_MSC_IRQ_OFF") ? 0 : 1; }
+        static int udv = -1; if (udv < 0) { udv = getenv("TC1797_MSC_UDV") ? 1 : 0; }
+        if (mr) {
+            int u = (addr >> 8) & 1; int x = (int)((addr & 0xFu) >> 2);
+            /* TC1797_MSC_UDV (diag): force a valid upstream reply present on every UDx so the PCP
+             * upstream-completion channel processes it -- tests whether UD0.V is the gate to the
+             * descriptor-clear (vs the autonomous OCR-driven RX that would set it on silicon). */
+            if (udv) { return s->msc_ud[u][x] | 0x00010000u | (x == 0 ? 0xFFu : 0x2Au); }
+            return s->msc_ud[u][x];
+        }
+        /* default (MSC modelling off): legacy "always-complete" bit16 on UD0 only */
+        if ((addr & 0xFu) == 0x0u) {
+            return s->sfr_shadow[(addr - 0xF0000000u) >> 2] | 0x00010000u;
+        }
+        return s->sfr_shadow[(addr - 0xF0000000u) >> 2];
+    }
     /*
      * ── PMU / PFlash0/1 FSR (Flash Status Register, +0x10) ──
      * Bits: 0 PROG, 1 ERASE, 2 PFOPER, 3 DFOPER, 4 FABUSY, 7 PFBUSY,
@@ -4522,6 +4649,122 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
             msc_once++;
             info_report("tc1797: MSC%u write +0x%02x = 0x%08x (actuator cmd)",
                         (addr >> 8) & 1, addr & 0xFF, (uint32_t)val);
+        }
+        /* MSC Service-Request nodes (SRC0 @+0xFC / SRC1 @+0xF8): store + read back the
+         * node as a real SRC register. The interrupt-mode MSDI driver pulses the node
+         * via read-modify-write SETR once per ring frame to raise the completion ISR
+         * (SRPN 0x28), which drains the SC900685 command ring (head @0xF0050F00) and
+         * clears the per-channel descriptor busy bit (0xD000CE60+idx*0x20 bit0). Without
+         * a faithful read-back the firmware RMWs a corrupt SRPN, the ISR never fires, the
+         * ring never drains, FUN_8011630e sees the descriptor permanently busy, and the
+         * MSDI monitor reverts -> DTC-0x302f. tc1797_src_node_write applies SETR/CLRR ->
+         * SRR and, when SRR becomes set on an SRE/CPU node, raises the request normally.
+         * Env-gated (TC1797_MSC_IRQ) pending default-build validation. */
+        static int msc_irq = -1;
+        if (msc_irq < 0) { msc_irq = getenv("TC1797_MSC_IRQ_OFF") ? 0 : 1; }
+        /* SRC node region (SRC1 @+0xF8, SRC0 @+0xFC), BYTE-addressable: the driver sets
+         * SRE via a separate `st.t +0xFD,#4` (bit12 of the word) -- a byte write to +1 --
+         * while it pulses SETR via a word write to the base. Handle both granularities so
+         * the node carries the right SRE/SRPN/TOS and tc1797_src_node_write actually
+         * delivers (TOS=1 here -> PCP channel 0x28 drains the SC900685 ring). */
+        if (msc_irq && ((addr & 0xFFFFFFF8u) == 0xF00008F8u ||
+                        (addr & 0xFFFFFFF8u) == 0xF00009F8u)) {
+            int u = (addr >> 8) & 1;
+            int n = (addr & 0x4u) ? 0 : 1;          /* +0xFC -> SRC0, +0xF8 -> SRC1 */
+            uint32_t bo = addr & 0x3u;
+            if (bo == 0) {                          /* word write to base: SETR/CLRR + deliver */
+                tc1797_src_node_write(s, &s->msc_src[u][n], (uint32_t)val,
+                                      addr & 0xFFFFFFFCu);
+                /* SRC0 (+0xFC) = the downstream-frame START (the driver SETRs it per ring
+                 * frame). On silicon the frame's upstream half then completes and raises
+                 * SRC1 (+0xF8) -- the COMPLETION the ring-drain channel (SRPN 0x28) waits
+                 * on. The driver arms SRC1 (SRE=1) but never SETRs it; the hardware does.
+                 * Model that: when SRC0 is SETR'd, fire the armed SRC1 completion. */
+                if (n == 0 && ((uint32_t)val & 0x8000u)) {
+                    static int msc_rx = -1;
+                    if (msc_rx < 0) { msc_rx = getenv("TC1797_MSC_RX_OFF") ? 0 : 1; }
+                    if (msc_rx) {
+                        /* SC900685 UPSTREAM REPLY model: a downstream command elicits an
+                         * upstream data frame. The device streams its switch state across
+                         * LABF address slots (A[1:0] = 0..3), one 8-bit DATA frame each. Set
+                         * UD0 = V | LABF<<19 | P<<17 | DATA, advancing the slot per reply, so
+                         * PCP ch0x2a (SRPN 0x2a, upstream RX) reads a valid framed reply and
+                         * retires the descriptor. P = even parity of DATA (IPF computed equal
+                         * -> no ERR). Switch DATA is per-slot (KOEO rest state for now). */
+                        static const uint8_t sc_frame[4] = { 0x00, 0x00, 0x00, 0x00 };
+                        uint8_t idx  = s->msc_rx_idx[u] & 3u;
+                        uint8_t data = sc_frame[idx];
+                        uint32_t p   = __builtin_parity(data) & 1u;     /* even parity bit */
+                        s->msc_ud[u][0] = 0x00010000u                   /* V[16] */
+                                        | ((uint32_t)idx << 19)         /* LABF[20:19] = slot */
+                                        | (p << 17)                     /* P[17] received parity */
+                                        | data;                         /* DATA[7:0] */
+                        s->msc_isr[u] |= (1u << 0) | (1u << 3);         /* DEDI + URDI */
+                        s->msc_rx_idx[u] = idx + 1u;
+                        if (getenv("TC1797_MSCLOG")) {
+                            static unsigned r; if (r++ < 24) {
+                                fprintf(stderr, "MSC-RX u%d slot=%u UD0=%08x -> fire SRPN0x2a\n",
+                                        u, idx, s->msc_ud[u][0]); fflush(stderr);
+                            }
+                        }
+                    }
+                    if (s->msc_src[u][1] & 0x1000u) {     /* SRC1 SRE armed -> fire URDI/SRPN0x2a */
+                        tc1797_src_node_write(s, &s->msc_src[u][1],
+                                              (s->msc_src[u][1] & 0x00001FFFu) | 0x8000u,
+                                              (addr & 0xFFFFFFFCu) - 4u);
+                    }
+                }
+            } else {                                /* sub-byte config write (e.g. SRE @byte+1) */
+                uint32_t mask = 0xFFu << (bo * 8);
+                s->msc_src[u][n] = (s->msc_src[u][n] & ~mask)
+                                 | (((uint32_t)val & 0xFFu) << (bo * 8));
+            }
+            if (getenv("TC1797_MSCLOG")) {
+                static unsigned k; if (k++ < 30) {
+                    fprintf(stderr, "MSCSRC wr@%08x=%08x bo=%u -> msc_src[%d][%d]=%08x (sre=%u srr=%u tos=%u)\n",
+                            (uint32_t)addr, (uint32_t)val, bo, u, n, s->msc_src[u][n],
+                            (s->msc_src[u][n] >> 12) & 1, (s->msc_src[u][n] >> 13) & 1,
+                            (s->msc_src[u][n] >> 10) & 1); fflush(stderr);
+                }
+            }
+            return;
+        }
+        /* MSC Downstream Command (DC @+0x20) write = a downstream frame START. Per TC1797
+         * UM ch.18: the MSC shifts the command out (downstream), the connected SC900685
+         * power device replies with an upstream frame, the MSC stores it in a UDx register
+         * with the V (valid) bit set, sets ISR.URDI (upstream receive) + ISR.DEDI (downstream
+         * data done), and raises the receive/data interrupt -> SR[1:0] -> SRC0/SRC1 (SRPN
+         * 0x28/0x2a) -> the PCP ring-drain channel, which reads UDx + clears the descriptor.
+         * Model the full round-trip so the ring drains organically (env TC1797_MSC_IRQ). */
+        if (msc_irq && (addr & 0xFFu) == 0x20u) {
+            int u = (addr >> 8) & 1;
+            uint8_t data = (uint8_t)((uint32_t)val & 0xFFu);
+            if (data == 0) { data = 0xFFu; }          /* non-zero so RDIE=10 (data!=0) fires */
+            s->msc_ud[u][0] = 0x00010000u | data;     /* UD0: V[16]=1, DATA[7:0] = reply */
+            s->msc_isr[u] |= (1u << 0) | (1u << 3);   /* DEDI (downstream done) + URDI (rx) */
+            if (s->msc_src[u][0] & 0x1000u) {         /* SR0 -> SRC0 (SRE armed) */
+                tc1797_src_node_write(s, &s->msc_src[u][0],
+                                      (s->msc_src[u][0] & 0x00001FFFu) | 0x8000u,
+                                      0xF00008FCu + (uint32_t)u * 0x100u);
+            }
+            if (s->msc_src[u][1] & 0x1000u) {         /* SR1 -> SRC1 (SRE armed) */
+                tc1797_src_node_write(s, &s->msc_src[u][1],
+                                      (s->msc_src[u][1] & 0x00001FFFu) | 0x8000u,
+                                      0xF00008F8u + (uint32_t)u * 0x100u);
+            }
+        }
+        /* ISC (+0x48) Interrupt Set/Clear: clear the ISR flags the firmware acks. The UM
+         * ISC has Set/Clear bit pairs; model the common "clear" half (low bits clear). */
+        if (msc_irq && (addr & 0xFFu) == 0x48u) {
+            int u = (addr >> 8) & 1;
+            s->msc_isr[u] &= ~((uint32_t)val & 0x0Fu);   /* CDEDI/CDECI/CDTFI/CURDI */
+            return;
+        }
+        /* UDx (+0x30..3C) write: bit C[18]=1 clears the V (valid) bit (UM 18.2). */
+        if (msc_irq && (addr & 0xFCu) == 0x30u && (addr & 0xFFu) <= 0x3Cu) {
+            int u = (addr >> 8) & 1; int x = (int)((addr & 0xFu) >> 2);
+            if ((uint32_t)val & (1u << 18)) { s->msc_ud[u][x] &= ~(1u << 16); }
+            return;
         }
         /* fall through to the switch for any specific MSC register handling */
     }

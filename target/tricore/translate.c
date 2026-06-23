@@ -128,6 +128,14 @@ static inline bool tc_dbg_watch(uint32_t pc)
                 || n == 0x8007fcecu  /* state2: the revert target (seqState <- 2) */
                 || n == 0x80111d00u  /* SSC driver handshake (advances DAT_d000cdf4) */
                 || n == 0x80111d44u  /* the SSC channel-state write */
+                || n == 0x800bf154u  /* FUN_800bf104: d2=bVar2 (FUN_80112dce SSC-xfer result) */
+                || n == 0x800bf164u  /* FUN_800bf104: d2=bVar3 (FUN_800dece8 reg-0xb status) */
+                || n == 0x800bf1a2u  /* FUN_800bf19e: d2=iVar1 (FUN_80112e52 state-3 SSC health) */
+                || n == 0x800bf1aau  /* FUN_800bf19e: d2=iVar2 (FUN_800ded70 state-3 reg-6) */
+                || n == 0x800a5920u  /* FUN_800a58de: d2=per-bank FUN_800a57f2 E2E result (0=ok) */
+                || n == 0x800a57f2u  /* FUN_800a57f2 entry: per-bank E2E validator (args d4/d5/d6) */
+                || n == 0x800a58deu  /* FUN_800a58de entry: per-bank validator */
+                || n == 0x8011630eu  /* FUN_8011630e: SSC descriptor enqueue (busy/full?) */
                 || n == 0x8011a800u; /* SSC transfer engine -- which buffer, which mode? */
         }
     }
