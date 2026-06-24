@@ -455,7 +455,7 @@ static uint64_t tc1797_stm_match_ticks(TC1797SoCState *s, int ch, uint64_t tim_n
      * falls through to the learned-cadence path below (last_fwd[1] = its real programmed period). Pinning
      * CMP1 to a fixed period was the reverted MAX-last_fwd / 1 ms failure -- it let the firmware arm a
      * 2.2 ms alarm and tripped the DTC-0x3045 watchdog. Only CMP0 (the fixed 100 us system tick) is pinned. */
-    /* OSEK SYSTEM-TICK FIX (default-on; disable via TC1797_NO_OSEKTICK). The firmware's CMP0 schedule
+    /* OSEK SYSTEM-TICK FIX (OPT-IN via TC1797_OSEKTICK_PIN; see the FAITHFUL DEFAULT note below). The firmware's CMP0 schedule
      * ISR (FUN_80081870) re-arms CMP0 = deadline by reading the live STM TIM (FUN_80081836); under
      * -icount that read->write spans real instructions, so the re-arm lands a few ticks BEHIND the
      * counter -- impossible on synchronous silicon. The model then saw CMP0 overdue and self-fired at
@@ -555,11 +555,11 @@ static void tc1797_stm_arm(TC1797SoCState *s)
          * (its freshly computed deadline is the far-future wrap, not <= now), so it stays
          * silent until the window wraps -- exactly the UM windowed-equality behaviour --
          * and after firing, the recompute sets it far-future, so it fires once per arm.
-         * This is the faithful behaviour and SHOULD be the default; it is gated OPT-IN
-         * (TC1797_STM_CROSSING) for now ONLY because un-freezing CMP1 exposes the MSDI
-         * bank2-fill dispatch bug (the monitor loops on the unfilled bank2 -> DTC 0x302f
-         * reset). Flip to default-on once the bank2 dispatch lands. Default-off = the old
-         * drop-the-edge behaviour, which keeps the (frozen-but-stable) phase-4 boot. */
+         * This is the faithful behaviour and IS the default; it is gated OPT-OUT
+         * (TC1797_STM_CROSSING_OFF) so the legacy drop-the-edge path can be restored if
+         * un-freezing CMP1 re-exposes the MSDI bank2-fill dispatch bug (the monitor loops
+         * on the unfilled bank2 -> DTC 0x302f reset). Default-on = the faithful edge; the
+         * opt-out keeps the old (frozen-but-stable) phase-4 boot. */
         static int g_crossing = -1;
         if (g_crossing < 0) {
             g_crossing = getenv("TC1797_STM_CROSSING_OFF") ? 0 : 1;  /* faithful, default ON */
