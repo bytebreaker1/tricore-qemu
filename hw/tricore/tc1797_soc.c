@@ -3462,7 +3462,7 @@ static uint64_t tc1797_ssc_read(TC1797SoCState *s, int unit, uint32_t off)
                             }
                             rep = 0x2A00u | ((uint32_t)d53v << 4);
                         } else {
-                            rep = (s->msdi_chan == 0) ? 0x2A13u : 0x2A1Bu;      /* donor steady bank1[2]/bank2[5] */
+                            rep = (s->msdi_chan == 0) ? 0x2A1Au : 0x2A16u;      /* donor steady bank1[2]=2a1a / bank2[5]=2a16 (was 0x2a13/0x2a1b -- wrong vs donor dump; the e8/ea low nibble feeds the channel-select idx, so 0x16->idx6->f058 like the donor instead of 0x1b->idxb->f07e) */
                         }
                     } else if (reg == 0xE8) {                                   /* the bank gate (block[iVar6]&0x3f==1) */
                         if (msdi_ready != 1) {
