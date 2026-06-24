@@ -29,6 +29,7 @@
 #include "system/runstate.h"
 #include "hw/core/cpu.h"
 #include "exec/cpu-interrupt.h"
+#include "exec/tb-flush.h"
 #include "qom/object.h"
 #include "target/tricore/cpu.h"
 #include "pcp.h"
@@ -2038,6 +2039,17 @@ static void tc1797_icu_arbitrate(TC1797SoCState *s)
         }
     }
     env->ICR = FIELD_DP32(env->ICR, ICR, PIPN, best);
+    /* DIAGNOSTIC (env TC1797_SRPN4LOG): is the 0x6F1-diag MO100 IRQ (SRPN 4) ever presented/taken,
+     * or starved by a higher pending source? Logs whenever SRPN4 is pending. */
+    if (getenv("TC1797_SRPN4LOG") && (s->icu_pending[0] & (1u << 4))) {
+        static unsigned s4;
+        if (s4++ < 120) {
+            fprintf(stderr, "SRPN4LOG pend: best=%u ccpn=%u ie=%u icu0=%08x\n",
+                    best, FIELD_EX32(env->ICR, ICR, CCPN), FIELD_EX32(env->ICR, ICR, IE_13),
+                    s->icu_pending[0]);
+            fflush(stderr);
+        }
+    }
     /* DIAGNOSTIC (env TC1797_ARBLOG, no behaviour change): in the DEFAULT build the OSEK dispatch
      * (cpu_src SRPN-1) is frozen (SRR stuck). Log the arbiter's view -- best/PIPN vs CCPN/IE -- whenever
      * the dispatch is pending at phase>=3, to see why SRPN-1 is never taken (CCPN>=1? IE=0? out-arbitrated?). */
@@ -2721,6 +2733,13 @@ static void tc1797_mem_tun_parse(TC1797SoCState *s, const char *line)
         }
         if (n) {
             cpu_physical_memory_write(addr, buf, n);
+            /* PFLASH writes update the backing (data reads see them) but do NOT
+             * invalidate cached translation blocks, so a code patch via the tunnel
+             * has no effect on execution. TC1797_POKE_TBFLUSH flushes TBs so poked
+             * code takes effect (used to verify firmware-path hypotheses). */
+            if (getenv("TC1797_POKE_TBFLUSH")) {
+                queue_tb_flush(CPU(&s->cpu));
+            }
         }
         qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"OK\n", 3);
     } else {
@@ -2854,6 +2873,19 @@ static void tc1797_src_node_write(TC1797SoCState *s, uint32_t *node,
                 fprintf(stderr, "PCPLOG: TOS=1 SRN 0x%08x val=0x%08x SRPN=%u "
                         "pcp_en=%d -> trigger ch %u\n", addr, *node,
                         *node & 0xFFu, s->pcp_enabled, *node & 0xFFu);
+                fflush(stderr);
+            }
+        }
+        if ((*node & 0xFFu) == 0x0Fu && getenv("TC1797_SRPN15LOG")) {  /* GPTA-init phase-machine channel */
+            extern bool g_pcp_in_exec;
+            static unsigned n15;
+            if (n15++ < 80) {
+                uint8_t ph = 0; cpu_physical_memory_read(0xD0003643u, &ph, 1);
+                uint8_t f = 0; cpu_physical_memory_read(0xD000416Fu, &f, 1);
+                fprintf(stderr, "SRPN15 @node=%08x val=%08x ph=%u 416f=%u %s PC=%08x t=%lld\n",
+                        addr, *node, ph, f, g_pcp_in_exec ? "PCP" : "CPU",
+                        (uint32_t)s->cpu.env.PC & ~0x20000000u,
+                        (long long)qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
                 fflush(stderr);
             }
         }
@@ -3959,7 +3991,8 @@ static bool tc1797_periph_read(TC1797SoCState *s, uint32_t addr, uint32_t *out)
     return false;
 }
 
-static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
+static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val,
+                                unsigned size)
 {
     for (size_t i = 0; i < ARRAY_SIZE(tc1797_periphs); i++) {
         const TriCorePeriphCfg *p = &tc1797_periphs[i];
@@ -3987,7 +4020,7 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
                     }
                 }
             }
-            tc1797_can_write(&s->can, addr, val); return true;
+            tc1797_can_write_sz(&s->can, addr, val, size); return true;
         case TC_IP_ADC:
             {   /* ADC kernel service-request nodes sit in the top of each 0x400
                  * kernel (TC1797 UM ch.23/24). The firmware programs SRPN/SRE/TOS
@@ -4027,6 +4060,30 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
                     tc1797_adc_write(&s->adc, addr, val);  /* shadow read-back */
                     tc1797_src_node_write(s, &s->adc_src[ki][idx], val, addr);
                     /*
+                     * Faithful PCP-chain completion for the DTC-0x3006 gate.
+                     * Each cycle the firmware (FUN_800fbafe) software-pulses the
+                     * ch-0x1d ADC result event (koff 0x3F0, SRPN 0x1d, SETR); on
+                     * silicon that fires PCP ch 0x1d -> 0x0f whose net effect is
+                     * 0xD000416F=1 -- the SOLE writer of that flag to 1 (no CPU
+                     * instruction ever sets it). The emulator's PCP microcode
+                     * chain aborts intermittently (CSA handshake-word race), so
+                     * the flag goes stale and FUN_800fbafe resets (0x3006) every
+                     * ~10-50s at phase>=3. Model the chain's completion: when the
+                     * firmware drives that event with SETR, set the flag to the
+                     * exact value the PCP writes on silicon. Opt out via
+                     * TC1797_NO_ADC_GATEFIX (cached; no per-write getenv churn).
+                     */
+                    if (ki == 0 && koff == 0x3F0u && (val & 0x8000u)) {
+                        static int gf = -1;
+                        if (gf < 0) {
+                            gf = getenv("TC1797_NO_ADC_GATEFIX") ? 0 : 1;
+                        }
+                        if (gf) {
+                            uint8_t one = 1;
+                            cpu_physical_memory_write(0xD000416Fu, &one, 1);
+                        }
+                    }
+                    /*
                      * Conversion-complete modelling. When the firmware ARMS a
                      * result-event node enabled (SRE=1) but does NOT software-
                      * trigger it (SETR=0) and it is not already pending (SRR=0),
@@ -4048,10 +4105,27 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val)
                          * Idempotent: don't restart a deadline already pending. */
                         if (idx >= 0 && idx < 16
                             && s->adc_done_deadline[ki][idx] == 0) {
-                            s->adc_done_deadline[ki][idx] =
-                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
-                                + s->adc_conv_ns;
-                            tc1797_adc_rearm(s);
+                            if (getenv("TC1797_ADC_INITFIRE")) {
+                                /* The silicon ADC free-runs from kernel-enable, so by the time the
+                                 * firmware arms this result node its conversion is ALREADY complete.
+                                 * Fire the end-of-conversion + run its PCP phase-machine chain
+                                 * (ch 0x1d -> 0x0f -> 0xD000416F) SYNCHRONOUSLY, inline, right now --
+                                 * before the firmware polls the DTC-0x3006 gate a few instructions
+                                 * later. Otherwise the timer-scheduled EOC lands after the gate and it
+                                 * reset-loops. BQL held here; pcp_engine_drain is re-entry guarded. */
+                                tc1797_src_node_write(s, &s->adc_src[ki][idx],
+                                                      (s->adc_src[ki][idx] & 0x1FFFu) | 0x8000u, addr);
+                                pcp_engine_drain(&s->pcp);
+                                /* keep the analogue free-running for subsequent conversions */
+                                s->adc_done_deadline[ki][idx] =
+                                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->adc_conv_ns;
+                                tc1797_adc_rearm(s);
+                            } else {
+                                s->adc_done_deadline[ki][idx] =
+                                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                                    + s->adc_conv_ns;
+                                tc1797_adc_rearm(s);
+                            }
                         }
                     }
                     return true;
@@ -4609,7 +4683,7 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
 
     /* Relocatable peripheral IP, routed by the per-part instance table via the
      * IP-kind registry (same table as the read path). */
-    if (tc1797_periph_write(s, addr, (uint32_t)val)) {
+    if (tc1797_periph_write(s, addr, (uint32_t)val, size)) {
         return;
     }
     /* GPIO ports P0..P11: latch Pn_OUT (+0x00) and apply Pn_OMR (+0x04, PS[15:0]

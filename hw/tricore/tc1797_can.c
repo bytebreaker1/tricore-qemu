@@ -6,6 +6,8 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/bswap.h"
+#include "hw/core/cpu.h"
+#include "target/tricore/cpu.h"
 #include "tc1797_can.h"
 
 /* PANCTR list-command opcodes (TC1797 UM Table 19-7). */
@@ -96,6 +98,19 @@ uint32_t tc1797_can_read(Tc1797Can *c, uint32_t addr)
         unsigned n = (addr - TC1797_CAN_MO_BASE) >> 5;
         unsigned moff = (addr - TC1797_CAN_MO_BASE) & 0x1F;
         Tc1797CanMO *m = &c->mo[n];
+        if (n == 100 && moff != 0x08 && getenv("TC1797_MO100LOG")) {  /* firmware reads of the 0x6F1 diag MO (skip IRQ's MOIPR@0x08) */
+            uint32_t fpc = current_cpu ? (((TriCoreCPU *)current_cpu)->env.PC & ~0x20000000u) : 0;
+            static unsigned mp, mc;
+            if (m->rx_pending) {
+                if (mp++ < 40) {
+                    fprintf(stderr, "MO100READ off=0x%02x pend=1 PC=%08x  <<< firmware sees frame\n", moff, fpc);
+                    fflush(stderr);
+                }
+            } else if (mc++ < 6) {
+                fprintf(stderr, "MO100READ off=0x%02x pend=0 PC=%08x\n", moff, fpc);
+                fflush(stderr);
+            }
+        }
         switch (moff) {
         case 0x00:                                  /* MOFCR: NEWDAT(bit5) */
             return c->regs[idx] | (m->rx_pending ? (1u << 5) : 0);
@@ -179,6 +194,12 @@ uint32_t tc1797_can_read(Tc1797Can *c, uint32_t addr)
 
 void tc1797_can_write(Tc1797Can *c, uint32_t addr, uint32_t val)
 {
+    tc1797_can_write_sz(c, addr, val, 4);
+}
+
+void tc1797_can_write_sz(Tc1797Can *c, uint32_t addr, uint32_t val,
+                         unsigned size)
+{
     addr = TC1797_CAN_BASE + (addr - c->base);
     uint32_t idx = can_idx(addr);
 
@@ -188,7 +209,20 @@ void tc1797_can_write(Tc1797Can *c, uint32_t addr, uint32_t val)
         return;
     }
     if (idx < TC1797_CAN_NREGS) {
-        c->regs[idx] = val;
+        /* Sub-word (byte/halfword) writes compose into the existing 32-bit
+         * register instead of overwriting it. The firmware writes the CAN MO
+         * data registers one byte at a time (FUN_80122e06: a st.b loop); the
+         * old full-word overwrite kept only the last byte of each word
+         * (zero-extended), so a diagnostic response TX came out as
+         * d0,0,0,0,d4,0,0,0 instead of the full 8 payload bytes. TC1797 SFRs
+         * are byte-addressable, so composing sub-word writes is faithful HW. */
+        if (size >= 4) {
+            c->regs[idx] = val;
+        } else {
+            unsigned bo = (addr & 3u) * 8u;
+            uint32_t mask = ((size == 1) ? 0xFFu : 0xFFFFu) << bo;
+            c->regs[idx] = (c->regs[idx] & ~mask) | ((val << bo) & mask);
+        }
     }
     if (addr < TC1797_CAN_MO_BASE
         || addr >= TC1797_CAN_MO_BASE + TC1797_CAN_NMO * 0x20) {
@@ -235,6 +269,17 @@ void tc1797_can_write(Tc1797Can *c, uint32_t addr, uint32_t val)
             uint8_t data[8];
             stl_le_p(data, d0);
             stl_le_p(data + 4, d1);
+            if (getenv("TC1797_TXLOG")) {       /* log each distinct TX'd CAN id once (diag resp = 0x7ea) */
+                static uint8_t seen_tx[2048];
+                if (id < 2048 && !seen_tx[id]) {
+                    seen_tx[id] = 1;
+                    fprintf(stderr, "TXLOG first-tx MO%d id=0x%03x data=%08x%08x\n", n, id, d0, d1);
+                    fflush(stderr);
+                } else if (id == 0x7ea || id == 0x7e8) {   /* always log diag responses */
+                    fprintf(stderr, "TXLOG *** DIAG-RESP MO%d id=0x%03x data=%08x%08x ***\n", n, id, d0, d1);
+                    fflush(stderr);
+                }
+            }
             c->tx_count++;
             if (c->tx_cb) {
                 c->tx_cb(c->tx_opaque, id, data, 8);
@@ -309,6 +354,16 @@ bool tc1797_can_rx_inject(Tc1797Can *c, uint32_t can_id,
         }
         uint32_t mask = m->mask ? m->mask : 0x7FF;
         if ((can_id & mask) == (m->id & mask)) {
+            /* DIAGNOSTIC (env TC1797_MO100INJ): which RX MO catches the 0x6F1
+             * standard-UDS diag request FIRST (the loop returns on first match).
+             * Confirms 0x6f1 -> MO100 (id 0x6f0/mask 0x7f0) with no earlier
+             * intercept, and surfaces its MOIPR for the SRC-node/SRPN routing. */
+            if (getenv("TC1797_MO100INJ") && can_id == 0x6f1) {
+                uint32_t moipr = c->regs[mo_word(n, 0x08)];
+                fprintf(stderr, "MO100INJ 0x6f1 FIRST-MATCH MO%d id=0x%03x mask=0x%03x dir=%d moipr=0x%08x\n",
+                        n, m->id, mask, m->dir, moipr);
+                fflush(stderr);
+            }
             if (mol && can_id == 0x7e2) {
                 static unsigned mt; if (mt++ < 10) {
                     fprintf(stderr, "RXINJ 0x7e2 MATCH MO%d id=%03x mask=%03x dir=%d\n",

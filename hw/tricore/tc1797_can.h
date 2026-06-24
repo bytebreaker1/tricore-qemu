@@ -52,6 +52,10 @@ typedef struct Tc1797Can {
 void tc1797_can_init(Tc1797Can *c, uint32_t base, CanTxFn tx_cb, void *opaque);
 uint32_t tc1797_can_read(Tc1797Can *c, uint32_t addr);
 void tc1797_can_write(Tc1797Can *c, uint32_t addr, uint32_t val);
+/* Width-aware variant: byte/halfword writes compose into the 32-bit register
+ * (the firmware writes MO data registers byte-by-byte). */
+void tc1797_can_write_sz(Tc1797Can *c, uint32_t addr, uint32_t val,
+                         unsigned size);
 /* Deliver an inbound frame into a matching receive MO. Returns true if a
  * configured RX object accepted it. Safe to call from any thread holding BQL. */
 bool tc1797_can_rx_inject(Tc1797Can *c, uint32_t can_id,
