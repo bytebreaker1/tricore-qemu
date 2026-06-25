@@ -54,12 +54,94 @@ static int tc_dbg_enabled(void)
              || getenv("TC1797_COLDLOG") || getenv("TC1797_WDLOG")
              || getenv("TC1797_KICKCAL2") || getenv("TC1797_IDLEPROF")
              || getenv("TC1797_MSDILOG2") || getenv("TC1797_MONTRACE")
+             || getenv("TC1797_A70LOG")
+             || getenv("TC1797_ACTLOG")
+             || getenv("TC1797_DIAGGATE")
+             || getenv("TC1797_DIAG6F1")
+             || getenv("TC1797_MSDISEL")
+             || getenv("TC1797_A70FIX")
              || getenv("TC1797_MSDI_BYPASS")) ? 1 : 0;
     }
     return v;
 }
 static inline bool tc_dbg_watch(uint32_t pc)
 {
+    {   /* TC1797_DIAG6F1: trace the 0x6F1 standard-UDS reception path: dispatcher FUN_800e8728,
+         * Dcm FUN_8010ffa2, CanTp 0x6F1 handler 0x8011bba8, and the OS-tick FUN_80083552. */
+        static int d6 = -1;
+        if (d6 < 0) d6 = getenv("TC1797_DIAG6F1") ? 1 : 0;
+        if (d6) {
+            uint32_t n = pc & ~0x20000000u;
+            return n == 0x800e8728u || n == 0x8010ffa2u || n == 0x8011bba8u || n == 0x800dccdcu
+                || n == 0x800dc44cu || n == 0x80121cf6u || n == 0x8010198cu || n == 0x8010199au
+                /* block-transfer (0x7e2) reception path trace */
+                || n == 0x8011c066u || n == 0x8011c0c8u || n == 0x8011cb7eu || n == 0x800eb502u
+                || n == 0x8011c2e8u || n == 0x8011ca3cu
+                || n == 0x8011c244u || n == 0x8011c2acu;
+        }
+    }
+    {   /* TC1797_DIAGGATE: watch FUN_80014a76 (computes DAT_c0000164 diag-accept gate) to see
+         * if it runs + which condition fails. */
+        static int dgg = -1;
+        if (dgg < 0) dgg = getenv("TC1797_DIAGGATE") ? 1 : 0;
+        if (dgg) {
+            uint32_t n = pc & ~0x20000000u;
+            return n == 0x80014a76u || n == 0x80014880u || n == 0x80015638u
+                || n == 0x80014aa6u || n == 0x80014ac2u || n == 0x80014b12u;
+        }
+    }
+    {   /* TC1797_MSDISEL: trace the MSDI bank2 channel-select writers -- FUN_800e06a4 (writes the
+         * 4 f0|byte select cmds) + FUN_800e0736 (idx->select via flash tables). Reveals WHICH path
+         * (cycler step2 vs monitor FUN_8008040c vs other) actually writes the bank2 select + the idx. */
+        static int ms = -1;
+        if (ms < 0) ms = getenv("TC1797_MSDISEL") ? 1 : 0;
+        if (ms) {
+            uint32_t n = pc & ~0x20000000u;
+            return n == 0x800e06a4u || n == 0x800e0736u;
+        }
+    }
+    {   /* TC1797_ACTLOG: log the OSEK ActivateTask (0x801249b0) activation set + the COM/diag
+         * task body (0x8033a0f0) to find which tasks actually run and whether the diag task is
+         * ever activated. Low cardinality (distinct-deduped in the helper). */
+        static int al = -1;
+        if (al < 0) al = getenv("TC1797_ACTLOG") ? 1 : 0;
+        if (al) {
+            uint32_t n = pc & ~0x20000000u;
+            return n == 0x801249b0u || n == 0x8033a0f0u
+                /* diag RX completion + PduR boundary (first-exec trace to find Dcm path) */
+                || n == 0x8011cc6au || n == 0x8011cbf8u || n == 0x8011ccf0u || n == 0x8011ccccu
+                || n == 0x8011cb7eu || n == 0x8011cb66u || n == 0x8011cb32u
+                || n == 0x800eb502u || n == 0x800eb364u || n == 0x800eb4c0u || n == 0x800eadd4u;
+        }
+    }
+    {   /* TC1797_A70LOG: the 0x3026 coding-read path (FUN_80096522 + the selftest a70 check). */
+        static int a7 = -1;
+        if (a7 < 0) a7 = getenv("TC1797_A70LOG") ? 1 : 0;
+        if (a7) {
+            uint32_t n = pc & ~0x20000000u;
+            return n == 0x80096522u || n == 0x80149088u || n == 0x801491a0u
+                || n == 0x800bf97cu    /* the reset fn -- dump the call stack + os/phase context */
+                || n == 0x8009622eu    /* coding-queue processor (sync-wait body) */
+                || n == 0x800960ceu    /* coding read source (needs DAT_d000396b in [2,8]) */
+                || n == 0x8009649cu    /* coding-subsystem INIT (sets d000396b=1, d0012d99=1) */
+                || n == 0x800df5c2u;   /* the OTHER caller of FUN_8009649c */
+        }
+    }
+    {   /* TC1797_A70FIX: inject the car's REAL decoded id-0xb variant coding. The raw DFLASH
+         * variant-coding bank (which FUN_80096522 decodes) is censored (0xFF) in every capture;
+         * its decoded RESULT is recoverable from the car DSPR dump. Hook 0x80148e16 in
+         * selftest_80148da4 -- after both FUN_80096522 decode calls (0x80148dee/0x80148e12) and
+         * before the a70/a71/a8e/a8f loads (0x80148e32+) -- so the firmware copies the consistent
+         * car values itself (a70=00/a71=ff/a8e=ff/a8f=00). */
+        static int a7f = -1;
+        if (a7f < 0) a7f = getenv("TC1797_A70FIX") ? 1 : 0;
+        if (a7f) {
+            uint32_t n = pc & ~0x20000000u;
+            return n == 0x80096522u    /* FUN_80096522 decoder entry (save dest/len) */
+                || n == 0x800965b2u    /* decoder return (inject car value, all ids) */
+                || n == 0x80148e16u;   /* id-0xb selftest fallback (no-DSPR-file path) */
+        }
+    }
     {   /* TC1797_WDLOG: watch ONLY the two watchdog fns (low overhead) so the emulation
          * stays fast enough to reach phase 3 where they run. */
         static int wl = -1;
@@ -136,6 +218,8 @@ static inline bool tc_dbg_watch(uint32_t pc)
                 || n == 0x800a57f2u  /* FUN_800a57f2 entry: per-bank E2E validator (args d4/d5/d6) */
                 || n == 0x800a58deu  /* FUN_800a58de entry: per-bank validator */
                 || n == 0x8011630eu  /* FUN_8011630e: SSC descriptor enqueue (busy/full?) */
+                || n == 0x80096522u  /* FUN_80096522: coding-block reader (0x3026 a70 source) */
+                || n == 0x80149088u  /* selftest_80148da4: the a70&0x21 -> 0x3026 decision */
                 || n == 0x8011a800u; /* SSC transfer engine -- which buffer, which mode? */
         }
     }

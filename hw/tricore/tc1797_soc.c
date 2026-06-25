@@ -4892,6 +4892,26 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
                             "a70=%02x a71=%02x(~a70=%02x) a75=%u 18a8c=%08x 172ac=%08x",
                             ph2, af, w37, w39, w38, a70, a71, (uint8_t)~a70, a75,
                             m18a8c, c172);
+                /* Coding-complement pairs (FUN_80074768 0x3015): on the real car
+                 * these satisfy value==~complement (cc=00/e88=ff). A mismatch fires
+                 * 0x3015 and sets a70|=8 -> cascades to the 0x3026 timing-CRC re-fire. */
+                {
+                    uint8_t cc[4]={0}, e88[4]={0}, ce[2]={0}, ea[2]={0}, p134[4]={0}, l000[4]={0};
+                    cpu_physical_memory_read(0xD0016CC0u, cc, 4);
+                    cpu_physical_memory_read(0xD0016E88u, e88, 4);
+                    cpu_physical_memory_read(0xD0016CE1u, ce, 2);
+                    cpu_physical_memory_read(0xD0016EA8u, ea, 2);
+                    cpu_physical_memory_read(0xD0000134u, p134, 4);
+                    cpu_physical_memory_read(0xD0000000u, l000, 4);
+                    int cc_ok = ((cc[0]^0xff)==e88[0])&&((cc[1]^0xff)==e88[1])&&
+                                ((cc[2]^0xff)==e88[2])&&((cc[3]^0xff)==e88[3]);
+                    int ce_ok = ((ce[0]^0xff)==ea[0])&&((ce[1]^0xff)==ea[1]);
+                    info_report("tc1797:  coding-cmpl cc=%02x%02x%02x%02x e88=%02x%02x%02x%02x ok=%d "
+                                "| ce12=%02x%02x ea89=%02x%02x ok=%d | 134=%02x%02x000=%02x%02x",
+                                cc[0],cc[1],cc[2],cc[3], e88[0],e88[1],e88[2],e88[3], cc_ok,
+                                ce[0],ce[1], ea[0],ea[1], ce_ok,
+                                p134[0],p134[1], l000[2],l000[3]);
+                }
             }
             /* Surface the firmware's own crash report once. */
             uint32_t p = 0, ra = 0, v = 0, code = 0;

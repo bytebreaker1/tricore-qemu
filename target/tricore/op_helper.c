@@ -28,6 +28,252 @@
 void helper_tc_dbg(CPUTriCoreState *env, uint32_t pc)
 {
     static int n;
+    {   /* TC1797_A70FIX: inject the car's REAL decoded variant coding. FUN_80096522 is the per-id
+         * coding decoder; on this build it decodes the SYNTHETIC DFLASH bank, yielding wrong values
+         * (e.g. id-0xb -> a70=0xff) that trip the 0x3026 timing-CRC + 0x3015 coding-complement resets.
+         * The raw DFLASH source is censored in every capture, but the DECODED RESULT is in the car's
+         * DSPR dump. GENERALIZED (all ids): with TC1797_CODING_DSPR=<128KB DSPR dump> set, hook the
+         * decoder entry (0x80096522: save dest=a4, len=d6) + return (0x800965b2: if it ran, copy the
+         * car's value g_cardspr[dest..dest+len] over the just-written output). Every coding id then
+         * gets the car's real value. Fallback with no DSPR file: hardcode id-0xb at 0x80148e16. */
+        static int a7f = -1;
+        static uint8_t *g_cardspr = NULL;
+        static uint32_t sv_dest = 0, sv_len = 0;
+        if (a7f < 0) {
+            a7f = getenv("TC1797_A70FIX") ? 1 : 0;
+            const char *p = getenv("TC1797_CODING_DSPR");
+            if (a7f && p) {
+                FILE *cf = fopen(p, "rb");
+                if (cf) {
+                    g_cardspr = g_malloc0(0x20000);
+                    size_t rd = fread(g_cardspr, 1, 0x20000, cf);
+                    fclose(cf);
+                    fprintf(stderr, "A70FIX: car DSPR coding reference loaded from %s (%zu bytes)\n",
+                            p, rd);
+                    fflush(stderr);
+                }
+            }
+        }
+        if (a7f) {
+            uint32_t n = pc & ~0x20000000u;
+            if (g_cardspr && n == 0x80096522u) {          /* decoder entry: save dest/len */
+                sv_dest = env->gpr_a[4];
+                sv_len  = env->gpr_d[6];
+            } else if (g_cardspr && n == 0x800965b2u) {   /* decoder return: inject car value */
+                if (env->gpr_d[2] != 0x2au              /* 0x2a = invalid-param early return (no write) */
+                    && sv_dest >= 0xD0000000u && sv_len > 0 && sv_len <= 256u
+                    && sv_dest + sv_len <= 0xD0020000u) {
+                    cpu_physical_memory_write(sv_dest, g_cardspr + (sv_dest - 0xD0000000u), sv_len);
+                    static unsigned r;
+                    if (r++ < 12) {
+                        fprintf(stderr, "A70FIX: injected car coding @%08x len=%u\n", sv_dest, sv_len);
+                        fflush(stderr);
+                    }
+                }
+            } else if (!g_cardspr && n == 0x80148e16u) {  /* no-file fallback: id-0xb only */
+                uint8_t v[2];
+                v[0] = 0x00; v[1] = 0xff; cpu_physical_memory_write(0xD0017294u, v, 2);
+                v[0] = 0xff; v[1] = 0x00; cpu_physical_memory_write(0xD0017298u, v, 2);
+            }
+        }
+    }
+    if (getenv("TC1797_MSDISEL")) {
+        uint32_t nm = pc & ~0x20000000u;
+        if (nm == 0x800e06a4u) {
+            static unsigned w; if (w++ < 60) {
+                fprintf(stderr, "MSDISEL write-bank2cmd uVar2=%08x caller=%08x\n",
+                        env->gpr_d[4], env->gpr_a[11] & ~0x20000000u); fflush(stderr); }
+        } else if (nm == 0x800e0736u) {
+            static unsigned x; if (x++ < 60) {
+                fprintf(stderr, "MSDISEL FUN_800e0736 idx=%u caller=%08x\n",
+                        env->gpr_d[4], env->gpr_a[11] & ~0x20000000u); fflush(stderr); }
+        }
+    }
+    if (getenv("TC1797_DIAG6F1")) {
+        uint32_t np = pc & ~0x20000000u;
+        if (np == 0x800e8728u) {            /* RX dispatcher: param_1(a4)=&id, param_3(a5)=data */
+            uint32_t idp = env->gpr_a[4], datp = env->gpr_a[5];
+            uint32_t id = idp ? cpu_ldl_le_data(env, idp) : 0;
+            uint8_t d0 = datp ? cpu_ldub_data(env, datp) : 0;
+            static unsigned dd; static uint32_t seenid[64]; static int ns;
+            int fresh = (id == 0x6f1u);
+            if (!fresh) { fresh = 1; for (int i = 0; i < ns; i++) if (seenid[i] == id) { fresh = 0; break; } if (fresh && ns < 64) seenid[ns++] = id; }
+            if (fresh || id == 0x6f1u) {
+                if (dd++ < 60)
+                    fprintf(stderr, "DIAG6F1 dispatch FUN_800e8728 id=0x%03x data0=0x%02x%s\n",
+                            id, d0, id == 0x6f1u ? "  <<< 0x6F1 DIAG!" : "");
+                fflush(stderr);
+            }
+        } else if (np == 0x8010ffa2u) {
+            static unsigned dm; if (dm++ < 10) { fprintf(stderr, "DIAG6F1 *** DCM FUN_8010ffa2 RAN ***\n"); fflush(stderr); }
+        } else if (np == 0x8011bba8u) {
+            static unsigned ct; if (ct++ < 10) { fprintf(stderr, "DIAG6F1 CanTp-0x6F1 0x8011bba8 ran\n"); fflush(stderr); }
+        } else if (np == 0x800dccdcu) {
+            static unsigned h6; if (h6++ < 10) { fprintf(stderr, "DIAG6F1 0x6f0-handler 0x800dccdc ran\n"); fflush(stderr); }
+        } else if (np == 0x80121cf6u) {     /* drain loop: param_1=d4 start, param_2=d5 end */
+            static uint32_t seenpr[64]; static int nspr;
+            uint32_t pr = (env->gpr_d[4] << 16) | (env->gpr_d[5] & 0xffff); int fresh = 1;
+            for (int i = 0; i < nspr; i++) if (seenpr[i] == pr) { fresh = 0; break; }
+            if (fresh && nspr < 64) { seenpr[nspr++] = pr;
+                fprintf(stderr, "DIAG6F1 FUN_80121cf6(start=%u, end=%u)%s\n", env->gpr_d[4], env->gpr_d[5],
+                        (env->gpr_d[4] <= 23 && env->gpr_d[5] > 23) ? "  <<< covers ch23!" : ""); fflush(stderr); }
+        } else if (np == 0x8010198cu) {
+            static unsigned t1; if (t1++ < 3) { fprintf(stderr, "DIAG6F1 thunk 0x8010198c (ch14-x drain) RAN\n"); fflush(stderr); }
+        } else if (np == 0x8010199au) {
+            static unsigned t2; if (t2++ < 3) { fprintf(stderr, "DIAG6F1 thunk 0x8010199a (ch23-31 drain) RAN <<<\n"); fflush(stderr); }
+        } else if (np == 0x800dc44cu) {     /* MO drain: param channel in d4 (or d5) */
+            static uint8_t seen[256]; uint32_t ch4 = env->gpr_d[4] & 0xff, ch5 = env->gpr_d[5] & 0xff;
+            if (ch4 < 256 && !seen[ch4]) { seen[ch4] = 1;
+                fprintf(stderr, "DIAG6F1 drain FUN_800dc44c channel(d4)=%u (d5=%u)%s\n", ch4, ch5,
+                        ch4 == 23 ? "  <<< MO100/0x6F1 channel 23!" : ""); fflush(stderr); }
+        } else if (np == 0x8011c066u) {     /* block-cmd dispatch: *DAT_d0019a4c = command index */
+            static unsigned bd; uint32_t a4c = cpu_ldl_le_data(env, 0xD0019A4Cu);
+            uint8_t cmd = a4c ? cpu_ldub_data(env, a4c) : 0xff;
+            if (cmd != 0 && bd++ < 30) {    /* only non-idle dispatches */
+                fprintf(stderr, "DIAG6F1 blk-dispatch FUN_8011c066 cmd=*a4c=%u (a4c=%08x)\n", cmd, a4c); fflush(stderr); }
+        } else if (np == 0x8011c0c8u) {     /* cmd3 incoming-data handler */
+            static unsigned c3; if (c3++ < 20) {
+                uint32_t a4c = cpu_ldl_le_data(env, 0xD0019A4Cu); uint8_t len = a4c ? cpu_ldub_data(env, a4c+2) : 0xff;
+                fprintf(stderr, "DIAG6F1 *** cmd3 FUN_8011c0c8 RAN, RX[2](len)=%u\n", len); fflush(stderr); }
+        } else if (np == 0x8011cb7eu) {     /* StartOfReception wrapper */
+            static unsigned cb; if (cb++ < 20) {
+                fprintf(stderr, "DIAG6F1 *** cb7e RAN: c0000164=%u d00042bf=%u\n",
+                        cpu_ldub_data(env, 0xC0000164u), cpu_ldub_data(env, 0xD00042BFu)); fflush(stderr); }
+        } else if (np == 0x800eb502u) {     /* PduR StartOfReception */
+            static unsigned sr; if (sr++ < 20) {
+                fprintf(stderr, "DIAG6F1 *** StartOfReception FUN_800eb502 RAN: a4=%08x a5=%08x d4=%u d5=%u\n",
+                        env->gpr_a[4], env->gpr_a[5], env->gpr_d[4], env->gpr_d[5]); fflush(stderr); }
+        } else if (np == 0x8011ca3cu) {     /* cmd4 outgoing-read */
+            static unsigned c4; if (c4++ < 20) { fprintf(stderr, "DIAG6F1 cmd4 FUN_8011ca3c RAN\n"); fflush(stderr); }
+        } else if (np == 0x8011c2e8u) {     /* dispatch main: *a54 = TX armed state */
+            static unsigned dm; if (dm++ < 8) {
+                uint32_t a54 = cpu_ldl_le_data(env, 0xD0019A54u); uint8_t s = a54 ? cpu_ldub_data(env, a54) : 0;
+                uint16_t a8e = cpu_lduw_le_data(env, 0xD0019A8Eu);
+                fprintf(stderr, "DIAG6F1 disp-main FUN_8011c2e8: *a54=0x%02x a8e=0x%04x\n", s, a8e); fflush(stderr); }
+        } else if (np == 0x8011c244u) {     /* RX handler: a frame was read; log byte0/session/busy */
+            static unsigned rh; static uint8_t seenb[256];
+            uint32_t a50 = cpu_ldl_le_data(env, 0xD0019A50u);
+            uint8_t b0 = a50 ? cpu_ldub_data(env, a50) : 0xff;
+            uint8_t a95 = cpu_ldub_data(env, 0xD0019A95u);
+            uint16_t a8c = cpu_lduw_le_data(env, 0xD0019A8Cu);
+            if (rh < 40 && (b0 >= 2 || !seenb[b0])) { seenb[b0 & 0xff] = 1; rh++;
+                fprintf(stderr, "DIAG6F1 RX FUN_8011c1fe frame byte0=%u a95=0x%02x a8c(busy)=0x%04x\n", b0, a95, a8c); fflush(stderr); }
+        } else if (np == 0x8011c2acu) {     /* trigger SET */
+            static unsigned tg; uint32_t a50 = cpu_ldl_le_data(env, 0xD0019A50u);
+            uint8_t b0 = a50 ? cpu_ldub_data(env, a50) : 0xff;
+            if (tg++ < 30) { fprintf(stderr, "DIAG6F1 >>> TRIGGER SET byte0=%u\n", b0); fflush(stderr); }
+        }
+    }
+    if (getenv("TC1797_DIAGGATE")) {
+        uint32_t np = pc & ~0x20000000u;
+        if (np == 0x80014a76u) {       /* FUN_80014a76: computes DAT_c0000164 (diag-accept gate) */
+            static unsigned dg;
+            if (dg++ < 6) {
+                uint8_t t773 = cpu_ldub_data(env, 0x80017773u);
+                uint32_t r5c0 = cpu_ldl_le_data(env, 0xF00005C0u);
+                uint32_t r010 = cpu_ldl_le_data(env, 0xF8002010u);
+                uint8_t t0 = cpu_ldub_data(env, 0x80017F10u); int uni = 1;
+                for (int i = 1; i < 12; i++) { if (cpu_ldub_data(env, 0x80017F10u + i) != t0) { uni = 0; break; } }
+                fprintf(stderr, "DIAGGATE 80014a76 #%u: cond1(773=%02x b1=%u) cond2(5c0&ff=%02x||f8002010&10000=%x) "
+                        "cond3(uniform=%d) c0000164now=%u\n", dg, t773, (t773 >> 1) & 1u, r5c0 & 0xff,
+                        r010 & 0x10000u, uni, cpu_ldub_data(env, 0xC0000164u));
+                fflush(stderr);
+            }
+        } else if (np == 0x80014880u) {  /* the accept callback (returns c0000164 to the CanTp) */
+            static unsigned ag; if (ag++ < 4) {
+                fprintf(stderr, "DIAGGATE 80014880 accept-check: returns c0000164=%u\n", cpu_ldub_data(env, 0xC0000164u));
+                fflush(stderr); }
+        } else if (np == 0x80014aa6u) {  /* jnz d15(local_1) : cond1 -- actual local_1 from FUN_8001488e */
+            static unsigned c1; if (c1++ < 4) {
+                fprintf(stderr, "DIAGGATE cond1 @aa6: local_1(d15)=%u (nonzero=>REJECT)\n", env->gpr_d[15]); fflush(stderr); }
+        } else if (np == 0x80014ac2u) {  /* jnz d2 : cond3 -- actual FUN_80015638 return */
+            static unsigned c3; if (c3++ < 4) {
+                fprintf(stderr, "DIAGGATE cond3 @ac2: FUN_80015638 ret(d2)=%u (nonzero=>REJECT)\n", env->gpr_d[2]); fflush(stderr); }
+        } else if (np == 0x80014b12u) {  /* jeq d9,#0 : final accept flag */
+            static unsigned cf; if (cf++ < 4) {
+                fprintf(stderr, "DIAGGATE final @b12: d9(accept)=%u (0=>ACCEPT/open, 1=>REJECT)\n", env->gpr_d[9]); fflush(stderr); }
+        }
+    }
+    if (getenv("TC1797_ACTLOG")) {
+        uint32_t np = pc & ~0x20000000u;
+        if (np == 0x801249b0u) {   /* ActivateTask(a4 = run-node): log the DISTINCT activation set */
+            static uint32_t seen[512]; static int nseen;
+            uint32_t rn = env->gpr_a[4];
+            int found = 0;
+            for (int i = 0; i < nseen; i++) { if (seen[i] == rn) { found = 1; break; } }
+            if (!found && nseen < 512) {
+                seen[nseen++] = rn;
+                uint8_t ph = cpu_ldub_data(env, 0xD0003643u);
+                fprintf(stderr, "[ACTLOG] ActivateTask run-node=0x%08x (distinct #%d, phase=%u)\n",
+                        rn, nseen, ph);
+                fflush(stderr);
+            }
+        } else if (np == 0x8033a0f0u) {   /* the COM/diag task body -- does it ever run? */
+            static int c; if (c < 8) { c++;
+                fprintf(stderr, "[ACTLOG] *** FUN_8033a0f0 (COM/diag) EXECUTED #%d ***\n", c);
+                fflush(stderr); }
+        } else {   /* diag RX completion / PduR boundary: log first-exec to map the live Dcm path */
+            static uint32_t dseen[32]; static int dn;
+            int f = 0;
+            for (int i = 0; i < dn; i++) { if (dseen[i] == np) { f = 1; break; } }
+            if (!f && dn < 32) {
+                dseen[dn++] = np;
+                fprintf(stderr, "[DIAGTRACE] first-exec 0x%08x\n", np);
+                fflush(stderr);
+            }
+        }
+    }
+    if (getenv("TC1797_A70LOG") && (pc & ~0x20000000u) == 0x800bf97cu) {
+        static unsigned rk; if (rk++ < 4) {
+            uint8_t os = cpu_ldub_data(env, 0xD000400Fu);
+            uint8_t ph = cpu_ldub_data(env, 0xD0003643u);
+            uint16_t dtc = env->gpr_d[5];   /* FUN_800bf97c(sev, dtc, val): dtc in d5 */
+            fprintf(stderr, "RESET-CTX dtc=0x%04x os_running=%u phase=%u | call stack:\n", dtc, os, ph);
+            uint32_t pcxi = env->PCXI;
+            for (int i = 0; i < 14 && pcxi; i++) {
+                uint32_t seg = (pcxi >> 16) & 0xFu, off = pcxi & 0xFFFFu;
+                uint32_t csa = (seg << 28) | (off << 6);
+                uint32_t prev = cpu_ldl_le_data(env, csa);
+                uint32_t ra   = cpu_ldl_le_data(env, csa + 12) & ~0x20000000u;
+                fprintf(stderr, "    [%2d] ra=%08x\n", i, ra);
+                pcxi = prev;
+            }
+            fflush(stderr);
+        }
+    }
+    if (getenv("TC1797_A70LOG") && ((pc & ~0x20000000u) == 0x8009649cu || (pc & ~0x20000000u) == 0x800df5c2u)) {
+        uint8_t ph = cpu_ldub_data(env, 0xD0003643u);
+        uint8_t b396b = cpu_ldub_data(env, 0xD000396Bu);
+        fprintf(stderr, "CODING-INIT %s ph=%u d000396b(before)=%u\n",
+                (pc & ~0x20000000u) == 0x8009649cu ? "FUN_8009649c" : "FUN_800df5c2(caller)", ph, b396b);
+        fflush(stderr);
+    }
+    if (getenv("TC1797_A70LOG") && ((pc & ~0x20000000u) == 0x8009622eu || (pc & ~0x20000000u) == 0x800960ceu)) {
+        static unsigned ck; if (ck++ < 60) {
+            uint8_t ph = cpu_ldub_data(env, 0xD0003643u);
+            uint8_t b396b = cpu_ldub_data(env, 0xD000396Bu);
+            fprintf(stderr, "CODING %s ph=%u d000396b=%u%s\n",
+                    (pc & ~0x20000000u) == 0x8009622eu ? "queue-proc(622e)" : "read-src(60ce)",
+                    ph, b396b,
+                    (pc & ~0x20000000u) == 0x800960ceu ? ((uint8_t)(b396b - 2u) < 7u ? " -> NORMAL-read" : " -> ABNORMAL(d396b!=2..8)") : "");
+            fflush(stderr);
+        }
+    }
+    if (getenv("TC1797_A70LOG")) {
+        uint32_t np_ = pc & ~0x20000000u;
+        if ((np_ == 0x80096522u && env->gpr_d[6] == 0xbu) || np_ == 0x80149088u || np_ == 0x801491a0u) {
+            static unsigned k; if (k++ < 40) {
+                uint8_t b396b  = cpu_ldub_data(env, 0xD000396Bu);
+                uint8_t a70    = cpu_ldub_data(env, 0xD0018A70u);
+                uint16_t d7294 = cpu_lduw_le_data(env, 0xD0017294u);
+                uint8_t ph     = cpu_ldub_data(env, 0xD0003643u);
+                const char *w = np_ == 0x80096522u ? "FUN96522-blk0xb"
+                              : np_ == 0x80149088u ? "selftest-0x21" : "0x3026-call";
+                fprintf(stderr, "A70 %-16s ph=%u d000396b=%u a70(18a70)=%02x d0017294=%04x\n",
+                        w, ph, b396b, a70, d7294); fflush(stderr);
+            }
+        }
+    }
     /* TC1797_MSDI_BYPASS (USER-REQUESTED TEMPORARY CRUTCH, default OFF -- NOT FAITHFUL).
      * At the return of the MSDI bank-check FUN_8008034a (ret @0x800803de): force the return
      * value d2=0 ("bank OK") so the monitor advances its own bank sequence (reads bank2/3 via
