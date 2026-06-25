@@ -4963,6 +4963,34 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
                                 cc[0],cc[1],cc[2],cc[3], e88[0],e88[1],e88[2],e88[3], cc_ok,
                                 ce[0],ce[1], ea[0],ea[1], ce_ok,
                                 p134[0],p134[1], l000[2],l000[3]);
+                    /* FUN_800743a8 mirror/value WORD complement checks = the REAL 0x3017
+                     * trigger (RE 2026-06-25): mirror[0xD0016E90/9C/94] == ~value
+                     * [0xD001728C/0xD0016CCC/0xD0016CC8]. Shows whether the emu's coding-init
+                     * left these 0 (not run) vs inconsistent (bad synthetic coding). */
+                    {
+                        uint32_t m90=0,m9c=0,m94=0,v8c=0,vcc=0,vc8=0;
+                        cpu_physical_memory_read(0xD0016E90u,&m90,4);
+                        cpu_physical_memory_read(0xD0016E9Cu,&m9c,4);
+                        cpu_physical_memory_read(0xD0016E94u,&m94,4);
+                        cpu_physical_memory_read(0xD001728Cu,&v8c,4);
+                        cpu_physical_memory_read(0xD0016CCCu,&vcc,4);
+                        cpu_physical_memory_read(0xD0016CC8u,&vc8,4);
+                        info_report("tc1797:  743a8 e90=%08x ~728c=%08x %s | e9c=%08x ~6ccc=%08x %s "
+                                    "| e94=%08x ~6cc8=%08x %s",
+                                    m90, ~v8c, m90==(uint32_t)~v8c?"ok":"FAIL",
+                                    m9c, ~vcc, m9c==(uint32_t)~vcc?"ok":"FAIL",
+                                    m94, ~vc8, m94==(uint32_t)~vc8?"ok":"FAIL");
+                        /* The REAL 0x3017 trigger = FUN_800743a8 @0x800745c2 coding-validity
+                         * state machine: 0xD0016CC8 must reach magic 0xcafeaffe OR signature
+                         * byte 0xD0017274/78 must be 0x55 (programmed by checksum FUN_80074126).
+                         * If neither -> ce1|=4 -> cc1 counter -> 0x3017 -> a70|=8 -> 0x3026. */
+                        uint32_t s74=0,s78=0,cc8=0;
+                        cpu_physical_memory_read(0xD0017274u,&s74,4);
+                        cpu_physical_memory_read(0xD0017278u,&s78,4);
+                        cpu_physical_memory_read(0xD0016CC8u,&cc8,4);
+                        info_report("tc1797:  743a8-sig 17274=%08x 17278=%08x (want a byte=0x55) | "
+                                    "6cc8=%08x (want cafeaffe; fadecafe=pending)", s74, s78, cc8);
+                    }
                 }
             }
             /* Surface the firmware's own crash report once. */
