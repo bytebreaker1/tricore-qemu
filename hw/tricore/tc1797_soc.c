@@ -2890,7 +2890,20 @@ static void tc1797_src_node_write(TC1797SoCState *s, uint32_t *node,
             }
         }
         if (s->pcp_enabled) {
-            pcp_engine_trigger(&s->pcp, *node & 0xFFu);
+            /* MSDI ring-drain race close (DTC-0x302a): the MSC0 ch-0x28 ring-completion
+             * drain is modelled synchronously in the MSC0 SRC0-SETR handler (see
+             * TC1797_NO_MSC_RINGDRAIN), because the real PCP ch-0x28 microcode drain is
+             * BH-deferred past the monitor's d4a check AND intermittently CSA-aborts.
+             * Suppress its (abort-prone, head-advancing) microcode trigger so the C
+             * net-effect is the SOLE drainer and the ring head advances exactly once per
+             * frame (no double-advance). Only the MSC0 SRC0 node (0xF00008FC, SRPN 0x28) is
+             * suppressed; all other PCP channels (incl. MSC SRC1/0x2a) trigger normally. */
+            static int rdz = -1;
+            if (rdz < 0) { rdz = getenv("TC1797_NO_MSC_RINGDRAIN") ? 0 : 1; }
+            if (!(rdz && (*node & 0xFFu) == 0x28u
+                  && (addr & 0xFFFFFF00u) == 0xF0000800u)) {
+                pcp_engine_trigger(&s->pcp, *node & 0xFFu);
+            }
         }
         /* MSC ring-completion node: SRR auto-clears on PCP service entry (silicon HW), so
          * the MSDI driver sees the request serviced and re-SETRs the node per ring frame.
@@ -4786,6 +4799,45 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
                         tc1797_src_node_write(s, &s->msc_src[u][1],
                                               (s->msc_src[u][1] & 0x00001FFFu) | 0x8000u,
                                               (addr & 0xFFFFFFFCu) - 4u);
+                    }
+                    /*
+                     * MSDI bring-up race close (DTC-0x302a). The SC900685 command-ring drain
+                     * (clear descriptor 0xD000CE60+idx*0x20 bit0 + advance ring head
+                     * 0xF0050F00) is the job of the real PCP ch-0x28 microcode, but that drain
+                     * (a) dispatches on a slice-end bottom-half AFTER the MSDI monitor's d4a
+                     * watchdog check, and (b) intermittently CSA-aborts so the descriptor
+                     * never clears -- the residual 0x302a reset (caller 0xa00802ba). Making the
+                     * BH prompt (cpu_exit) did NOT help -> the abort, not the latency, is the
+                     * cause. So model the drain NET-EFFECT synchronously here -- the exact
+                     * inverse of the firmware enqueue FUN_8011630e (which sets the descriptor
+                     * bit0, stores its ptr at ring[(tail&0x1f)+1], tail++): clear the head-slot
+                     * descriptor's bit0 + advance head, ONE frame per SRC0 fire. The ch-0x28
+                     * PCP microcode trigger is SUPPRESSED for the MSC region in
+                     * tc1797_src_node_write (same TC1797_NO_MSC_RINGDRAIN gate) so the head is
+                     * never double-advanced. Mirrors the ADC-gate net-effect (L4076) -- bypass
+                     * the abort-prone microcode, no value-fit, no forced ready flag, no reset
+                     * cap. Conservative: only drains a head slot whose descriptor is actually
+                     * busy + a plausible DSPR descriptor. Opt out: TC1797_NO_MSC_RINGDRAIN.
+                     */
+                    if (u == 0) {
+                        static int rd = -1;
+                        if (rd < 0) { rd = getenv("TC1797_NO_MSC_RINGDRAIN") ? 0 : 1; }
+                        if (rd) {
+                            uint32_t rb = 0xF0050F00u, head = 0, dptr = 0;
+                            cpu_physical_memory_read(rb, &head, 4);
+                            cpu_physical_memory_read(rb + ((head & 0x1Fu) + 1u) * 4u, &dptr, 4);
+                            if (dptr >= 0xD000CE60u && dptr < 0xD000CE60u + 0x40u * 0x20u
+                                && (dptr & 3u) == 0u) {
+                                uint32_t dw = 0;
+                                cpu_physical_memory_read(dptr, &dw, 4);
+                                if (dw & 1u) {                  /* busy -> drain this frame */
+                                    dw &= ~1u;
+                                    cpu_physical_memory_write(dptr, &dw, 4);
+                                    head += 1u;
+                                    cpu_physical_memory_write(rb, &head, 4);
+                                }
+                            }
+                        }
                     }
                 }
             } else {                                /* sub-byte config write (e.g. SRE @byte+1) */
