@@ -88,7 +88,19 @@ struct TC1797SoCState {
     uint32_t scu_rststat;      /* SCU_RSTSTAT shadow (write-1-to-clear) */
     uint32_t hwcfg_ststat;     /* SCU_STSTAT: HWCFG[7:0] boot-config pins (P0 latch) */
     uint32_t scu_stcon;        /* SCU_STCON startup-config shadow */
-    uint32_t fce_crc;          /* FCE CRC0 value register (CRC32-Ethernet) */
+    uint32_t fce_crc;          /* MCHK_RR result register. Running value = the FAITHFUL
+                                * TC1797 MCHK CRC (UM 11.5, Fig 11-32): a Fibonacci LFSR that
+                                * shifts UP, feedback g32 = parity(RR & 0xEDB88320) inserted at
+                                * bit0, input word XORed bit-parallel into every stage --
+                                *   crc' = ((crc << 1) | g32) ^ W   (bit31 dropped).
+                                * Solved + bit-exact vs the firmware's own BROM BMHD checks
+                                * (seed FFFFFFFF: 6w HEAD -> 0x235ab3a6, 30w RANGE -> 0xb896ce94);
+                                * step at write-handler 0xF010C210. The BROM header check now
+                                * PASSES with this value (no oracle needed; TC1797_NO_FCE_ORACLE).
+                                * NOTE: the firmware coding self-test does NOT use this MMIO CRC --
+                                * it runs a SOFTWARE reflected-CRC32 over the DFLASH coding blocks,
+                                * which tc1797_seed_dflash_bank matches independently; runtime FCE
+                                * use is BROM-only (all seeds FFFFFFFF), so that path is untouched. */
     uint32_t wdt_con0;         /* WDT_CON0 shadow (ENDINIT password writes) */
     uint32_t wdt_con1;         /* WDT_CON1 shadow */
     bool wdt_endinit;          /* decoded ENDINIT state (CON0 bit0) */
@@ -4165,6 +4177,13 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val,
     return false;
 }
 
+/* TC1797_FCE_SEQLOG capture buffer: records the seed + every word of one MCHK run so the
+ * full (seed, words[], expected-D4) sample can be dumped at the BROM compare for offline
+ * algorithm recovery. Diagnostic only (opt-in). */
+static uint32_t g_fce_seq_seed;
+static uint32_t g_fce_seq_words[4096];
+static int g_fce_seq_n;
+
 static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
 {
     TC1797SoCState *s = opaque;
@@ -4497,10 +4516,27 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
      * signal DSPR addresses, not a modelled result register.) */
     case 0xF0101038: case 0xF0101438: case 0xF0101838: return 0x00000300;
     case 0xF8002028: case 0xF8004028: return 0x00000000; /* PROCON2 */
-    /* ── FCE (CRC engine): BMI-validation bypass. The BROM reads the CRC
-     *    result at PC 0xAFFFCFE6 then compares to the expected CRC in D4;
-     *    return D4 so validation passes for a validly-flashed image (we don't
-     *    have Bosch's exact CRC32 variant). ── */
+    /* ── MCHK (Memory Checker Module, UM 11.5, base 0xF010C200) BMI-validation
+     *    oracle. The block at 0xF010C2xx is NOT the AURIX "FCE" (no config/REFIN/
+     *    REFOUT/INV registers exist on the TC1797 MCHK -- only ID/IR/RR/WR). The
+     *    BROM CRCs the BMHD header (0xAFFFCFC0 loop) and reads the result at PC
+     *    0xAFFFCFE6, then `sub d8,d4` requires result == expected CRChead (D4).
+     *
+     *    CRACKED + modelled faithfully 2026-06-25 (BROM disasm @0xAFFFCFC0 + the UM
+     *    Figure 11-32 bit-network, read from the UM PDF page after text extraction
+     *    lost the wiring). The MCHK CRC is a non-standard FIBONACCI LFSR -- UM 11.5.1:
+     *    "the generation algorithm differs from the one used by the Ethernet
+     *    protocol." Per 32-bit MCHK_IR write (ONE combinational step):
+     *        crc = ((crc << 1) | parity(crc & 0xEDB88320)) ^ word
+     *    i.e. shift the result register up by one, insert feedback g32 = XOR of the
+     *    tapped state bits (taps {31,30,29,27,26,24,23,21,20,19,15,9,8,5} = the
+     *    reflected G32 poly), XOR the input word bit-parallel. Implemented at case
+     *    0xF010C210. Bit-EXACT vs the firmware's own BMHD checks (seed 0xFFFFFFFF:
+     *    6 header words -> 0x235ab3a6 = the 0xAFFFCFE6 compare value; 30 range words
+     *    -> 0xb896ce94). So s->fce_crc now == the expected CRChead organically and
+     *    the oracle below is RETIRED (default-off; opt back in via TC1797_FCE_ORACLE
+     *    only for A/B debugging). VERIFIED: BROM BMI gate passes on the real value,
+     *    phase 4 reached, the cold-boot 0x3026/0x3006 flash-CRC resets are gone. ── */
     case 0xF010C214:
         /* AUDIT GATE (2026-06-17): the BROM BMI CRC oracle returns the expected CRC (D4) at the compare
          * PC instead of the computed FCE CRC. Gated to test whether it's still needed once the WDT
@@ -4516,8 +4552,29 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
                             s->fce_crc, (uint32_t)s->cpu.env.gpr_d[4]);
                 }
             }
-            if (getenv("TC1797_NO_FCE_ORACLE") == NULL) {
-                return s->cpu.env.gpr_d[4];   /* LOAD-BEARING: boot fails the BROM BMI check without it */
+            if (getenv("TC1797_FCE_SEQLOG")) {
+                static int seq_dumped;
+                if (seq_dumped++ < 8) {
+                    fprintf(stderr, "FCE-SEQ seed=%08x n=%d expected(D4)=%08x words=",
+                            g_fce_seq_seed, g_fce_seq_n, (uint32_t)s->cpu.env.gpr_d[4]);
+                    for (int i = 0; i < g_fce_seq_n; i++)
+                        fprintf(stderr, "%08x ", g_fce_seq_words[i]);
+                    fprintf(stderr, "\n"); fflush(stderr);
+                }
+            }
+            /* Oracle RETIRED 2026-06-25: the MCHK CRC is now modelled FAITHFULLY
+             * (the Fibonacci-LFSR step at case 0xF010C210), so s->fce_crc == the
+             * firmware's own expected CRChead (D4) organically -- verified live:
+             * computed==expected==0x235ab3a6 at this PC with no crutch, BROM BMI
+             * gate passes, phase 4 reached. Opt back into the old crutch only for
+             * A/B debugging via TC1797_FCE_ORACLE. */
+            if (getenv("TC1797_FCE_ORACLE")) {
+                return s->cpu.env.gpr_d[4];
+            }
+        }
+        if (getenv("TC1797_FCE_RDLOG")) {
+            static unsigned ri; if (ri++ < 400) {
+                fprintf(stderr, "FCE-RD %08x\n", s->fce_crc); fflush(stderr);
             }
         }
         return s->fce_crc;
@@ -5101,27 +5158,65 @@ static void tc1797_sfr_write(void *opaque, hwaddr offset, uint64_t val,
         break;
     case 0xF010C214:                      /* FCE CRC0 value: write = seed */
         s->fce_crc = (uint32_t)val;
+        if (getenv("TC1797_FCE_INLOG")) {
+            fprintf(stderr, "FCE-SEED %08x\n", (uint32_t)val); fflush(stderr);
+        }
+        /* SEQ logger: remember the seed, start a fresh word list for this CRC run. */
+        if (getenv("TC1797_FCE_SEQLOG")) {
+            g_fce_seq_seed = (uint32_t)val;
+            g_fce_seq_n = 0;
+        }
         break;
     case 0xF010C210: {                    /* FCE CRC0 input: CRC32 step */
         uint32_t v = (uint32_t)val, crc = s->fce_crc;
+        if (getenv("TC1797_FCE_INLOG")) {
+            static unsigned fi; if (fi++ < 400) { fprintf(stderr, "FCE-IN %08x\n", v); fflush(stderr); }
+        }
+        if (getenv("TC1797_FCE_SEQLOG")) {
+            if (g_fce_seq_n < (int)(sizeof(g_fce_seq_words)/sizeof(g_fce_seq_words[0])))
+                g_fce_seq_words[g_fce_seq_n++] = v;
+        }
         if (getenv("TC1797_FCE_FWD")) {
-            /* TEST: non-reflected CRC32 (poly 0x04C11DB7, MSB-first byte+bit order)
-             * -- the alternative FCE variant if the firmware sets REFIN/REFOUT=0. */
+            /* LEGACY TEST: non-reflected CRC32 (poly 0x04C11DB7, MSB-first). */
             for (int bp = 3; bp >= 0; bp--) {
                 crc ^= ((v >> (bp * 8)) & 0xFFu) << 24;
                 for (int i = 0; i < 8; i++) {
                     crc = (crc << 1) ^ (0x04C11DB7u & (uint32_t)(-(int32_t)((crc >> 31) & 1)));
                 }
             }
-        } else {
+            s->fce_crc = crc;
+        } else if (getenv("TC1797_FCE_REFCRC32")) {
+            /* LEGACY TEST: standard reflected CRC32 (the old default; gives 0xc1dd42bc,
+             * the WRONG BROM value). Kept opt-in for A/B comparison. */
             for (int bp = 0; bp < 4; bp++) {
                 crc ^= (v >> (bp * 8)) & 0xFF;
                 for (int i = 0; i < 8; i++) {
                     crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
                 }
             }
+            s->fce_crc = crc;
+        } else {
+            /* ── FAITHFUL TC1797 MCHK next-state (UM 11.5, Figure 11-32) ──
+             * The MCHK is NOT a standard CRC32 ("the generation algorithm differs
+             * from the one used by the Ethernet protocol", UM 11.5.1). One write to
+             * the input register (MCHKIR) is ONE combinational step of the bit
+             * network:
+             *   - a 32-bit Fibonacci LFSR that shifts the result register MCHKRR
+             *     UP by one (bit i <- bit i-1; the old MSB bit31 is discarded),
+             *   - the feedback bit g32 = parity( MCHKRR & 0xEDB88320 ) over the
+             *     polynomial taps {31,30,29,27,26,24,23,21,20,19,15,9,8,5}
+             *     (= the reflected G32 poly's coefficient set) is inserted at bit 0,
+             *   - the 32-bit input word W is XORed bit-parallel into every stage
+             *     (W bits 1..31 into the shifted positions, W bit0 into bit0).
+             * i.e.  crc' = ((crc << 1) | g32) ^ W   with bit31 naturally dropped.
+             * VERIFIED bit-exact against the firmware's own BROM BMHD checks:
+             *   seed FFFFFFFF, 6w  HEAD  -> 0x235ab3a6 (the 0xAFFFCFE6 compare value)
+             *   seed FFFFFFFF, 30w RANGE -> 0xb896ce94
+             * No oracle, no special-casing -- a faithful model of the silicon. */
+            uint32_t g32 = (uint32_t)(__builtin_parity(crc & 0xEDB88320u));
+            crc = (((crc << 1) & 0xFFFFFFFEu) | g32) ^ v;
+            s->fce_crc = crc;
         }
-        s->fce_crc = crc;
         break;
     }
     case 0xF7E0FFFC: {
