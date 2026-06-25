@@ -6674,8 +6674,36 @@ static void tc1797_machine_init(MachineState *machine)
         if (len > 0x1BB680) {
             fw[0x1B984C] = CODING_SIG_A; fw[0x1B984D] = CODING_SIG_A;
             fw[0x1BB679] = CODING_SIG_B; fw[0x1BB67A] = CODING_SIG_B;
+            /*
+             * Second coding-validity validator (clears runtime FATAL 0x3017).
+             *
+             * The runtime self-test FUN_800743a8 (a9=0xA0153C38 ptr table, same
+             * table object as the 0x3027 test above) reads the SAME two PFLASH
+             * coding-validity objects, but at neighbouring signature offsets, and
+             * marks them invalid (-> DAT_d0016ce1 bit2 -> DTC 0x3017 -> 0x3026
+             * reboot) when they read blank:
+             *   FUN_80074126 sets 0xD0017274=0x55 iff marker[+3]==0xAA AND image[5]==0x55
+             *                 sets 0xD0017278=0x55 iff marker[+2]==0xAA AND image[4]==0x55
+             * where image base = *(0xA0153C38+0) = 0xA01B9844 (file 0x1B9844) and
+             *       marker ptr  = *(0xA0153C38+0x134) = 0x801BB670 (file 0x1BB670).
+             * The validator's CC8-sentinel fast-path (program-CRC == 0xCAFEAFFE)
+             * is the FIRST descriptor's accept; the SECOND descriptor's CRC lands
+             * at 0xCAFF0553 on this dump (a zero-filled DATA sub-region) and so
+             * falls through to this marker check -- which then fails on the blank
+             * signature bytes. Programming the coded-ECU pattern here is the same
+             * faithful "this is a coded ECU" state as the 0x3027 fix: the self-test
+             * runs in full and passes exactly as on coded silicon (NOT a bypass,
+             * NOT a forced flag -- the firmware's own FUN_80074126 reads these PFLASH
+             * bytes and writes the 0x55 signature itself). Coding the synthetic
+             * DFLASH bank cannot fix this: this validator reads static PFLASH, not
+             * the DFLASH-decoded DSPR image (verified at runtime: a9=0xA0153C38).
+             */
+            fw[0x1B9848] = CODING_SIG_A;   /* image[4] -> 0xD0017278 */
+            fw[0x1B9849] = CODING_SIG_A;   /* image[5] -> 0xD0017274 */
+            fw[0x1BB672] = CODING_SIG_B;   /* marker[+2] enable for image[4] */
+            fw[0x1BB673] = CODING_SIG_B;   /* marker[+3] enable for image[5] */
             info_report("tc1797: coded-ECU coding-validity signatures programmed "
-                        "(obj1 0xA01B984C, obj2 0x801BB678) -- emulating a coded ECU");
+                        "(obj1 0xA01B984C/9844, obj2 0x801BB678/670) -- emulating a coded ECU");
         }
         info_report("tc1797: loaded %zu bytes firmware, patched %d WDT-spin sites",
                     (size_t)len, wdt_patches);
