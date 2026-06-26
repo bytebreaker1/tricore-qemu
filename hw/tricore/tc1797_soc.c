@@ -4171,11 +4171,36 @@ static void tc1797_ssc_write(TC1797SoCState *s, int unit, uint32_t off,
             if ((chip >= 0 || s->ssc_ssoc[0] == 0x0200u) && getenv("TC1797_SSC0LOG")) {
                 static unsigned s0;
                 if (s0++ < 4000) {
-                    fprintf(stderr, "SSC0TX ssoc=%04x %-7s reg=%02x data=%02x (frame=%04x) pc=%08x\n",
+                    /* Decode the frame: an L9959 bring-up instruction (RD_ID/WR_CONFIG/
+                     * ...) or the runtime H-bridge control word (FUN_80112868). The
+                     * decode tables are lifted from the firmware -- RE wf w3sq2baie:
+                     * all 3 SSC0 gate-drivers are L9959 (ID readback 0xDF), not TLE7183F. */
+                    char dec[40];
+                    uint32_t fr = val & 0xffffu;
+                    if (s->ssc_ssoc[0] == 0x0200u) {
+                        snprintf(dec, sizeof(dec), "VANOS-OCV duty=%u", db);
+                    } else if (fr & 0x8000u) {              /* runtime H-bridge control word */
+                        const char *dir = (fr & 0x0400u) ? "STANDBY" :
+                            (fr & 0x02u) ? "fwd-hi" : (fr & 0x08u) ? "rev-hi" :
+                            (fr & 0x01u) ? "fwd-lo" : (fr & 0x04u) ? "rev-lo" :
+                            (fr & 0x10u) ? "PWM" : (fr & 0x20u) ? "freewheel" : "coast";
+                        snprintf(dec, sizeof(dec), "CTRL %s", dir);
+                    } else {                                /* L9959 SPI instruction */
+                        const char *m;
+                        switch (hb & 0x3Fu) {
+                        case 0x04: m = "RD_ID"; break;      case 0x06: m = "RD_REV"; break;
+                        case 0x08: m = "RD_CFG"; break;     case 0x10: m = "RD_DIA1"; break;
+                        case 0x18: m = "RD_DIA2"; break;    case 0x28: m = "WR_CONFIG"; break;
+                        case 0x2c: m = "WR_STATCON"; break; case 0x30: m = "WR_DIA1"; break;
+                        case 0x38: m = "WR_DIA2"; break;    default:   m = "reg"; break;
+                        }
+                        snprintf(dec, sizeof(dec), "%s=%02x", m, db);
+                    }
+                    fprintf(stderr, "SSC0TX ssoc=%04x %-7s %-18s (frame=%04x) pc=%08x\n",
                             s->ssc_ssoc[0],
                             s->ssc_ssoc[0] == 0x0200u ? "VANOS" :
                             chip == 0 ? "L9959.0" : chip == 1 ? "L9959.1" : "L9959.2",
-                            hb, db, val & 0xffffu, (uint32_t)s->cpu.env.PC & ~0x20000000u);
+                            dec, fr, (uint32_t)s->cpu.env.PC & ~0x20000000u);
                     fflush(stderr);
                 }
             }
