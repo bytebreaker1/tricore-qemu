@@ -267,7 +267,9 @@ struct TC1797SoCState {
      * phaser slews the cam, and the cam-position sensor (NW, GPTA cap cell 3) feeds the angle back.
      * We capture the L9959 config, model the phaser as a 1st-order lag (duty -> target advance), and
      * fire the cam capture at (crank reference + cam phase) so the sensor reflects the DME command. */
-    uint8_t  l9959_reg[256];     /* SSC1 captured config: reg(high byte) -> data(low byte) */
+    uint8_t  l9959_reg[256];     /* VANOS/cam-OCV device (SSC0 SSOC 0x0200=SLSO1): reg(high)->data(low) */
+    uint16_t ssc_ssoc[2];        /* latched SSC chip-select (SSOC reg +0x18) per unit; selects the SLSOn target */
+    uint8_t  gatedrv_reg[3][256];/* the 3 L9959 H-bridge gate-drivers on SSC0 (SSOC 0x1000/0x8000/0x2000 = dev 0/1/2): reg->data. RE workflow wpkgne9dm */
     unsigned vanos_reg;          /* L9959 register holding the intake-VANOS duty (TC1797_VANOS_REG) */
     double   vanos_max_deg;      /* full duty -> this much cam advance, crank deg (TC1797_VANOS_MAX) */
     double   vanos_tau_s;        /* phaser hydraulic time constant, s (TC1797_VANOS_TAU) */
@@ -4149,6 +4151,35 @@ static void tc1797_ssc_write(TC1797SoCState *s, int unit, uint32_t off,
                 }
             }
         }
+        if (unit == 0) {
+            /* Capture the actuator OUTPUT frames routed by the latched chip-select
+             * (RE workflow wpkgne9dm: gate-drivers are on SSC0, not SSC1). ADDITIVE:
+             * the MSDI reply path above (SSOC 0x4000) is untouched -- we only
+             * side-record the L9959/VANOS command words so the actuator outputs are
+             * OBSERVABLE. Frame = high byte = register, low byte = data/duty. */
+            uint8_t hb = (val >> 8) & 0xFFu, db = (uint8_t)(val & 0xFFu);
+            int chip = -1;
+            switch (s->ssc_ssoc[0]) {
+            case 0x0200: s->l9959_reg[hb] = db; break;     /* VANOS/cam-OCV (SLSO1) */
+            case 0x1000: chip = 0; break;                  /* L9959 dev0 (SLSO4) */
+            case 0x8000: chip = 1; break;                  /* L9959 dev1 (SLSO7) */
+            case 0x2000: chip = 2; break;                  /* L9959 dev2 (SLSO5) */
+            }
+            if (chip >= 0) {
+                s->gatedrv_reg[chip][hb] = db;
+            }
+            if ((chip >= 0 || s->ssc_ssoc[0] == 0x0200u) && getenv("TC1797_SSC0LOG")) {
+                static unsigned s0;
+                if (s0++ < 4000) {
+                    fprintf(stderr, "SSC0TX ssoc=%04x %-7s reg=%02x data=%02x (frame=%04x) pc=%08x\n",
+                            s->ssc_ssoc[0],
+                            s->ssc_ssoc[0] == 0x0200u ? "VANOS" :
+                            chip == 0 ? "L9959.0" : chip == 1 ? "L9959.1" : "L9959.2",
+                            hb, db, val & 0xffffu, (uint32_t)s->cpu.env.PC & ~0x20000000u);
+                    fflush(stderr);
+                }
+            }
+        }
         /* UM 18/19: writing TBUF moves it to the transmit shift register (TSRC/+0xF4
          * fires, polled), which shifts out (TX) and shifts in (RX, loopback). When the
          * frame is fully received it is moved to RBUF and the RECEIVE interrupt RSRC
@@ -4195,12 +4226,19 @@ static void tc1797_ssc_write(TC1797SoCState *s, int unit, uint32_t off,
                               0xF0100100u + (uint32_t)unit * 0x100u + 0xFCu);
         return;
     }
-    /* CON trigger, baud, SSOC chip-select writes are accepted silently.
-     * SPI-bus map (RE'd via SSOC chip-select trace, task #83): SSC0 cs=0x4000
-     * = SC900685 MSDI switch monitor; SSC1 cs=0x0400 = TLE7183F, cs=0x0800 =
-     * L9959 (throttle/VANOS/wastegate, 0xBEEF unlock). The external M95512 SPI
-     * EEPROM (DME coding/identity store) is NOT accessed before the boot RAM/
-     * self-test cluster -- it is read downstream, so it does not gate 0x3027. */
+    if (off == 0x18) {
+        /* SSOC chip-select latch: selects the SLSOn slave (SSOC bit (8+n) = OENn)
+         * for the following TB frames. RE workflow wpkgne9dm CORRECTED the old map:
+         * ALL gate-driver + MSDI SPI is on SSC0 (the firmware's FUN_8011a800 picks
+         * unit 0 for every descriptor). 0x4000=SLSO6 = SC900685 MSDI (switch INPUT);
+         * 0x1000/0x8000/0x2000 = the 3 L9959-family H-bridge gate-drivers (dev 0/1/2);
+         * 0x0200=SLSO1 = VANOS/cam-OCV. Latch it so the TB capture routes per chip. */
+        s->ssc_ssoc[unit] = (uint16_t)val;
+        return;
+    }
+    /* CON trigger / baud writes are accepted silently. The external M95512 SPI
+     * EEPROM (DME coding/identity store) is read downstream, not before the boot
+     * RAM/self-test cluster, so it does not gate 0x3027. */
 }
 
 /*
