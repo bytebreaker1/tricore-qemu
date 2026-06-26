@@ -2698,6 +2698,90 @@ static void tc1797_eray_tun_receive(void *opaque, const uint8_t *buf, int size)
 }
 
 /*
+ * ── Digital-input live override (MSDI switch regs + GPIO Pn_IN bits) ─────────
+ * Faithful per-input control: drive the switch/pin STATE the firmware samples,
+ * not a downstream RAM poke. g_msdi_sw_ovr[reg] (-1 = donor default) overrides the
+ * SC900685 reply low byte in tc1797_msdi_reply -> the d6f4 record (0xD000D6F4) ->
+ * the FUN_800e0910(idx,mask) decode. g_gpio_in_ovr[port][bit] (-1 = pass-through
+ * high, 0 = force low, 1 = force high) overrides the Pn_IN read. Set via
+ * TC1797_DIN_INJECT / the "M"/"G" mem0-tunnel verbs. memset to -1 in realize
+ * (one SoC instance). Pinned high-confidence: KL15 ignition = MSDI reg 0xC8 bit0
+ * (key=off clears it -> 0x32). RE workflow wyy7ys7jf.
+ */
+static int16_t g_msdi_sw_ovr[256];
+static int8_t  g_gpio_in_ovr[12][32];
+
+static void tc1797_din_inject_one(const char *e)
+{
+    const char *eq = strchr(e, '=');
+    if (!eq) {
+        warn_report("tc1797: TC1797_DIN_INJECT: bad entry '%s' (need name=value)", e);
+        return;
+    }
+    int len = (int)(eq - e);
+    while (len > 0 && (e[len - 1] == ' ' || e[len - 1] == '\t')) {
+        len--;
+    }
+    const char *val = eq + 1;
+    while (*val == ' ' || *val == '\t') {
+        val++;
+    }
+    if (len == 3 && strncmp(e, "key", 3) == 0) {           /* KL15 ignition (reg 0xC8 bit0) */
+        if (!strncmp(val, "off", 3)) {
+            g_msdi_sw_ovr[0xC8] = 0x32;                    /* donor 0x33, clear bit0 */
+        } else if (!strncmp(val, "run", 3) || !strncmp(val, "on", 2)
+                   || !strncmp(val, "crank", 5) || !strncmp(val, "start", 5)) {
+            g_msdi_sw_ovr[0xC8] = 0x33;                    /* donor key-on */
+        } else {
+            warn_report("tc1797: DIN key=%s? use off/run/crank", val);
+        }
+        return;
+    }
+    if ((e[0] == 'P' || e[0] == 'p') && memchr(e, '.', len)) {  /* Px.y = 0|1|-1 GPIO bit */
+        const char *dot = memchr(e, '.', len);
+        int port = (int)strtol(e + 1, NULL, 0);
+        int bit = (int)strtol(dot + 1, NULL, 0);
+        int st = (int)strtol(val, NULL, 0);
+        if (port >= 0 && port < 12 && bit >= 0 && bit < 32) {
+            g_gpio_in_ovr[port][bit] = (st == 0) ? 0 : (st == 1) ? 1 : -1;
+            return;
+        }
+    }
+    if ((e[0] == 'M' || e[0] == 'm') && e[1] == ':') {     /* M:<reg_hex>=<byte> raw MSDI */
+        int reg = (int)strtol(e + 2, NULL, 16);
+        int byte = (int)strtol(val, NULL, 0);
+        if (reg >= 0 && reg < 256) {
+            g_msdi_sw_ovr[reg] = (int16_t)(byte & 0xFF);
+            return;
+        }
+    }
+    if ((len == 6 && !strncmp(e, "clutch", 6)) || (len == 5 && !strncmp(e, "sport", 5))) {
+        warn_report("tc1797: DIN '%s': cdf-channel switch, exact bit not yet pinned "
+                    "(needs a donor toggle capture); use raw M:<reg>=<byte>", e);
+        return;
+    }
+    warn_report("tc1797: TC1797_DIN_INJECT: unknown entry '%s'", e);
+}
+
+static void tc1797_din_inject_apply(const char *spec)
+{
+    char buf[1024];
+    g_strlcpy(buf, spec, sizeof(buf));
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",\n", &save); tok;
+         tok = strtok_r(NULL, ",\n", &save)) {
+        while (*tok == ' ' || *tok == '\t' || *tok == '\r') {
+            tok++;
+        }
+        if (*tok == '#' || *tok == '\0') {
+            continue;
+        }
+        tc1797_din_inject_one(tok);
+        info_report("tc1797: DIN inject %s", tok);
+    }
+}
+
+/*
  * ── ADC analog-input injection ──────────────────────────────────────────────
  * Drive a per-channel 12-bit VADC conversion RESULT (the RESRn count) so the
  * firmware's OWN read + scale + plausibility-filter path produces the sensor
@@ -2860,6 +2944,31 @@ static void tc1797_mem_tun_parse(TC1797SoCState *s, const char *line)
             return;
         }
         tc1797_adc_set_input(&s->adc, (int)kernel, (int)slot, (int)count, -1);
+        qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"OK\n", 3);
+    } else if (op == 'M' || op == 'm') {
+        /* Live MSDI switch override: "M <reg_hex> <byte>" (byte<0 clears to
+         * donor default). e.g. "M c8 0x32" = KL15 ignition off. */
+        char *q = NULL;
+        long reg = strtol(line + 1, &q, 16);
+        long byte = (q && *q) ? strtol(q, NULL, 0) : -1;
+        if (reg < 0 || reg > 255) {
+            qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"E\n", 2);
+            return;
+        }
+        g_msdi_sw_ovr[reg] = (byte < 0) ? -1 : (int16_t)(byte & 0xFF);
+        qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"OK\n", 3);
+    } else if (op == 'G' || op == 'g') {
+        /* Live GPIO input override: "G <port_dec> <bit_dec> <state>", state
+         * -1 = pass-through (high), 0 = force low, 1 = force high. e.g. "G 2 9 0". */
+        char *q = NULL;
+        long port = strtol(line + 1, &q, 0);
+        long bit = (q && *q) ? strtol(q, &q, 0) : -1;
+        long st = (q && *q) ? strtol(q, NULL, 0) : -2;
+        if (port < 0 || port >= 12 || bit < 0 || bit >= 32) {
+            qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"E\n", 2);
+            return;
+        }
+        g_gpio_in_ovr[port][bit] = (st == 0) ? 0 : (st == 1) ? 1 : -1;
         qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"OK\n", 3);
     } else {
         qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"E\n", 2);
@@ -3474,6 +3583,12 @@ static uint16_t tc1797_msdi_reply(uint32_t cmd)
     }
     if (reg == 0) {
         return 0x2Au;                        /* NOP/clock -> bare status tag */
+    }
+    if (g_msdi_sw_ovr[reg] >= 0) {
+        /* Live per-switch override (TC1797_DIN_INJECT / "M" verb): inject the
+         * device reply byte at the SSC0 frame, exactly where the silicon switch
+         * state enters -> d6f4 record -> FUN_800e0910 decode. */
+        return 0x2A00u | (uint8_t)g_msdi_sw_ovr[reg];
     }
     if (sw[reg] == 0 && getenv("TC1797_REGECHO")) {
         return 0x2A00u | reg;                /* diag: unmapped regs echo their reg byte to reveal buffer source */
@@ -4470,7 +4585,21 @@ static uint64_t tc1797_sfr_read(void *opaque, hwaddr offset, unsigned size)
         unsigned pn = (addr - 0xF0000C00u) >> 8;     /* port index 0..11 */
         unsigned po = addr & 0xFFu;
         if (po == 0x24u) {
-            return 0xFFFFFFFFu;                      /* Pn_IN: inputs high (KL15/pull-ups) */
+            /* Pn_IN: default all-high (KL15/pull-ups). Per-bit live override
+             * (TC1797_DIN_INJECT "Px.y=0|1" / "G" verb) drives individual input
+             * pins low/high -- the real level the firmware samples + debounces. */
+            uint32_t v = 0xFFFFFFFFu;
+            if (pn < 12) {
+                for (int b = 0; b < 32; b++) {
+                    int8_t o = g_gpio_in_ovr[pn][b];
+                    if (o == 0) {
+                        v &= ~(1u << b);
+                    } else if (o == 1) {
+                        v |= (1u << b);
+                    }
+                }
+            }
+            return v;
         }
         if (po == 0x00u && pn < 12) {
             return s->port_out[pn];                  /* Pn_OUT: observable output latch */
@@ -6447,6 +6576,18 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
             } else {
                 warn_report("tc1797: TC1797_ADC_INJECT_FILE: cannot open %s", injf);
             }
+        }
+    }
+    /* Digital-input live override: default every MSDI switch reg to its donor
+     * value (-1) and every GPIO input bit to pass-through-high (-1), then apply
+     * the boot env. 0xFF bytes -> -1 for both int16 and int8. Faithful: drives
+     * the switch/pin STATE the firmware samples. */
+    memset(g_msdi_sw_ovr, 0xFF, sizeof(g_msdi_sw_ovr));
+    memset(g_gpio_in_ovr, 0xFF, sizeof(g_gpio_in_ovr));
+    {
+        const char *din = getenv("TC1797_DIN_INJECT");
+        if (din) {
+            tc1797_din_inject_apply(din);
         }
     }
     if (getenv("TC1797_ADCTEST")) {
