@@ -2797,13 +2797,23 @@ static void tc1797_din_inject_apply(const char *spec)
  * the readers consume (RE workflow wbhc00kqc).
  */
 static const struct { const char *name; int kernel, slot; } tc1797_adc_chan[] = {
-    { "coolant", 0, 13 }, { "ect", 0, 13 },     /* engine coolant temp -> 0xD0003500, OBD PID 0x05 */
-    { "iat", 0, 15 }, { "cat", 0, 15 },          /* intake/charge-air temp -> 0xD00034FE, PID 0x0F */
-    { "map", 2, 0 }, { "map_fine", 2, 0 }, { "map_coarse", 2, 1 }, /* manifold pressure (dual-range) PID 0x0B */
-    { "pedal_a", 0, 6 }, { "pedal", 0, 6 }, { "pedal_b", 0, 7 },   /* accel pedal dual-track -> 0xD0017260, PID 0x11 */
-    { "battery", 0, 2 }, { "vbat", 0, 2 }, { "battery2", 0, 3 },   /* supply rail pair, PID 0x42 */
-    { "baro", 2, 7 },                            /* baro/reference, PID 0x33 */
-    { "pressa", 2, 6 }, { "pressb", 2, 2 },      /* secondary pressures */
+    /* high-confidence (firmware reader pinned; RE workflows wbhc00kqc + w50z5jaws) */
+    { "coolant", 0, 13 }, { "ect", 0, 13 },           /* coolant temp NTC -> 0xD0003500, PID 0x05 */
+    { "iat", 0, 15 }, { "cat", 0, 15 },               /* intake-air temp NTC -> 0xD00034FE, PID 0x0F */
+    { "map", 2, 0 }, { "map_fine", 2, 0 }, { "map_coarse", 2, 1 }, /* manifold pressure, PID 0x0B */
+    { "pedal_a", 0, 6 }, { "pedal", 0, 6 }, { "pedal_b", 0, 7 },   /* accel pedal dual-track, PID 0x49 */
+    { "throttle_limp", 0, 4 },                        /* throttle limp-track monitor */
+    /* medium-confidence (sensor identity inferred from scaling+consumer+pinout; reader pinned) */
+    { "throttle_a", 0, 12 }, { "throttle_b", 0, 14 }, /* DKG throttle dual-track (set BOTH or plausibility fault) */
+    { "valvetronic", 0, 11 }, { "valvetronic_fb", 1, 15 }, /* eccentric-shaft lift position + feedback */
+    { "oil_temp", 0, 2 }, { "charge_temp", 0, 3 },    /* oil / charge-air temp NTC (*0x7d>>9 degC) */
+    { "lambda_pre", 2, 2 },                           /* pre-cat wideband O2 */
+    { "lambda_post1", 2, 8 }, { "lambda_post2", 2, 10 }, /* post-cat narrow-band O2 */
+    /* low-confidence (oil/rail/boost group -- bind empirically vs OBD PID 0x23) */
+    { "oil_a", 1, 3 }, { "oil_b", 1, 6 }, { "rail", 1, 12 },
+    { "boost_a", 2, 5 }, { "boost_b", 2, 6 },
+    /* All readable raw slots (drive via "A <k> <slot> <count>"):
+     *   ADC0{2,3,4,6,7,8,10,11,12,13,14,15} ADC1{2,3,5,6,12,13,14,15} ADC2{0,1,2,4,5,6,7,8,9,10,11} */
 };
 
 static bool tc1797_adc_resolve(const char *name, int len, int *kernel, int *slot)
@@ -2969,6 +2979,21 @@ static void tc1797_mem_tun_parse(TC1797SoCState *s, const char *line)
             return;
         }
         g_gpio_in_ovr[port][bit] = (st == 0) ? 0 : (st == 1) ? 1 : -1;
+        qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"OK\n", 3);
+    } else if (op == 'K' || op == 'k') {
+        /* Live FADC (knock) injection: "K <ch> <count>" (raw 12-bit, -1 clears).
+         * Mirrors "A". CAVEAT: doubly inert on s55_full_rom2.bin -- no firmware
+         * path reads the FADC RESRx as a knock measurement, AND the emu result
+         * block is at +0x100 (where set_input stores) while the firmware polls
+         * +0x40+ch*0x10. Provided for symmetry / a future knock-bearing variant. */
+        char *q = NULL;
+        long ch = strtol(line + 1, &q, 0);
+        long count = (q && *q) ? strtol(q, NULL, 0) : -1;
+        if (ch < 0 || ch >= TC1797_FADC_NCH) {
+            qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"E\n", 2);
+            return;
+        }
+        tc1797_fadc_set_input(&s->fadc, (int)ch, (int)count);
         qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"OK\n", 3);
     } else {
         qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"E\n", 2);
