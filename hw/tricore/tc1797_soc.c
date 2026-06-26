@@ -174,6 +174,7 @@ struct TC1797SoCState {
     QEMUTimer *adc_done_timer;   /* fires at the earliest pending node deadline */
     int64_t adc_done_deadline[TC1797_ADC_NKERN][16]; /* abs ns; 0 = node idle */
     int64_t adc_conv_ns;         /* modelled ADC conversion time (env TC1797_ADC_CONV_NS) */
+    bool adc_free_running[TC1797_ADC_NKERN]; /* kernel converter permanently active (GLOBCTR ANON=11): the converter self-sustains (UM 23.2.3/23.1.5), so armed result nodes re-fire every conversion period -> the PCP phase chain (ch 0x1a->0x1d->0x0f) walks 0xD000416F to its settled value before the firmware polls. Set on GLOBCTR enable, cleared on disable/warm-reset. */
     QEMUTimer *gpta_cmp_timer;   /* polls/fires GPTA GTC compare-match SRC nodes */
     QEMUTimer *sample_timer;     /* diag: 20us env->PC sampler (TC1797_SAMPLE), no inject */
     bool sw_reset_pending;       /* set when 0xF0000560=2 requested a SW reset */
@@ -3772,11 +3773,14 @@ static void tc1797_adc_conv_done(void *opaque)
              * DTC-0x3006 gate driver) is a multi-pass state machine that needs
              * SEVERAL completions to advance from its cold init -- exactly as the
              * free-running silicon ADC supplies. Re-arm the next conversion while
-             * the node stays enabled + PCP-routed. Opt-in (TC1797_ADC_CONTINUOUS)
-             * pending RE of the exact ADC scan-mode config bits, so the default
-             * build's one-shot-per-arm behaviour is unchanged. Bounded by the
-             * conversion latency -> a periodic source, never a busy-loop. */
-            if (getenv("TC1797_ADC_CONTINUOUS")
+             * the node stays enabled + PCP-routed AND the kernel converter is
+             * permanently active (adc_free_running[ki] = GLOBCTR ANON=11). That is
+             * the faithful condition (UM 23.1.5/23.2.3/23.2.10.3: ANON=11 +
+             * continuous/autoscan source => the converter self-sustains), so the
+             * PCP phase chain (ch 0x1a->0x1d->0x0f) walks 0xD000416F to its settled
+             * value 0x01 before the firmware's first FUN_800fbafe poll. Bounded by
+             * the conversion latency -> a periodic source, never a busy-loop. */
+            if (s->adc_free_running[ki]
                 && ((*node >> 12) & 1u) && ((*node >> 10) & 1u)) {  /* SRE && TOS */
                 s->adc_done_deadline[ki][idx] = now + s->adc_conv_ns;
             }
@@ -3793,14 +3797,17 @@ static void tc1797_adc_conv_done(void *opaque)
      * faithful to silicon, where the PCP runs in parallel and the result is ready
      * by the poll. (BQL held here; re-entry guarded.)
      *
-     * Env-gated (TC1797_ADC_SYNC_PCP) for now: it correctly removes the deferred-PCP
-     * latency, but the DTC-0x3006 gate FUN_800fbafe needs MORE -- 0xD000416F is a PCP
-     * phase machine (cycles 0->2->5->1; the gate wants phase 1) that the firmware polls
-     * one cycle too early, because on silicon the ADC FREE-RUNS from its kernel enable
-     * and has already driven a full cycle by the first poll. Modelling that free-run
-     * (so the phase machine reaches 1 before the gate, without the fast-rate re-arm
-     * busy-loop) is the open part; until then the default build is unchanged. */
-    if (getenv("TC1797_ADC_SYNC_PCP")) {
+     * 0xD000416F is a PCP phase byte (cycles 0x00->0x02->0x05->0x01) advanced by a
+     * 3-channel chain: ch 0x1a writes 0x00 (scan reset), ch 0x1d writes 0x02 (ADC
+     * EOC captured), ch 0x0f writes 0x05 then 0x01 (settled) on the GPTA cadence.
+     * The gate FUN_800fbafe wants exactly 0x01, reached only after the ch-0x0f
+     * passes -- NOT from ch 0x1d alone (that is why the old single-channel inline
+     * fire landed on 0x02). Draining the full queue here lets the ch-0x1d EOC AND
+     * the queued ch-0x0f passes run, so the phase walks to 0x01; combined with the
+     * free-running re-arm above (gated on the kernel's ANON=11 state) it reaches
+     * and holds 0x01 before the firmware's first poll -- exactly as the
+     * free-running silicon ADC does. Default-on; opt out via TC1797_NO_ADC_SYNC_PCP. */
+    if (getenv("TC1797_NO_ADC_SYNC_PCP") == NULL) {
         pcp_engine_drain(&s->pcp);
     }
     if (getenv("TC1797_ADCDONE")) {
@@ -4079,34 +4086,35 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val,
                         fflush(stderr);
                     }
                 }
+                /* Kernel-enable: GLOBCTR (koff 0x030) ANON=11 (bits[9:8], the
+                 * 0x8712 the firmware writes) turns the converter permanently on
+                 * (UM 23.2.3). The silicon ADC then free-runs its scan, so any
+                 * armed result node re-fires every conversion period. Track that
+                 * per kernel so conv_done keeps re-arming + the PCP phase chain
+                 * settles 0xD000416F before the firmware polls. ANON!=11 -> off. */
+                if (ki >= 0 && ki < TC1797_ADC_NKERN && koff == 0x030u) {
+                    s->adc_free_running[ki] = (((uint32_t)val >> 8) & 3u) == 3u;
+                }
                 if (ki >= 0 && ki < TC1797_ADC_NKERN
                     && koff >= 0x3C0u && (val & 0x1000u)) {
                     int idx = (int)((koff - 0x3C0u) >> 2);
                     tc1797_adc_write(&s->adc, addr, val);  /* shadow read-back */
                     tc1797_src_node_write(s, &s->adc_src[ki][idx], val, addr);
                     /*
-                     * Faithful PCP-chain completion for the DTC-0x3006 gate.
-                     * Each cycle the firmware (FUN_800fbafe) software-pulses the
-                     * ch-0x1d ADC result event (koff 0x3F0, SRPN 0x1d, SETR); on
-                     * silicon that fires PCP ch 0x1d -> 0x0f whose net effect is
-                     * 0xD000416F=1 -- the SOLE writer of that flag to 1 (no CPU
-                     * instruction ever sets it). The emulator's PCP microcode
-                     * chain aborts intermittently (CSA handshake-word race), so
-                     * the flag goes stale and FUN_800fbafe resets (0x3006) every
-                     * ~10-50s at phase>=3. Model the chain's completion: when the
-                     * firmware drives that event with SETR, set the flag to the
-                     * exact value the PCP writes on silicon. Opt out via
-                     * TC1797_NO_ADC_GATEFIX (cached; no per-write getenv churn).
+                     * RETIRED crutch (default-off, opt-in TC1797_ADC_GATEFIX for
+                     * A/B only): directly poking 0xD000416F=1 on the firmware's SETR
+                     * pulse. It is non-faithful on two counts -- (1) 0xD000416F is
+                     * written ONLY by the PCP phase chain, never by a CPU store of a
+                     * nonzero value, and (2) the SETR pulse is at PC 0x800fbb40,
+                     * AFTER the gate's read at 0x800fbb28, so the poke was a cycle
+                     * late on the first poll anyway. The faithful path is the
+                     * free-running ADC (kernel-enable above + conv_done re-arm +
+                     * PCP drain) that walks the phase byte to 0x01 organically.
                      */
-                    if (ki == 0 && koff == 0x3F0u && (val & 0x8000u)) {
-                        static int gf = -1;
-                        if (gf < 0) {
-                            gf = getenv("TC1797_NO_ADC_GATEFIX") ? 0 : 1;
-                        }
-                        if (gf) {
-                            uint8_t one = 1;
-                            cpu_physical_memory_write(0xD000416Fu, &one, 1);
-                        }
+                    if (ki == 0 && koff == 0x3F0u && (val & 0x8000u)
+                        && getenv("TC1797_ADC_GATEFIX")) {
+                        uint8_t one = 1;
+                        cpu_physical_memory_write(0xD000416Fu, &one, 1);
                     }
                     /*
                      * Conversion-complete modelling. When the firmware ARMS a
@@ -4130,27 +4138,18 @@ static bool tc1797_periph_write(TC1797SoCState *s, uint32_t addr, uint32_t val,
                          * Idempotent: don't restart a deadline already pending. */
                         if (idx >= 0 && idx < 16
                             && s->adc_done_deadline[ki][idx] == 0) {
-                            if (getenv("TC1797_ADC_INITFIRE")) {
-                                /* The silicon ADC free-runs from kernel-enable, so by the time the
-                                 * firmware arms this result node its conversion is ALREADY complete.
-                                 * Fire the end-of-conversion + run its PCP phase-machine chain
-                                 * (ch 0x1d -> 0x0f -> 0xD000416F) SYNCHRONOUSLY, inline, right now --
-                                 * before the firmware polls the DTC-0x3006 gate a few instructions
-                                 * later. Otherwise the timer-scheduled EOC lands after the gate and it
-                                 * reset-loops. BQL held here; pcp_engine_drain is re-entry guarded. */
-                                tc1797_src_node_write(s, &s->adc_src[ki][idx],
-                                                      (s->adc_src[ki][idx] & 0x1FFFu) | 0x8000u, addr);
-                                pcp_engine_drain(&s->pcp);
-                                /* keep the analogue free-running for subsequent conversions */
-                                s->adc_done_deadline[ki][idx] =
-                                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + s->adc_conv_ns;
-                                tc1797_adc_rearm(s);
-                            } else {
-                                s->adc_done_deadline[ki][idx] =
-                                    qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
-                                    + s->adc_conv_ns;
-                                tc1797_adc_rearm(s);
-                            }
+                            /* Schedule the end-of-conversion one conversion latency
+                             * out. conv_done re-drives the node (SETR -> PCP ch 0x1d)
+                             * and, when the kernel is free-running, re-arms the next
+                             * conversion + drains the ch-0x0f passes so the phase byte
+                             * settles to 0x01 well before the gate poll (the arm here
+                             * happens many ms before FUN_800fbafe's check). The old
+                             * inline single-channel fire (TC1797_ADC_INITFIRE) is
+                             * retired -- it drained only ch 0x1d and stuck at 0x02. */
+                            s->adc_done_deadline[ki][idx] =
+                                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)
+                                + s->adc_conv_ns;
+                            tc1797_adc_rearm(s);
                         }
                     }
                     return true;
@@ -6602,6 +6601,7 @@ static void tc1797_cpu_reset(void *opaque)
          * cannot fire their EOC into the freshly re-initialising firmware (the
          * reboot re-arms its result nodes from scratch). */
         memset(s->adc_done_deadline, 0, sizeof(s->adc_done_deadline));
+        memset(s->adc_free_running, 0, sizeof(s->adc_free_running));
         if (s->adc_done_timer) {
             timer_del(s->adc_done_timer);
         }
