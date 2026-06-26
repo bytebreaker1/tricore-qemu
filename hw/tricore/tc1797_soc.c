@@ -2698,6 +2698,97 @@ static void tc1797_eray_tun_receive(void *opaque, const uint8_t *buf, int size)
 }
 
 /*
+ * ── ADC analog-input injection ──────────────────────────────────────────────
+ * Drive a per-channel 12-bit VADC conversion RESULT (the RESRn count) so the
+ * firmware's OWN read + scale + plausibility-filter path produces the sensor
+ * signal -- the analog twin of the CAN koeo_inject (which delivers a real MO
+ * frame, not a COM-PDU poke). The value written is the raw conversion count
+ * (0..0xFFF); resr_word() then returns it as a valid VADC word (VF=1|CHNR|count)
+ * exactly as the silicon analog front-end posts after sampling a sensor voltage.
+ * Nothing downstream is forced -- the firmware does its own MMIO read (FUN_8014416a
+ * scaler / FUN_800667e2 pedal), Q31/x10/NTC-curve scale, window+median filter and
+ * DSPR store. Physical-value -> count scaling lives host-side (adc_inject.py): the
+ * NTC temperature curves are DFLASH calibration absent from the static dump, so the
+ * faithful unit here is the raw count. Channel names resolve to the (kernel,slot)
+ * the readers consume (RE workflow wbhc00kqc).
+ */
+static const struct { const char *name; int kernel, slot; } tc1797_adc_chan[] = {
+    { "coolant", 0, 13 }, { "ect", 0, 13 },     /* engine coolant temp -> 0xD0003500, OBD PID 0x05 */
+    { "iat", 0, 15 }, { "cat", 0, 15 },          /* intake/charge-air temp -> 0xD00034FE, PID 0x0F */
+    { "map", 2, 0 }, { "map_fine", 2, 0 }, { "map_coarse", 2, 1 }, /* manifold pressure (dual-range) PID 0x0B */
+    { "pedal_a", 0, 6 }, { "pedal", 0, 6 }, { "pedal_b", 0, 7 },   /* accel pedal dual-track -> 0xD0017260, PID 0x11 */
+    { "battery", 0, 2 }, { "vbat", 0, 2 }, { "battery2", 0, 3 },   /* supply rail pair, PID 0x42 */
+    { "baro", 2, 7 },                            /* baro/reference, PID 0x33 */
+    { "pressa", 2, 6 }, { "pressb", 2, 2 },      /* secondary pressures */
+};
+
+static bool tc1797_adc_resolve(const char *name, int len, int *kernel, int *slot)
+{
+    for (size_t i = 0; i < ARRAY_SIZE(tc1797_adc_chan); i++) {
+        if ((int)strlen(tc1797_adc_chan[i].name) == len
+            && strncmp(name, tc1797_adc_chan[i].name, len) == 0) {
+            *kernel = tc1797_adc_chan[i].kernel;
+            *slot = tc1797_adc_chan[i].slot;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Apply one "k:n=count[:chnr]" or "name=count[:chnr]" entry (count = raw, base 0). */
+static bool tc1797_adc_inject_one(TC1797SoCState *s, const char *e)
+{
+    const char *eq = strchr(e, '=');
+    if (!eq) {
+        return false;
+    }
+    int kernel = -1, slot = -1;
+    const char *colon = memchr(e, ':', eq - e);
+    if (colon) {
+        kernel = (int)strtol(e, NULL, 0);
+        slot = (int)strtol(colon + 1, NULL, 0);
+    } else {
+        /* trim trailing spaces from the name before resolving */
+        const char *end = eq;
+        while (end > e && (end[-1] == ' ' || end[-1] == '\t')) {
+            end--;
+        }
+        if (!tc1797_adc_resolve(e, (int)(end - e), &kernel, &slot)) {
+            return false;
+        }
+    }
+    char *p = NULL;
+    int count = (int)strtol(eq + 1, &p, 0);
+    int chnr = (p && *p == ':') ? (int)strtol(p + 1, NULL, 0) : -1;
+    tc1797_adc_set_input(&s->adc, kernel, slot, count, chnr);
+    return true;
+}
+
+/* Apply a comma/newline-separated injection spec (env value or file contents);
+ * '#' begins a comment, blanks ignored. */
+static void tc1797_adc_inject_apply(TC1797SoCState *s, const char *spec)
+{
+    char buf[4096];
+    g_strlcpy(buf, spec, sizeof(buf));
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",\n", &save); tok;
+         tok = strtok_r(NULL, ",\n", &save)) {
+        while (*tok == ' ' || *tok == '\t' || *tok == '\r') {
+            tok++;
+        }
+        if (*tok == '#' || *tok == '\0') {
+            continue;
+        }
+        if (!tc1797_adc_inject_one(s, tok)) {
+            warn_report("tc1797: ADC inject: bad entry '%s' "
+                        "(use k:n=count or name=count, count base-0)", tok);
+        } else {
+            info_report("tc1797: ADC inject %s", tok);
+        }
+    }
+}
+
+/*
  * Host memory peek/poke tunnel (-chardev socket,id=mem0,...). This is the
  * clean, zero-perturbation replacement for the gdb stub's run-control dance:
  * memory is served from the SoC side via cpu_physical_memory_read/write (in the
@@ -2754,6 +2845,21 @@ static void tc1797_mem_tun_parse(TC1797SoCState *s, const char *line)
                 queue_tb_flush(CPU(&s->cpu));
             }
         }
+        qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"OK\n", 3);
+    } else if (op == 'A' || op == 'a') {
+        /* Live ADC analog injection: "A <kernel> <slot> <count>" drives a
+         * per-channel VADC result count (the firmware then reads+scales it).
+         * Fire-and-forget single line (no read-loop) so it never stalls the
+         * OSEK schedule. Mirrors the CAN tunnel inject. */
+        char *q = NULL;
+        long kernel = strtol(line + 1, &q, 0);
+        long slot = (q && *q) ? strtol(q, &q, 0) : -1;
+        long count = (q && *q) ? strtol(q, NULL, 0) : -1;
+        if (slot < 0) {
+            qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"E\n", 2);
+            return;
+        }
+        tc1797_adc_set_input(&s->adc, (int)kernel, (int)slot, (int)count, -1);
         qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"OK\n", 3);
     } else {
         qemu_chr_fe_write_all(&s->mem_tun, (const uint8_t *)"E\n", 2);
@@ -6319,6 +6425,29 @@ static void tc1797_soc_realize(DeviceState *dev, Error **errp)
             count = -1;                 /* silicon reset: no synthesized word */
         }
         tc1797_adc_set_default(&s->adc, count);
+    }
+    /* Per-channel analog input injection (TC1797_ADC_INJECT="coolant=0x250,2:0=0x800"
+     * or TC1797_ADC_INJECT_FILE=<path>). Applied AFTER the mid-scale default so an
+     * injected channel overrides its baseline while un-injected channels keep the
+     * valid default -- the firmware reads + scales each as a real conversion. */
+    {
+        const char *inj = getenv("TC1797_ADC_INJECT");
+        if (inj) {
+            tc1797_adc_inject_apply(s, inj);
+        }
+        const char *injf = getenv("TC1797_ADC_INJECT_FILE");
+        if (injf) {
+            FILE *f = fopen(injf, "r");
+            if (f) {
+                char fb[4096];
+                size_t fn = fread(fb, 1, sizeof(fb) - 1, f);
+                fb[fn] = '\0';
+                fclose(f);
+                tc1797_adc_inject_apply(s, fb);
+            } else {
+                warn_report("tc1797: TC1797_ADC_INJECT_FILE: cannot open %s", injf);
+            }
+        }
     }
     if (getenv("TC1797_ADCTEST")) {
         tc1797_adc_selftest();
