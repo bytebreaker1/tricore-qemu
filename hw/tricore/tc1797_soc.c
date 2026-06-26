@@ -2769,17 +2769,25 @@ static void tc1797_din_inject_apply(const char *spec)
 {
     char buf[1024];
     g_strlcpy(buf, spec, sizeof(buf));
-    char *save = NULL;
-    for (char *tok = strtok_r(buf, ",\n", &save); tok;
-         tok = strtok_r(NULL, ",\n", &save)) {
-        while (*tok == ' ' || *tok == '\t' || *tok == '\r') {
-            tok++;
+    char *lsave = NULL;
+    for (char *line = strtok_r(buf, "\n", &lsave); line;
+         line = strtok_r(NULL, "\n", &lsave)) {
+        char *h = strchr(line, '#');           /* strip inline/whole-line comment */
+        if (h) {
+            *h = '\0';
         }
-        if (*tok == '#' || *tok == '\0') {
-            continue;
+        char *csave = NULL;
+        for (char *tok = strtok_r(line, ",", &csave); tok;
+             tok = strtok_r(NULL, ",", &csave)) {
+            while (*tok == ' ' || *tok == '\t' || *tok == '\r') {
+                tok++;
+            }
+            if (*tok == '\0') {
+                continue;
+            }
+            tc1797_din_inject_one(tok);
+            info_report("tc1797: DIN inject %s", tok);
         }
-        tc1797_din_inject_one(tok);
-        info_report("tc1797: DIN inject %s", tok);
     }
 }
 
@@ -2866,20 +2874,28 @@ static void tc1797_adc_inject_apply(TC1797SoCState *s, const char *spec)
 {
     char buf[4096];
     g_strlcpy(buf, spec, sizeof(buf));
-    char *save = NULL;
-    for (char *tok = strtok_r(buf, ",\n", &save); tok;
-         tok = strtok_r(NULL, ",\n", &save)) {
-        while (*tok == ' ' || *tok == '\t' || *tok == '\r') {
-            tok++;
+    char *lsave = NULL;
+    for (char *line = strtok_r(buf, "\n", &lsave); line;
+         line = strtok_r(NULL, "\n", &lsave)) {
+        char *h = strchr(line, '#');           /* strip inline/whole-line comment */
+        if (h) {
+            *h = '\0';
         }
-        if (*tok == '#' || *tok == '\0') {
-            continue;
-        }
-        if (!tc1797_adc_inject_one(s, tok)) {
-            warn_report("tc1797: ADC inject: bad entry '%s' "
-                        "(use k:n=count or name=count, count base-0)", tok);
-        } else {
-            info_report("tc1797: ADC inject %s", tok);
+        char *csave = NULL;
+        for (char *tok = strtok_r(line, ",", &csave); tok;
+             tok = strtok_r(NULL, ",", &csave)) {
+            while (*tok == ' ' || *tok == '\t' || *tok == '\r') {
+                tok++;
+            }
+            if (*tok == '\0') {
+                continue;
+            }
+            if (!tc1797_adc_inject_one(s, tok)) {
+                warn_report("tc1797: ADC inject: bad entry '%s' "
+                            "(use k:n=count or name=count, count base-0)", tok);
+            } else {
+                info_report("tc1797: ADC inject %s", tok);
+            }
         }
     }
 }
